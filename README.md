@@ -6,6 +6,8 @@ bajo control de Codex.
 ## CLI
 
 - `bridge run "<task>"`
+- `bridge run --mode gui "<task>"`
+- `bridge gui-run "<task>"`
 - `bridge status`
 - `bridge logs --tail 200`
 
@@ -31,6 +33,20 @@ Salida final estricta:
 - Política estricta de acciones: cada item debe ser `cmd: <command>`.
 - Validación canónica: `evidence_paths[]` debe quedar dentro de `runs/<run_id>/`.
 
+## GUI Operator Mode (v1.2)
+
+- Activación: `bridge run --mode gui ...` o `bridge gui-run ...`.
+- En GUI mode, `--confirm-sensitive` es obligatorio.
+- Allowlist GUI explícita: `xdotool`, `wmctrl`, `xwininfo`, `import`, `scrot` (más comandos shell permitidos).
+- Clicks sin ventana objetivo explícita son bloqueados.
+- Clicks por coordenadas (`mousemove ... click`) son bloqueados.
+- Tras cada click se exige verificación y evidencia before/after.
+
+Evidencia obligatoria por click `N`:
+- `runs/<run_id>/evidence/step_<N>_before.png`
+- `runs/<run_id>/evidence/step_<N>_after.png`
+- `runs/<run_id>/evidence/step_<N>_window.txt`
+
 ## Logs y artefactos
 
 Cada ejecución guarda artefactos en `runs/<run_id>/`:
@@ -41,6 +57,30 @@ Cada ejecución guarda artefactos en `runs/<run_id>/`:
 - `report.json`
 
 `bridge logs` incluye tail de `bridge.log`, `oi_stdout.log` y `oi_stderr.log`.
+
+## Requisitos de entorno GUI (X11)
+
+- `DISPLAY` válido (por ejemplo `:0`).
+- Sesión X11 activa con foco en la ventana esperada.
+- Herramientas presentes: `xdotool`, `wmctrl`, `xwininfo`, y para screenshots `import` o `scrot`.
+
+Troubleshooting típico:
+- `DISPLAY` no configurado: exportar `DISPLAY=:0` en la sesión correcta.
+- Ventana incorrecta en foco: usar pasos explícitos de búsqueda/activación de ventana.
+- Sin screenshots: instalar o habilitar `import`/`scrot`.
+
+## Playbook GUI ejemplo
+
+```bash
+bridge gui-run --confirm-sensitive \
+  "abre navegador, navega a https://example.com y haz click en botón \"Descargar archivo\". \
+verifica resultado visible tras click y guarda evidencia por paso."
+```
+
+Resultado esperado:
+- `actions[]` con comandos `cmd: ...`
+- `observations/ui_findings` con ubicación del botón, acción aplicada y cambio visible
+- `evidence_paths[]` con before/after/window por cada click
 
 ## Security Posture
 
@@ -54,5 +94,9 @@ Cada ejecución guarda artefactos en `runs/<run_id>/`:
   - hard-fail de `actions[]` no `cmd:`
   - validación canónica de `evidence_paths[]`
   - inclusión de `oi_stdout.log` en `bridge logs`
+- `v1.2.0`: GUI Operator Mode:
+  - `--mode gui` y `gui-run`
+  - guardrails GUI (target window + verify + no coordinate clicks)
+  - evidencia obligatoria before/after por click
 
 Ver handoff completo en `docs/CODEX_HANDOFF.md`.

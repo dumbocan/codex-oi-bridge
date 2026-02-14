@@ -18,14 +18,25 @@ class RunnerResult:
     timed_out: bool = False
 
 
-def build_oi_prompt(task_id: str, task: str, run_dir: Path, allowlist: tuple[str, ...]) -> str:
+def build_oi_prompt(
+    task_id: str,
+    task: str,
+    run_dir: Path,
+    allowlist: tuple[str, ...],
+    *,
+    mode: str,
+) -> str:
     allowed = ", ".join(allowlist)
+    mode_block = _gui_mode_block(run_dir) if mode == "gui" else _shell_mode_block()
     return f"""
 You are Open Interpreter used only as a screen/operation observer.
 Never edit source code or architecture. Never execute destructive commands.
 Allowed shell command prefixes only: {allowed}
 Use shell commands only; do not use Python computer/display APIs, notebooks, or interactive setup flows.
 Every shell action must be represented in actions[] as: "cmd: <exact command>".
+If the goal includes explicit URLs, hosts, or ports, use them exactly and do not rewrite them.
+Execution mode: {mode}
+{mode_block}
 If a requested step needs an action outside guardrails, do not execute it and report it.
 Save evidence (logs/screenshots/reports) only inside: {run_dir}
 Always return a single strict JSON object with keys exactly:
@@ -109,3 +120,22 @@ def _prompt_for_stdin_mode(prompt: str) -> str:
     # --stdin uses input(), so only the first line is consumed.
     collapsed = " ".join(line.strip() for line in prompt.splitlines() if line.strip())
     return collapsed + "\n"
+
+
+def _shell_mode_block() -> str:
+    return (
+        "In shell mode, focus on command output and direct observations. "
+        "Do not simulate GUI interactions."
+    )
+
+
+def _gui_mode_block(run_dir: Path) -> str:
+    evidence_dir = run_dir / "evidence"
+    return (
+        "In gui mode: no asumir, verificar. Un paso, una evidencia. "
+        "Before any click, identify explicit target window/title. "
+        "After each click, run a verify step describing what changed. "
+        "For every click step N, save before/after screenshots and active window log in "
+        f"{evidence_dir} as step_N_before.png, step_N_after.png, step_N_window.txt. "
+        "If button/target is not found, report blocked state and safe alternatives."
+    )

@@ -137,3 +137,59 @@ Se añadieron tests para:
 - bypass de `actions[]` sin `cmd:`.
 - path traversal/rutas externas en `evidence_paths[]`.
 - salida de `bridge logs` incluyendo stdout+stderr.
+
+## 16) GUI Operator Mode (v1.2.0)
+
+Nuevos entrypoints:
+- `bridge run --mode gui "<task>"`
+- `bridge gui-run "<task>"`
+
+Límites del modo GUI:
+- Sigue prohibido editar código.
+- Sigue bloqueando comandos destructivos.
+- `--confirm-sensitive` es obligatorio.
+- Click sin ventana objetivo explícita => bloqueado.
+- Click por coordenadas => bloqueado.
+- Cada click exige verificación post-click en findings.
+
+## 17) Evidencia obligatoria GUI
+
+Por cada click de paso `N`:
+- `runs/<run_id>/evidence/step_<N>_before.png`
+- `runs/<run_id>/evidence/step_<N>_after.png`
+- `runs/<run_id>/evidence/step_<N>_window.txt`
+
+Si falta cualquiera => hard-fail del run.
+
+## 18) Requisitos entorno X11
+
+- `DISPLAY` apuntando a sesión válida.
+- Herramientas: `xdotool`, `wmctrl`, `xwininfo`.
+- Captura: `import` (ImageMagick) o `scrot`.
+
+## 19) Troubleshooting GUI
+
+- Error de display: revisar `echo $DISPLAY`.
+- Click no efectivo: revisar foco y target window explícito.
+- Sin capturas: instalar `scrot` o ImageMagick (`import`).
+- Botón no encontrado: reportar bloqueo + alternativa segura en `observations`.
+
+## 20) Playbook GUI (ejemplo real)
+
+Objetivo:
+- Abrir navegador
+- Ir a URL dada
+- Click en botón `"Descargar archivo"`
+- Verificar resultado visible
+
+Comando:
+```bash
+bridge gui-run --confirm-sensitive \
+  "abre navegador, navega a https://example.com y haz click en botón \"Descargar archivo\". \
+verifica resultado visible tras click y guarda evidencia por paso."
+```
+
+Validaciones esperadas:
+- `actions[]` solo `cmd: ...`
+- evidencia before/after/window por cada click
+- findings con ubicación del botón + acción + resultado visible

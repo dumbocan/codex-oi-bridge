@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from bridge.constants import SHELL_ALLOWED_COMMAND_PREFIXES
 from bridge.cli import _validate_evidence_paths, _validate_report_actions, logs_command
 from bridge.models import OIReport
 
@@ -23,7 +24,13 @@ class CLITests(unittest.TestCase):
             evidence_paths=[],
         )
         with self.assertRaises(SystemExit):
-            _validate_report_actions(report, confirm_sensitive=True)
+            _validate_report_actions(
+                report,
+                confirm_sensitive=True,
+                expected_targets=set(),
+                allowlist=SHELL_ALLOWED_COMMAND_PREFIXES,
+                mode="shell",
+            )
 
     def test_evidence_path_outside_run_dir_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -44,7 +51,7 @@ class CLITests(unittest.TestCase):
                 evidence_paths=[str(outside)],
             )
             with self.assertRaises(SystemExit):
-                _validate_evidence_paths(report, run_dir)
+                _validate_evidence_paths(report, run_dir, mode="shell", click_steps=0)
 
     def test_logs_include_stdout_and_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -62,6 +69,47 @@ class CLITests(unittest.TestCase):
             self.assertIn("bridge-line", text)
             self.assertIn("stdout-line", text)
             self.assertIn("stderr-line", text)
+
+    def test_url_target_drift_is_blocked_for_network_actions(self) -> None:
+        report = OIReport(
+            task_id="t1",
+            goal="api-check",
+            actions=["cmd: curl -s http://localhost/health"],
+            observations=[],
+            console_errors=[],
+            network_findings=[],
+            ui_findings=[],
+            result="failed",
+            evidence_paths=[],
+        )
+        with self.assertRaises(SystemExit):
+            _validate_report_actions(
+                report,
+                confirm_sensitive=True,
+                expected_targets={"http://127.0.0.1:8000"},
+                allowlist=SHELL_ALLOWED_COMMAND_PREFIXES,
+                mode="shell",
+            )
+
+    def test_url_target_exact_match_is_allowed(self) -> None:
+        report = OIReport(
+            task_id="t1",
+            goal="api-check",
+            actions=["cmd: curl -s http://127.0.0.1:8000/health"],
+            observations=[],
+            console_errors=[],
+            network_findings=[],
+            ui_findings=[],
+            result="success",
+            evidence_paths=[],
+        )
+        _validate_report_actions(
+            report,
+            confirm_sensitive=True,
+            expected_targets={"http://127.0.0.1:8000"},
+            allowlist=SHELL_ALLOWED_COMMAND_PREFIXES,
+            mode="shell",
+        )
 
 
 if __name__ == "__main__":

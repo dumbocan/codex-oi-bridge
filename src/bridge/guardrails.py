@@ -8,9 +8,9 @@ import shlex
 from dataclasses import dataclass
 
 from bridge.constants import (
-    ALLOWED_COMMAND_PREFIXES,
     BLOCKED_COMMAND_TOKENS,
     CODE_EXTENSIONS,
+    SHELL_ALLOWED_COMMAND_PREFIXES,
     SENSITIVE_COMMAND_TOKENS,
 )
 
@@ -40,7 +40,11 @@ def task_has_sensitive_intent(task: str) -> list[str]:
     return hits
 
 
-def evaluate_command(command: str) -> GuardrailDecision:
+def evaluate_command(
+    command: str,
+    *,
+    allowlist: tuple[str, ...] = SHELL_ALLOWED_COMMAND_PREFIXES,
+) -> GuardrailDecision:
     try:
         parts = shlex.split(command)
     except ValueError:
@@ -55,7 +59,7 @@ def evaluate_command(command: str) -> GuardrailDecision:
             return GuardrailDecision(False, f"Blocked command token detected: {blocked}")
 
     prefix = parts[0]
-    if prefix not in ALLOWED_COMMAND_PREFIXES:
+    if prefix not in allowlist:
         return GuardrailDecision(False, f"Command not in allowlist: {prefix}")
 
     sensitive = any(

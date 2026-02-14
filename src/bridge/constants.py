@@ -14,8 +14,8 @@ REQUIRED_REPORT_KEYS = (
 
 ALLOWED_RESULT_VALUES = {"success", "partial", "failed"}
 
-# Observation/operation commands allowed for Open Interpreter.
-ALLOWED_COMMAND_PREFIXES = (
+# Observation/operation commands allowed for Open Interpreter (shell mode).
+SHELL_ALLOWED_COMMAND_PREFIXES = (
     "cat",
     "curl",
     "date",
@@ -45,6 +45,17 @@ ALLOWED_COMMAND_PREFIXES = (
     "xwininfo",
     "xdotool",
     "wmctrl",
+)
+
+# GUI mode explicit allowlist.
+GUI_ALLOWED_COMMAND_PREFIXES = tuple(
+    sorted(
+        {
+            *SHELL_ALLOWED_COMMAND_PREFIXES,
+            "import",
+            "scrot",
+        }
+    )
 )
 
 BLOCKED_COMMAND_TOKENS = (
@@ -82,6 +93,12 @@ SENSITIVE_COMMAND_TOKENS = (
     "scp",
     "curl",
     "wget",
+)
+
+GUI_STATE_CHANGING_TOKENS = (
+    "xdotool click",
+    "xdotool key",
+    "xdotool type",
 )
 
 CODE_EXTENSIONS = (
