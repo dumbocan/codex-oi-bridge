@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 from bridge.cli import (
@@ -65,7 +67,8 @@ class GUIModeTests(unittest.TestCase):
             ), patch("bridge.cli.write_status"), patch(
                 "bridge.cli._validate_oi_runtime_config"
             ), patch("bridge.cli.require_sensitive_confirmation"):
-                run_command("gui smoke", confirm_sensitive=True, mode="gui")
+                with redirect_stdout(StringIO()):
+                    run_command("gui smoke", confirm_sensitive=True, mode="gui")
 
             self.assertTrue((run_dir / "evidence").exists())
             self.assertTrue((run_dir / "evidence").is_dir())
@@ -181,7 +184,13 @@ class GUIModeTests(unittest.TestCase):
                 evidence_paths=[],
             )
             with self.assertRaises(SystemExit):
-                _validate_evidence_paths(report, run_dir, mode="gui", click_steps=1)
+                _validate_evidence_paths(
+                    report,
+                    run_dir,
+                    mode="gui",
+                    click_steps=1,
+                    run_id="r1",
+                )
 
     def test_evidence_path_listed_but_missing_file_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
@@ -199,7 +208,13 @@ class GUIModeTests(unittest.TestCase):
                 evidence_paths=[str(run_dir / "not_exists.txt")],
             )
             with self.assertRaises(SystemExit):
-                _validate_evidence_paths(report, run_dir, mode="shell", click_steps=0)
+                _validate_evidence_paths(
+                    report,
+                    run_dir,
+                    mode="shell",
+                    click_steps=0,
+                    run_id="r1",
+                )
 
     def test_gui_fails_without_post_click_verify(self) -> None:
         report = OIReport(
@@ -253,6 +268,130 @@ class GUIModeTests(unittest.TestCase):
         task = 'haz click en "https://example.com/descargar" cerca del botón principal'
         targets = _extract_button_targets(task)
         self.assertEqual(targets, set())
+
+    def test_gui_can_satisfy_window_evidence_without_shell_redirection(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "step_1_before.png").write_text("b", encoding="utf-8")
+            (evidence / "step_1_after.png").write_text("a", encoding="utf-8")
+            report = OIReport(
+                task_id="r1",
+                goal="gui",
+                actions=["cmd: xdotool search --name Browser", "cmd: xdotool click 1"],
+                observations=["step 1 verify visible result"],
+                console_errors=[],
+                network_findings=[],
+                ui_findings=[],
+                result="partial",
+                evidence_paths=[
+                    str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                    str((evidence / "step_1_after.png").resolve().relative_to(Path.cwd())),
+                ],
+            )
+            safe = _validate_evidence_paths(
+                report,
+                run_dir,
+                mode="gui",
+                click_steps=1,
+                run_id="r1",
+            )
+            expected_window = str((run_dir / "evidence" / "step_1_window.txt").resolve().relative_to(Path.cwd()))
+            self.assertIn(expected_window, safe)
+
+    def test_gui_window_evidence_file_is_created_inside_run_dir(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "step_1_before.png").write_text("b", encoding="utf-8")
+            (evidence / "step_1_after.png").write_text("a", encoding="utf-8")
+            report = OIReport(
+                task_id="r1",
+                goal="gui",
+                actions=["cmd: xdotool search --name Browser", "cmd: xdotool click 1"],
+                observations=["step 1 verify visible result"],
+                console_errors=[],
+                network_findings=[],
+                ui_findings=[],
+                result="partial",
+                evidence_paths=[
+                    str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                    str((evidence / "step_1_after.png").resolve().relative_to(Path.cwd())),
+                ],
+            )
+            _validate_evidence_paths(
+                report,
+                run_dir,
+                mode="gui",
+                click_steps=1,
+                run_id="r1",
+            )
+            window_file = run_dir / "evidence" / "step_1_window.txt"
+            self.assertTrue(window_file.exists())
+            text = window_file.read_text(encoding="utf-8")
+            self.assertIn("run_id: r1", text)
+            self.assertIn("step: 1", text)
+
+    def test_no_external_path_for_synthesized_window_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "step_1_before.png").write_text("b", encoding="utf-8")
+            (evidence / "step_1_after.png").write_text("a", encoding="utf-8")
+            report = OIReport(
+                task_id="r1",
+                goal="gui",
+                actions=["cmd: xdotool search --name Browser", "cmd: xdotool click 1"],
+                observations=["step 1 verify visible result"],
+                console_errors=[],
+                network_findings=[],
+                ui_findings=[],
+                result="partial",
+                evidence_paths=[
+                    str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                    str((evidence / "step_1_after.png").resolve().relative_to(Path.cwd())),
+                    "/tmp/evil.txt",
+                ],
+            )
+            with self.assertRaises(SystemExit):
+                _validate_evidence_paths(
+                    report,
+                    run_dir,
+                    mode="gui",
+                    click_steps=1,
+                    run_id="r1",
+                )
+
+    def test_click_sequence_still_requires_before_after_png(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "step_1_before.png").write_text("b", encoding="utf-8")
+            report = OIReport(
+                task_id="r1",
+                goal="gui",
+                actions=["cmd: xdotool search --name Browser", "cmd: xdotool click 1"],
+                observations=["step 1 verify visible result"],
+                console_errors=[],
+                network_findings=[],
+                ui_findings=[],
+                result="partial",
+                evidence_paths=[
+                    str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                ],
+            )
+            with self.assertRaises(SystemExit):
+                _validate_evidence_paths(
+                    report,
+                    run_dir,
+                    mode="gui",
+                    click_steps=1,
+                    run_id="r1",
+                )
 
 
 if __name__ == "__main__":

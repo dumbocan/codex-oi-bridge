@@ -26,6 +26,14 @@ class GuardrailTests(unittest.TestCase):
         decision = evaluate_command("python script.py")
         self.assertFalse(decision.allowed)
 
+    def test_redirection_token_remains_blocked(self) -> None:
+        decision = evaluate_command("echo hi > output.txt")
+        self.assertFalse(decision.allowed)
+
+    def test_tee_token_remains_blocked(self) -> None:
+        decision = evaluate_command("ls | tee output.txt")
+        self.assertFalse(decision.allowed)
+
     def test_sensitive_command_requires_confirmation(self) -> None:
         with self.assertRaises(PermissionError):
             require_sensitive_confirmation(

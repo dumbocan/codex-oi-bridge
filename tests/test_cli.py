@@ -51,7 +51,13 @@ class CLITests(unittest.TestCase):
                 evidence_paths=[str(outside)],
             )
             with self.assertRaises(SystemExit):
-                _validate_evidence_paths(report, run_dir, mode="shell", click_steps=0)
+                _validate_evidence_paths(
+                    report,
+                    run_dir,
+                    mode="shell",
+                    click_steps=0,
+                    run_id="r1",
+                )
 
     def test_logs_include_stdout_and_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

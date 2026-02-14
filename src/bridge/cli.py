@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -189,6 +190,7 @@ def run_command(task: str, confirm_sensitive: bool, mode: str) -> None:
         ctx.run_dir,
         mode=mode,
         click_steps=click_steps,
+        run_id=ctx.run_id,
     )
     report = replace(report, evidence_paths=safe_evidence_paths)
     _validate_gui_post_conditions(
@@ -291,10 +293,14 @@ def _validate_evidence_paths(
     *,
     mode: str,
     click_steps: int,
+    run_id: str,
 ) -> list[str]:
+    if mode == "gui" and click_steps > 0:
+        report = _synthesize_gui_window_evidence(report, run_dir, click_steps, run_id)
+
     run_root = run_dir.resolve()
     safe_paths: list[str] = []
-    rel_paths: list[Path] = []
+    rel_paths: list[str] = []
 
     for raw_path in report.evidence_paths:
         candidate = Path(raw_path)
@@ -310,7 +316,7 @@ def _validate_evidence_paths(
                 )
             rel = resolved.relative_to(Path.cwd())
             safe_paths.append(str(rel))
-            rel_paths.append(Path(rel).relative_to(run_dir))
+            rel_paths.append(str(resolved.relative_to(run_root)))
             continue
         raise SystemExit(
             "Guardrail blocked evidence path outside run directory: "
@@ -318,7 +324,7 @@ def _validate_evidence_paths(
         )
 
     if mode == "gui" and click_steps > 0:
-        existing = {str(path) for path in rel_paths}
+        existing = set(rel_paths)
         for step in range(1, click_steps + 1):
             required = (
                 f"evidence/step_{step}_before.png",
@@ -339,6 +345,46 @@ def _validate_evidence_paths(
                         f"step={step}, path={rel}, run_dir={run_dir}"
                     )
     return safe_paths
+
+
+def _synthesize_gui_window_evidence(
+    report: OIReport,
+    run_dir: Path,
+    click_steps: int,
+    run_id: str,
+) -> OIReport:
+    evidence_dir = run_dir / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    merged_paths = list(report.evidence_paths)
+    path_set = set(merged_paths)
+    step_lines = report.observations + report.ui_findings
+    now = datetime.now(timezone.utc).isoformat()
+
+    for step in range(1, click_steps + 1):
+        abs_path = evidence_dir / f"step_{step}_window.txt"
+        rel = str(abs_path.resolve().relative_to(Path.cwd()))
+        if not abs_path.exists():
+            related = [
+                line
+                for line in step_lines
+                if any(token in line.lower() for token in (f"step {step}", f"step_{step}", f"paso {step}"))
+            ]
+            content = [
+                f"run_id: {run_id}",
+                f"step: {step}",
+                f"timestamp_utc: {now}",
+                "window evidence synthesized by bridge from run logs",
+            ]
+            if related:
+                content.append("related_findings:")
+                content.extend(f"- {line}" for line in related[:5])
+            abs_path.write_text("\n".join(content) + "\n", encoding="utf-8")
+        if rel not in path_set:
+            merged_paths.append(rel)
+            path_set.add(rel)
+
+    return replace(report, evidence_paths=merged_paths)
 
 
 def _validate_gui_post_conditions(

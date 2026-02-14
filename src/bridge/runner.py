@@ -136,7 +136,8 @@ def _gui_mode_block(run_dir: Path) -> str:
         f"The evidence directory already exists: {evidence_dir}. "
         "Before any click, identify explicit target window/title. "
         "After each click, run a verify step describing what changed. "
-        "For every click step N, save before/after screenshots and active window log in "
-        f"{evidence_dir} as step_N_before.png, step_N_after.png, step_N_window.txt. "
+        "For every click step N, save before/after screenshots in "
+        f"{evidence_dir} as step_N_before.png and step_N_after.png. "
+        "The bridge auto-finalizes step_N_window.txt if missing. "
         "If button/target is not found, report blocked state and safe alternatives."
     )
