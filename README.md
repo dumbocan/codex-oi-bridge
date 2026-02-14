@@ -14,6 +14,19 @@ bajo control de Codex.
 - `bridge logs --tail 200`
 - `bridge doctor --mode shell|gui|web`
 
+## Runtime recomendado (obligatorio)
+
+Para evitar errores de `OPENAI_API_KEY` ausente por sesión, usar siempre `bridge-safe`:
+
+- Script: `/home/micasa/codex-oi-bridge/bridge-safe`
+- Alias shell: `bridge-safe() { /home/micasa/codex-oi-bridge/bridge-safe "$@"; }`
+
+Flujo recomendado:
+1. `bridge-safe doctor --mode shell`
+2. `bridge-safe run ...` / `bridge-safe web-run ...` / `bridge-safe gui-run ...`
+
+No usar `bridge` directo salvo que la sesión tenga `.venv` y `.env` cargados manualmente.
+
 ## Contrato JSON
 
 Salida final estricta:

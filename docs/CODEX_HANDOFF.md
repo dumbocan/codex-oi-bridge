@@ -275,3 +275,16 @@ bridge logs --tail 200
 
 - Fix: URL parsing en `web` mode ahora normaliza puntuación final en lenguaje natural.
 - Caso cubierto: tasks como `abre http://localhost:5173, click ...` ya no fallan por URL inválida.
+
+## 27) Runtime recomendado (obligatorio)
+
+Para evitar errores de `OPENAI_API_KEY` ausente por sesión, usar siempre `bridge-safe`:
+
+- Script: `/home/micasa/codex-oi-bridge/bridge-safe`
+- Alias shell: `bridge-safe() { /home/micasa/codex-oi-bridge/bridge-safe "$@"; }`
+
+Flujo:
+1. `bridge-safe doctor --mode shell`
+2. `bridge-safe run ...` / `bridge-safe web-run ...` / `bridge-safe gui-run ...`
+
+No usar `bridge` directo salvo que la sesión tenga `.venv` y `.env` cargados manualmente.
