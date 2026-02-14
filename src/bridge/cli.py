@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shlex
+from dataclasses import replace
 from pathlib import Path
 
 from bridge.constants import ALLOWED_COMMAND_PREFIXES
@@ -121,6 +122,8 @@ def run_command(task: str, confirm_sensitive: bool) -> None:
             "warning=non-zero-returncode-but-valid-report-parsed",
         )
     _validate_report_actions(report, confirm_sensitive)
+    safe_evidence_paths = _validate_evidence_paths(report, ctx.run_dir)
+    report = replace(report, evidence_paths=safe_evidence_paths)
 
     write_json(ctx.report_path, report.to_dict())
     write_status(
@@ -137,8 +140,13 @@ def _validate_report_actions(report: OIReport, confirm_sensitive: bool) -> None:
     sensitive_hits: list[str] = []
     for action in report.actions:
         if not action.startswith("cmd:"):
-            continue
+            raise SystemExit(
+                "Guardrail blocked action: every action must follow format "
+                "'cmd: <command>'."
+            )
         command = action.split("cmd:", 1)[1].strip()
+        if not command:
+            raise SystemExit("Guardrail blocked action: empty command after 'cmd:'.")
         decision = evaluate_command(command)
         if not decision.allowed:
             raise SystemExit(f"Guardrail blocked action '{command}': {decision.reason}")
@@ -153,11 +161,32 @@ def logs_command(tail_count: int) -> None:
         raise SystemExit("No runs available yet.")
     run_dir = Path(payload["run_dir"])
     bridge_log = run_dir / "bridge.log"
+    oi_stdout = run_dir / "oi_stdout.log"
     oi_stderr = run_dir / "oi_stderr.log"
     output_lines = []
     output_lines.extend(tail_lines(bridge_log, tail_count))
+    output_lines.extend(tail_lines(oi_stdout, tail_count))
     output_lines.extend(tail_lines(oi_stderr, tail_count))
     print("\n".join(output_lines))
+
+
+def _validate_evidence_paths(report: OIReport, run_dir: Path) -> list[str]:
+    run_root = run_dir.resolve()
+    safe_paths: list[str] = []
+    for raw_path in report.evidence_paths:
+        candidate = Path(raw_path)
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+        else:
+            resolved = (Path.cwd() / candidate).resolve(strict=False)
+        if run_root == resolved or run_root in resolved.parents:
+            safe_paths.append(str(resolved.relative_to(Path.cwd())))
+            continue
+        raise SystemExit(
+            "Guardrail blocked evidence path outside run directory: "
+            f"{raw_path}"
+        )
+    return safe_paths
 
 
 def _validate_oi_runtime_config() -> None:

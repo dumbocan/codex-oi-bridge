@@ -111,3 +111,29 @@ export OI_BRIDGE_TIMEOUT_SECONDS=90
 - Confirmar existencia de `report.json` válido.
 - Confirmar que guardrails siguen bloqueando acciones prohibidas.
 - No ampliar alcance a edición de código sin rediseño explícito.
+
+## 12) Known Risks (v0.1.0)
+
+Riesgos detectados en v0.1.0:
+1. `actions[]` solo se validaba si empezaba por `cmd:` (posible bypass).
+2. `evidence_paths[]` no estaba restringido canónicamente a `runs/<run_id>/`.
+3. `bridge logs` no incluía `oi_stdout.log`.
+
+## 13) Security Posture
+
+- No confiar en `report.json` sin validación adicional.
+- Consumidores deben ignorar `evidence_paths` fuera de `run_dir`.
+
+## 14) Next Patch Plan (v0.1.1) [COMPLETADO]
+
+Implementado en v0.1.1:
+1. Hard-fail si una acción no sigue formato `cmd: ...`.
+2. Validación canónica de `evidence_paths[]` dentro de `ctx.run_dir`.
+3. `bridge logs` incluye `oi_stdout.log` además de `bridge.log` y `oi_stderr.log`.
+
+## 15) Test Gaps (v0.1.0) [CERRADOS en v0.1.1]
+
+Se añadieron tests para:
+- bypass de `actions[]` sin `cmd:`.
+- path traversal/rutas externas en `evidence_paths[]`.
+- salida de `bridge logs` incluyendo stdout+stderr.
