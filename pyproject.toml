@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-oi-bridge"
+version = "0.1.0"
+description = "Bridge CLI to use Open Interpreter as an observation-only assistant."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "codex-oi-bridge" }
+]
+dependencies = []
+
+[project.scripts]
+bridge = "bridge.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.flake8]
+max-line-length = 100
+exclude = [".venv", "runs", "__pycache__"]
