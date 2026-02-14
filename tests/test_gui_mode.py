@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from bridge.cli import (
+    run_command,
     _extract_button_targets,
     _validate_evidence_paths,
     _validate_gui_post_conditions,
@@ -13,6 +14,63 @@ from bridge.models import OIReport
 
 
 class GUIModeTests(unittest.TestCase):
+    def test_run_command_gui_creates_evidence_dir_before_oi(self) -> None:
+        captured = {}
+
+        def fake_run_open_interpreter(*, prompt: str, timeout_seconds: int):
+            # Called after run context/evidence dir are set up.
+            captured["called"] = True
+            return type(
+                "RunnerResult",
+                (),
+                {
+                    "stdout": """{
+  "task_id": "fake",
+  "goal": "gui",
+  "actions": [],
+  "observations": [],
+  "console_errors": [],
+  "network_findings": [],
+  "ui_findings": [],
+  "result": "success",
+  "evidence_paths": []
+}""",
+                    "stderr": "",
+                    "returncode": 0,
+                    "timed_out": False,
+                },
+            )()
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            ctx = type(
+                "RunContext",
+                (),
+                {
+                    "run_id": "r1",
+                    "run_dir": run_dir,
+                    "bridge_log": run_dir / "bridge.log",
+                    "stdout_log": run_dir / "oi_stdout.log",
+                    "stderr_log": run_dir / "oi_stderr.log",
+                    "report_path": run_dir / "report.json",
+                },
+            )()
+
+            from unittest.mock import patch
+
+            with patch("bridge.cli.create_run_context", return_value=ctx), patch(
+                "bridge.cli.run_open_interpreter",
+                side_effect=fake_run_open_interpreter,
+            ), patch("bridge.cli.write_status"), patch(
+                "bridge.cli._validate_oi_runtime_config"
+            ), patch("bridge.cli.require_sensitive_confirmation"):
+                run_command("gui smoke", confirm_sensitive=True, mode="gui")
+
+            self.assertTrue((run_dir / "evidence").exists())
+            self.assertTrue((run_dir / "evidence").is_dir())
+            self.assertIn("called", captured)
+
     def test_gui_rejects_click_without_target_window(self) -> None:
         report = OIReport(
             task_id="g1",

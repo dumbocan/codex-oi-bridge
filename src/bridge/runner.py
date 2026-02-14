@@ -133,6 +133,7 @@ def _gui_mode_block(run_dir: Path) -> str:
     evidence_dir = run_dir / "evidence"
     return (
         "In gui mode: no asumir, verificar. Un paso, una evidencia. "
+        f"The evidence directory already exists: {evidence_dir}. "
         "Before any click, identify explicit target window/title. "
         "After each click, run a verify step describing what changed. "
         "For every click step N, save before/after screenshots and active window log in "

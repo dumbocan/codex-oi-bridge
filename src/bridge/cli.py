@@ -120,6 +120,8 @@ def run_command(task: str, confirm_sensitive: bool, mode: str) -> None:
     allowlist = _mode_allowlist(mode)
 
     ctx = create_run_context()
+    if mode == "gui":
+        (ctx.run_dir / "evidence").mkdir(parents=True, exist_ok=True)
     append_log(ctx.bridge_log, f"run_id={ctx.run_id}")
     append_log(ctx.bridge_log, f"goal={task}")
     append_log(ctx.bridge_log, f"mode={mode}")
@@ -333,7 +335,8 @@ def _validate_evidence_paths(
                 if not full.exists() or not full.is_file():
                     raise SystemExit(
                         "Guardrail blocked GUI report: required evidence file "
-                        f"missing on disk for click step {step}: {rel}"
+                        "missing on disk. "
+                        f"step={step}, path={rel}, run_dir={run_dir}"
                     )
     return safe_paths
 
