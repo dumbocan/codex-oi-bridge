@@ -7,10 +7,12 @@ bajo control de Codex.
 
 - `bridge run "<task>"`
 - `bridge run --mode gui "<task>"`
+- `bridge run --mode web "<task>"`
 - `bridge gui-run "<task>"`
+- `bridge web-run "<task>"`
 - `bridge status`
 - `bridge logs --tail 200`
-- `bridge doctor --mode shell|gui`
+- `bridge doctor --mode shell|gui|web`
 
 ## Contrato JSON
 
@@ -48,6 +50,39 @@ Evidencia obligatoria por click `N`:
 - `runs/<run_id>/evidence/step_<N>_before.png`
 - `runs/<run_id>/evidence/step_<N>_after.png`
 - `runs/<run_id>/evidence/step_<N>_window.txt`
+
+## Web Mode (Playwright) (v1.3)
+
+- Activación: `bridge run --mode web ...` o `bridge web-run ...`.
+- Backend determinista desde bridge (no depende del output narrativo de OI).
+- Capacidades:
+  - abrir URL explícita del task,
+  - click por texto o selector,
+  - verificación visible por paso,
+  - captura `before/after` por cada click.
+- En `--verified` exige:
+  - evidencia `before/after` existente y no vacía por step,
+  - verify post-step en findings.
+
+Evidencia web por click `N`:
+- `runs/<run_id>/evidence/step_<N>_before.png`
+- `runs/<run_id>/evidence/step_<N>_after.png`
+
+Hallazgos runtime:
+- `console_errors[]` desde consola del navegador.
+- `network_findings[]` desde responses >= 400 y requests fallidas.
+
+## Window Management (v1.3)
+
+En `gui` mode el bridge soporta operaciones deterministas de ventanas:
+- `window:list`
+- `window:active`
+- `window:activate <title|id>`
+- `window:open <app/url>`
+
+Estas operaciones generan evidencia por paso:
+- screenshot before/after
+- `step_<N>_window.txt`
 
 ## Logs y artefactos
 
@@ -99,6 +134,18 @@ Then inspect:
 - `runs/<run_id>/report.json`
 - `runs/<run_id>/evidence/`
 
+## Playbook Web ejemplo
+
+```bash
+cd /home/micasa/codex-oi-bridge
+set -a && source .env && set +a
+bridge doctor --mode web
+bridge web-run --verified \
+  "abre http://localhost:5173, haz click en botón \"Entrar demo\", verifica cambio visible y reporta"
+bridge status
+bridge logs --tail 200
+```
+
 Resultado esperado:
 - `actions[]` con comandos `cmd: ...`
 - `observations/ui_findings` con ubicación del botón, acción aplicada y cambio visible
@@ -120,5 +167,9 @@ Resultado esperado:
   - `--mode gui` y `gui-run`
   - guardrails GUI (target window + verify + no coordinate clicks)
   - evidencia obligatoria before/after por click
+- `v1.3.0`: Web + Window control:
+  - `--mode web` y `web-run` con Playwright determinista
+  - captura console/network real del navegador
+  - operaciones de ventana deterministas en `gui` (`window:*`)
 
 Ver handoff completo en `docs/CODEX_HANDOFF.md`.

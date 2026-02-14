@@ -44,6 +44,17 @@ class DoctorTests(unittest.TestCase):
         screenshot_check = next(item for item in checks if item["name"] == "screenshot_runtime")
         self.assertFalse(screenshot_check["ok"])
 
+    def test_collect_runtime_checks_web(self) -> None:
+        with patch("bridge.cli._playwright_module_available", return_value=True), patch(
+            "bridge.cli._web_browser_binary_available",
+            return_value=True,
+        ):
+            checks = _collect_runtime_checks("web")
+        names = {item["name"] for item in checks}
+        self.assertIn("playwright_python", names)
+        self.assertIn("web_browser_binary", names)
+        self.assertNotIn("openai_api_key", names)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from bridge.constants import (
     GUI_ALLOWED_COMMAND_PREFIXES,
     GUI_STATE_CHANGING_TOKENS,
     SHELL_ALLOWED_COMMAND_PREFIXES,
+    WEB_ALLOWED_COMMAND_PREFIXES,
 )
 from bridge.guardrails import (
     evaluate_command,
@@ -37,6 +39,8 @@ from bridge.storage import (
     write_json,
     write_status,
 )
+from bridge.web_backend import run_web_task
+from bridge.window_backend import run_window_task, should_handle_window_task
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
@@ -70,6 +74,14 @@ def main() -> None:
             verified=args.verified,
         )
         return
+    if args.command == "web-run":
+        run_command(
+            args.task,
+            confirm_sensitive=args.confirm_sensitive,
+            mode="web",
+            verified=args.verified,
+        )
+        return
     if args.command == "status":
         print(json.dumps(status_payload(), indent=2, ensure_ascii=False))
         return
@@ -91,9 +103,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("task", type=str)
     run_parser.add_argument(
         "--mode",
-        choices=("shell", "gui"),
+        choices=("shell", "gui", "web"),
         default="shell",
-        help="Execution mode. shell (default) or gui.",
+        help="Execution mode. shell (default), gui, or web.",
     )
     run_parser.add_argument(
         "--confirm-sensitive",
@@ -121,6 +133,21 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable strict verified mode checks before accepting run output.",
     )
+    web_run_parser = subparsers.add_parser(
+        "web-run",
+        help='Run a deterministic web task: bridge web-run "<task>"',
+    )
+    web_run_parser.add_argument("task", type=str)
+    web_run_parser.add_argument(
+        "--confirm-sensitive",
+        action="store_true",
+        help="Approve sensitive actions without interactive prompt.",
+    )
+    web_run_parser.add_argument(
+        "--verified",
+        action="store_true",
+        help="Enable strict verified mode checks before accepting run output.",
+    )
 
     subparsers.add_parser("status", help="Show latest run status")
 
@@ -133,9 +160,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     doctor_parser.add_argument(
         "--mode",
-        choices=("shell", "gui"),
+        choices=("shell", "gui", "web"),
         default="shell",
-        help="Check shell or gui prerequisites.",
+        help="Check shell, gui, or web prerequisites.",
     )
     return parser
 
@@ -143,7 +170,6 @@ def _build_parser() -> argparse.ArgumentParser:
 def run_command(task: str, confirm_sensitive: bool, mode: str, verified: bool = False) -> None:
     if task_violates_code_edit_rule(task):
         raise SystemExit("Task rejected: requests source-code modification (forbidden by guardrails).")
-    _validate_oi_runtime_config()
     _validate_mode_preconditions(mode, confirm_sensitive)
     _preflight_runtime(mode)
 
@@ -155,7 +181,7 @@ def run_command(task: str, confirm_sensitive: bool, mode: str, verified: bool = 
     allowlist = _mode_allowlist(mode)
 
     ctx = create_run_context()
-    if mode == "gui":
+    if mode in ("gui", "web"):
         (ctx.run_dir / "evidence").mkdir(parents=True, exist_ok=True)
     append_log(ctx.bridge_log, f"run_id={ctx.run_id}")
     append_log(ctx.bridge_log, f"goal={task}")
@@ -165,56 +191,79 @@ def run_command(task: str, confirm_sensitive: bool, mode: str, verified: bool = 
     if button_targets:
         append_log(ctx.bridge_log, f"button_targets={sorted(button_targets)}")
 
-    prompt = build_oi_prompt(
-        task_id=ctx.run_id,
-        task=task,
-        run_dir=ctx.run_dir,
-        allowlist=allowlist,
-        mode=mode,
-    )
-    write_json(ctx.run_dir / "prompt.json", {"prompt": prompt})
-
     timeout_seconds = int(os.getenv("OI_BRIDGE_TIMEOUT_SECONDS", "300"))
-    result = run_open_interpreter(
-        prompt=prompt,
-        timeout_seconds=timeout_seconds,
-        run_dir=ctx.run_dir,
-    )
-    ctx.stdout_log.write_text(result.stdout, encoding="utf-8")
-    ctx.stderr_log.write_text(result.stderr, encoding="utf-8")
-    append_log(ctx.bridge_log, f"oi_returncode={result.returncode}")
-    append_log(ctx.bridge_log, f"oi_timed_out={result.timed_out}")
+    stdout_text = ""
 
-    try:
-        report = parse_oi_report(result.stdout)
-    except ValueError as exc:
-        write_status(
-            run_id=ctx.run_id,
-            run_dir=ctx.run_dir,
+    if mode == "web":
+        report = run_web_task(task, run_dir=ctx.run_dir, timeout_seconds=timeout_seconds, verified=verified)
+        stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
+        ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
+        ctx.stderr_log.write_text("", encoding="utf-8")
+        append_log(ctx.bridge_log, "runner=web-backend")
+        append_log(ctx.bridge_log, "oi_returncode=0")
+        append_log(ctx.bridge_log, "oi_timed_out=False")
+        write_json(ctx.run_dir / "prompt.json", {"mode": "web", "task": task})
+    elif mode == "gui" and should_handle_window_task(task):
+        report = run_window_task(task, run_dir=ctx.run_dir, timeout_seconds=timeout_seconds)
+        stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
+        ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
+        ctx.stderr_log.write_text("", encoding="utf-8")
+        append_log(ctx.bridge_log, "runner=window-backend")
+        append_log(ctx.bridge_log, "oi_returncode=0")
+        append_log(ctx.bridge_log, "oi_timed_out=False")
+        write_json(ctx.run_dir / "prompt.json", {"mode": "gui-window", "task": task})
+    else:
+        _validate_oi_runtime_config()
+        prompt = build_oi_prompt(
+            task_id=ctx.run_id,
             task=task,
-            result="failed",
-            report_path=ctx.report_path,
+            run_dir=ctx.run_dir,
+            allowlist=allowlist,
+            mode=mode,
         )
-        message = str(exc)
-        if "OpenAI API key not found" in result.stdout:
-            message = (
-                "Open Interpreter requires API key/model configuration. "
-                "Set OPENAI_API_KEY and retry."
+        write_json(ctx.run_dir / "prompt.json", {"prompt": prompt})
+
+        result = run_open_interpreter(
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            run_dir=ctx.run_dir,
+        )
+        stdout_text = result.stdout
+        ctx.stdout_log.write_text(result.stdout, encoding="utf-8")
+        ctx.stderr_log.write_text(result.stderr, encoding="utf-8")
+        append_log(ctx.bridge_log, f"oi_returncode={result.returncode}")
+        append_log(ctx.bridge_log, f"oi_timed_out={result.timed_out}")
+
+        try:
+            report = parse_oi_report(result.stdout)
+        except ValueError as exc:
+            write_status(
+                run_id=ctx.run_id,
+                run_dir=ctx.run_dir,
+                task=task,
+                result="failed",
+                report_path=ctx.report_path,
             )
-        if result.timed_out:
-            message = (
-                f"Open Interpreter timed out after {timeout_seconds}s "
-                "without producing a valid report JSON"
+            message = str(exc)
+            if "OpenAI API key not found" in result.stdout:
+                message = (
+                    "Open Interpreter requires API key/model configuration. "
+                    "Set OPENAI_API_KEY and retry."
+                )
+            if result.timed_out:
+                message = (
+                    f"Open Interpreter timed out after {timeout_seconds}s "
+                    "without producing a valid report JSON"
+                )
+            raise SystemExit(
+                f"Open Interpreter output is not valid JSON: {message}. "
+                f"Inspect {ctx.stdout_log} and {ctx.stderr_log}"
             )
-        raise SystemExit(
-            f"Open Interpreter output is not valid JSON: {message}. "
-            f"Inspect {ctx.stdout_log} and {ctx.stderr_log}"
-        )
-    if result.returncode != 0:
-        append_log(
-            ctx.bridge_log,
-            "warning=non-zero-returncode-but-valid-report-parsed",
-        )
+        if result.returncode != 0:
+            append_log(
+                ctx.bridge_log,
+                "warning=non-zero-returncode-but-valid-report-parsed",
+            )
 
     click_steps = _validate_report_actions(
         report,
@@ -241,7 +290,7 @@ def run_command(task: str, confirm_sensitive: bool, mode: str, verified: bool = 
         report,
         mode=mode,
         verified=verified,
-        stdout_text=result.stdout,
+        stdout_text=stdout_text,
     )
 
     write_json(ctx.report_path, report.to_dict())
@@ -309,6 +358,9 @@ def _validate_report_actions(
                 saw_mousemove_since_last_target = False
             if _is_state_changing_gui_action(command):
                 sensitive_hits.append(command)
+        elif mode == "web":
+            if _is_web_click_command(command):
+                click_steps += 1
 
         if decision.sensitive:
             sensitive_hits.append(command)
@@ -401,6 +453,27 @@ def _validate_evidence_paths(
                     )
                 if rel.endswith(("_before.png", "_after.png")) and full.stat().st_size <= 0:
                     raise SystemExit(f"Screenshot evidence missing/empty for step {step}: {full}")
+    if mode == "web" and click_steps > 0:
+        existing = set(rel_paths)
+        for step in range(1, click_steps + 1):
+            required = (
+                f"evidence/step_{step}_before.png",
+                f"evidence/step_{step}_after.png",
+            )
+            for rel in required:
+                if rel not in existing:
+                    raise SystemExit(
+                        "Guardrail blocked WEB report: missing required evidence "
+                        f"for click step {step}: {rel}"
+                    )
+                full = (run_dir / rel).resolve(strict=False)
+                if not full.exists() or not full.is_file():
+                    raise SystemExit(
+                        "Guardrail blocked WEB report: required evidence file missing "
+                        f"on disk. step={step}, path={rel}, run_dir={run_dir}"
+                    )
+                if full.stat().st_size <= 0:
+                    raise SystemExit(f"Screenshot evidence missing/empty for step {step}: {full}")
     return safe_paths
 
 
@@ -451,7 +524,7 @@ def _validate_gui_post_conditions(
     click_steps: int,
     button_targets: set[str],
 ) -> None:
-    if mode != "gui":
+    if mode not in ("gui", "web"):
         return
 
     lines = [line.lower() for line in (report.observations + report.ui_findings)]
@@ -472,12 +545,13 @@ def _validate_gui_post_conditions(
                 f"details for click step {step}."
             )
 
-    for label in button_targets:
-        if label.lower() not in combined:
-            raise SystemExit(
-                "Guardrail blocked GUI report: task mentions button text "
-                f"'{label}' but findings do not confirm location/action/result."
-            )
+    if mode == "gui":
+        for label in button_targets:
+            if label.lower() not in combined:
+                raise SystemExit(
+                    "Guardrail blocked GUI report: task mentions button text "
+                    f"'{label}' but findings do not confirm location/action/result."
+                )
 
 
 def _validate_oi_runtime_config() -> None:
@@ -519,20 +593,31 @@ def _collect_runtime_checks(mode: str) -> list[dict[str, object]]:
     def add(name: str, ok: bool, detail: str) -> None:
         checks.append({"name": name, "ok": ok, "detail": detail})
 
-    has_key = bool(os.getenv("OPENAI_API_KEY"))
-    add("openai_api_key", has_key, "OPENAI_API_KEY present" if has_key else "Missing OPENAI_API_KEY")
+    if mode in ("shell", "gui"):
+        has_key = bool(os.getenv("OPENAI_API_KEY"))
+        add(
+            "openai_api_key",
+            has_key,
+            "OPENAI_API_KEY present" if has_key else "Missing OPENAI_API_KEY",
+        )
 
-    dns_ok = _can_resolve("api.openai.com")
-    add("dns_api_openai", dns_ok, "api.openai.com resolvable" if dns_ok else "Cannot resolve api.openai.com")
+        dns_ok = _can_resolve("api.openai.com")
+        add(
+            "dns_api_openai",
+            dns_ok,
+            "api.openai.com resolvable" if dns_ok else "Cannot resolve api.openai.com",
+        )
 
-    interpreter_path = shutil.which(os.getenv("OI_BRIDGE_COMMAND", "interpreter")) or str(
-        Path(".venv") / "bin" / os.getenv("OI_BRIDGE_COMMAND", "interpreter")
-    )
-    add(
-        "interpreter_binary",
-        Path(interpreter_path).exists() or bool(shutil.which(os.getenv("OI_BRIDGE_COMMAND", "interpreter"))),
-        f"Using {interpreter_path}",
-    )
+    if mode in ("shell", "gui"):
+        interpreter_path = shutil.which(os.getenv("OI_BRIDGE_COMMAND", "interpreter")) or str(
+            Path(".venv") / "bin" / os.getenv("OI_BRIDGE_COMMAND", "interpreter")
+        )
+        add(
+            "interpreter_binary",
+            Path(interpreter_path).exists()
+            or bool(shutil.which(os.getenv("OI_BRIDGE_COMMAND", "interpreter"))),
+            f"Using {interpreter_path}",
+        )
 
     if mode == "gui":
         display = os.getenv("DISPLAY", "")
@@ -548,6 +633,21 @@ def _collect_runtime_checks(mode: str) -> list[dict[str, object]]:
         )
         shot_ok, shot_detail = _doctor_screenshot_runtime_check()
         add("screenshot_runtime", shot_ok, shot_detail)
+    if mode == "web":
+        py_ok = _playwright_module_available()
+        add(
+            "playwright_python",
+            py_ok,
+            "playwright module importable" if py_ok else "playwright module missing",
+        )
+        browser_ok = _web_browser_binary_available()
+        add(
+            "web_browser_binary",
+            browser_ok,
+            "chrome/chromium/firefox binary found"
+            if browser_ok
+            else "No browser binary found in PATH",
+        )
 
     return checks
 
@@ -558,6 +658,21 @@ def _can_resolve(hostname: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def _playwright_module_available() -> bool:
+    return importlib.util.find_spec("playwright") is not None
+
+
+def _web_browser_binary_available() -> bool:
+    candidates = (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "firefox",
+    )
+    return any(shutil.which(item) for item in candidates)
 
 
 def _doctor_screenshot_runtime_check() -> tuple[bool, str]:
@@ -586,6 +701,8 @@ def _doctor_screenshot_runtime_check() -> tuple[bool, str]:
 def _mode_allowlist(mode: str) -> tuple[str, ...]:
     if mode == "gui":
         return GUI_ALLOWED_COMMAND_PREFIXES
+    if mode == "web":
+        return WEB_ALLOWED_COMMAND_PREFIXES
     return SHELL_ALLOWED_COMMAND_PREFIXES
 
 
@@ -697,6 +814,11 @@ def _is_mousemove_command(command: str) -> bool:
 def _is_state_changing_gui_action(command: str) -> bool:
     low = command.lower()
     return any(token in low for token in GUI_STATE_CHANGING_TOKENS)
+
+
+def _is_web_click_command(command: str) -> bool:
+    low = command.lower()
+    return low.startswith("playwright ") and " click " in f" {low} "
 
 
 def _validate_malformed_command(command: str) -> None:

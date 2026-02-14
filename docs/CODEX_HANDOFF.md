@@ -218,3 +218,55 @@ bridge logs --tail 200
 Then inspect:
 - `runs/<run_id>/report.json`
 - `runs/<run_id>/evidence/`
+
+## 23) v1.3.0 Web Mode (Playwright)
+
+Nuevos entrypoints:
+- `bridge run --mode web "<task>"`
+- `bridge web-run "<task>"`
+- `bridge doctor --mode web`
+
+Características:
+- ejecución determinista desde bridge (sin depender de texto libre de OI),
+- abre URL explícita del task,
+- click por texto/selector,
+- verificación visible post-step,
+- screenshots `step_N_before.png` y `step_N_after.png`,
+- captura real de `console_errors[]` y `network_findings[]`.
+
+En `--verified`:
+- hard-fail si falta evidencia before/after por step,
+- hard-fail si no hay verify post-step.
+
+## 24) v1.3.0 Window Management (GUI)
+
+Soporte explícito en modo `gui`:
+- `window:list`
+- `window:active`
+- `window:activate <title|id>`
+- `window:open <app/url>`
+
+Comportamiento:
+- si el task trae operaciones `window:*`, las ejecuta el backend determinista del bridge.
+- cada paso genera evidencia:
+  - `step_N_before.png`
+  - `step_N_after.png`
+  - `step_N_window.txt`
+
+Guardrails:
+- se mantiene bloqueo destructivo,
+- se mantiene bloqueo de coordinate-click unsafe,
+- se mantiene política de evidencia dentro de `runs/<run_id>/`.
+
+## 25) Flujo recomendado (v1.3.0)
+
+```bash
+cd /home/micasa/codex-oi-bridge
+set -a && source .env && set +a
+bridge doctor --mode web
+bridge web-run --verified "<web task>"
+bridge doctor --mode gui
+bridge gui-run --confirm-sensitive --verified "<gui/window task>"
+bridge status
+bridge logs --tail 200
+```
