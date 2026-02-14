@@ -171,5 +171,7 @@ Resultado esperado:
   - `--mode web` y `web-run` con Playwright determinista
   - captura console/network real del navegador
   - operaciones de ventana deterministas en `gui` (`window:*`)
+- `v1.3.1`: estabilidad de web mode:
+  - fix de parseo de URL con puntuación final (`trailing punctuation`) en tasks (`http://... ,`)
 
 Ver handoff completo en `docs/CODEX_HANDOFF.md`.

@@ -270,3 +270,8 @@ bridge gui-run --confirm-sensitive --verified "<gui/window task>"
 bridge status
 bridge logs --tail 200
 ```
+
+## 26) v1.3.1 Hotfix
+
+- Fix: URL parsing en `web` mode ahora normaliza puntuación final en lenguaje natural.
+- Caso cubierto: tasks como `abre http://localhost:5173, click ...` ya no fallan por URL inválida.

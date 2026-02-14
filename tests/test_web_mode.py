@@ -3,6 +3,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from bridge.cli import _validate_evidence_paths, _validate_report_actions
 from bridge.constants import WEB_ALLOWED_COMMAND_PREFIXES
@@ -156,6 +157,19 @@ class WebModeTests(unittest.TestCase):
                 abs_path = Path.cwd() / rel_path
                 self.assertTrue(abs_path.exists())
                 self.assertGreater(abs_path.stat().st_size, 0)
+
+    def test_web_task_url_with_trailing_comma_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            with patch("bridge.web_backend._playwright_available", return_value=False):
+                with self.assertRaises(SystemExit) as ctx:
+                    run_web_task(
+                        "abre http://localhost:5173, y verifica",
+                        run_dir,
+                        30,
+                    )
+            self.assertIn("Playwright Python package is not installed", str(ctx.exception))
 
     def test_web_actions_and_evidence_validations(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:

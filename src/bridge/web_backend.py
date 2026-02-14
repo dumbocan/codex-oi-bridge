@@ -6,6 +6,7 @@ import importlib.util
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from bridge.models import OIReport
 
@@ -25,7 +26,9 @@ def run_web_task(task: str, run_dir: Path, timeout_seconds: int, verified: bool 
     url_match = _URL_RE.search(task)
     if not url_match:
         raise SystemExit("Web mode requires an explicit URL in task.")
-    url = url_match.group(0)
+    url = _normalize_url(url_match.group(0))
+    if not _is_valid_url(url):
+        raise SystemExit(f"Web mode received invalid URL token: {url_match.group(0)}")
     click_texts = [m.group(1).strip() for m in _CLICK_TEXT_RE.finditer(task)]
     selectors = [m.group(1).strip() for m in _SELECTOR_RE.finditer(task)]
     steps = _build_steps(click_texts, selectors)
@@ -153,3 +156,15 @@ def _launch_browser(playwright_obj: Any) -> Any:
 
 def _to_repo_rel(path: Path) -> str:
     return str(path.resolve().relative_to(Path.cwd()))
+
+
+def _normalize_url(raw: str) -> str:
+    return raw.rstrip(".,;:!?)]}\"'")
+
+
+def _is_valid_url(text: str) -> bool:
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
