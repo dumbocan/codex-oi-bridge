@@ -135,6 +135,7 @@ def _build_runner_env(run_dir: Path) -> dict[str, str]:
     env["XDG_CACHE_HOME"] = str(cache_dir)
     env["XDG_CONFIG_HOME"] = str(config_dir)
     env["MPLCONFIGDIR"] = str(config_dir / "matplotlib")
+    env["DISABLE_TELEMETRY"] = "true"
     return env
 
 

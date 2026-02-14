@@ -112,6 +112,23 @@ more text
         )
         self.assertEqual(report.result, "failed")
 
+    def test_parse_rejects_non_string_observations(self) -> None:
+        raw = """
+{
+  "task_id": "t-3",
+  "goal": "inspect",
+  "actions": ["cmd: ls"],
+  "observations": [{"k": "v"}],
+  "console_errors": [],
+  "network_findings": [],
+  "ui_findings": [],
+  "result": "partial",
+  "evidence_paths": []
+}
+"""
+        with self.assertRaises(ValueError):
+            parse_oi_report(raw)
+
 
 if __name__ == "__main__":
     unittest.main()

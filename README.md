@@ -10,6 +10,7 @@ bajo control de Codex.
 - `bridge gui-run "<task>"`
 - `bridge status`
 - `bridge logs --tail 200`
+- `bridge doctor --mode shell|gui`
 
 ## Contrato JSON
 
@@ -41,6 +42,7 @@ Salida final estricta:
 - Clicks sin ventana objetivo explícita son bloqueados.
 - Clicks por coordenadas (`mousemove ... click`) son bloqueados.
 - Tras cada click se exige verificación y evidencia before/after.
+- Paso previo recomendado/obligatorio en operación diaria: `bridge doctor --mode gui`.
 
 Evidencia obligatoria por click `N`:
 - `runs/<run_id>/evidence/step_<N>_before.png`
@@ -58,6 +60,16 @@ Cada ejecución guarda artefactos en `runs/<run_id>/`:
 
 `bridge logs` incluye tail de `bridge.log`, `oi_stdout.log` y `oi_stderr.log`.
 
+## v1.2.3 Runtime Hardening
+
+Open Interpreter now runs with per-run writable directories:
+- `HOME=runs/<run_id>/.oi_home`
+- `XDG_CACHE_HOME=runs/<run_id>/.oi_home/.cache`
+- `XDG_CONFIG_HOME=runs/<run_id>/.oi_home/.config`
+- `MPLCONFIGDIR=runs/<run_id>/.oi_home/.config/matplotlib`
+
+This avoids read-only failures (for example `~/.cache/open-interpreter/contribute.json`) and keeps runtime artifacts isolated per run.
+
 ## Requisitos de entorno GUI (X11)
 
 - `DISPLAY` válido (por ejemplo `:0`).
@@ -68,14 +80,24 @@ Troubleshooting típico:
 - `DISPLAY` no configurado: exportar `DISPLAY=:0` en la sesión correcta.
 - Ventana incorrecta en foco: usar pasos explícitos de búsqueda/activación de ventana.
 - Sin screenshots: instalar o habilitar `import`/`scrot`.
+- Preflight rápido: `bridge doctor --mode gui`.
 
 ## Playbook GUI ejemplo
 
 ```bash
+cd /home/micasa/codex-oi-bridge
+set -a && source .env && set +a
+bridge doctor --mode gui
 bridge gui-run --confirm-sensitive \
   "abre navegador, navega a https://example.com y haz click en botón \"Descargar archivo\". \
 verifica resultado visible tras click y guarda evidencia por paso."
+bridge status
+bridge logs --tail 200
 ```
+
+Then inspect:
+- `runs/<run_id>/report.json`
+- `runs/<run_id>/evidence/`
 
 Resultado esperado:
 - `actions[]` con comandos `cmd: ...`

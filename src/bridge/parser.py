@@ -87,22 +87,13 @@ def _candidate_score(payload: dict[str, Any]) -> int:
 def _coerce_payload(payload: dict[str, Any]) -> dict[str, Any]:
     coerced = dict(payload)
     if "actions" in coerced:
-        coerced["actions"] = _coerce_string_list(coerced["actions"], key_hint="action")
-    for key in (
-        "observations",
-        "console_errors",
-        "network_findings",
-        "ui_findings",
-        "evidence_paths",
-    ):
-        if key in coerced:
-            coerced[key] = _coerce_string_list(coerced[key], key_hint=key)
+        coerced["actions"] = _coerce_actions_list(coerced["actions"])
     if "result" in coerced:
         coerced["result"] = _coerce_result(coerced["result"])
     return coerced
 
 
-def _coerce_string_list(value: Any, key_hint: str) -> list[str]:
+def _coerce_actions_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return [str(value)]
     out: list[str] = []

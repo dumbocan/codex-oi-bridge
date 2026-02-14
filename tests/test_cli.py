@@ -117,6 +117,48 @@ class CLITests(unittest.TestCase):
             mode="shell",
         )
 
+    def test_malformed_command_missing_executable_prefix_is_blocked(self) -> None:
+        report = OIReport(
+            task_id="t2",
+            goal="api",
+            actions=["cmd: -H 'Authorization: Bearer token'"],
+            observations=[],
+            console_errors=[],
+            network_findings=[],
+            ui_findings=[],
+            result="failed",
+            evidence_paths=[],
+        )
+        with self.assertRaises(SystemExit):
+            _validate_report_actions(
+                report,
+                confirm_sensitive=True,
+                expected_targets=set(),
+                allowlist=SHELL_ALLOWED_COMMAND_PREFIXES,
+                mode="shell",
+            )
+
+    def test_malformed_multiline_command_is_blocked(self) -> None:
+        report = OIReport(
+            task_id="t3",
+            goal="api",
+            actions=["cmd: curl https://api.example.com\n-H 'Authorization: Bearer token'"],
+            observations=[],
+            console_errors=[],
+            network_findings=[],
+            ui_findings=[],
+            result="failed",
+            evidence_paths=[],
+        )
+        with self.assertRaises(SystemExit):
+            _validate_report_actions(
+                report,
+                confirm_sensitive=True,
+                expected_targets=set(),
+                allowlist=SHELL_ALLOWED_COMMAND_PREFIXES,
+                mode="shell",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

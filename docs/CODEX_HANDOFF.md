@@ -193,3 +193,28 @@ Validaciones esperadas:
 - `actions[]` solo `cmd: ...`
 - evidencia before/after/window por cada click
 - findings con ubicación del botón + acción + resultado visible
+
+## 21) v1.2.3 Runtime Hardening
+
+Open Interpreter now runs with per-run writable directories:
+- `HOME=runs/<run_id>/.oi_home`
+- `XDG_CACHE_HOME=runs/<run_id>/.oi_home/.cache`
+- `XDG_CONFIG_HOME=runs/<run_id>/.oi_home/.config`
+- `MPLCONFIGDIR=runs/<run_id>/.oi_home/.config/matplotlib`
+
+This avoids read-only failures (for example `~/.cache/open-interpreter/contribute.json`) and keeps runtime artifacts isolated per run.
+
+## 22) Recommended GUI Flow
+
+```bash
+cd /home/micasa/codex-oi-bridge
+set -a && source .env && set +a
+bridge doctor --mode gui
+bridge gui-run --confirm-sensitive "<gui task>"
+bridge status
+bridge logs --tail 200
+```
+
+Then inspect:
+- `runs/<run_id>/report.json`
+- `runs/<run_id>/evidence/`

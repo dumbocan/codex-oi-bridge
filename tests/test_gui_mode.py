@@ -67,7 +67,9 @@ class GUIModeTests(unittest.TestCase):
                 side_effect=fake_run_open_interpreter,
             ), patch("bridge.cli.write_status"), patch(
                 "bridge.cli._validate_oi_runtime_config"
-            ), patch("bridge.cli.require_sensitive_confirmation"):
+            ), patch("bridge.cli.require_sensitive_confirmation"), patch(
+                "bridge.cli._preflight_runtime"
+            ):
                 with redirect_stdout(StringIO()):
                     run_command("gui smoke", confirm_sensitive=True, mode="gui")
 
@@ -384,6 +386,64 @@ class GUIModeTests(unittest.TestCase):
                 result="partial",
                 evidence_paths=[
                     str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                ],
+            )
+            with self.assertRaises(SystemExit):
+                _validate_evidence_paths(
+                    report,
+                    run_dir,
+                    mode="gui",
+                    click_steps=1,
+                    run_id="r1",
+                )
+
+    def test_gui_screenshot_listed_but_missing_file_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            report = OIReport(
+                task_id="r1",
+                goal="gui",
+                actions=["cmd: xdotool search --name Browser", "cmd: xdotool click 1"],
+                observations=["step 1 verify visible result"],
+                console_errors=[],
+                network_findings=[],
+                ui_findings=[],
+                result="partial",
+                evidence_paths=[
+                    str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                    str((evidence / "step_1_after.png").resolve().relative_to(Path.cwd())),
+                ],
+            )
+            with self.assertRaises(SystemExit):
+                _validate_evidence_paths(
+                    report,
+                    run_dir,
+                    mode="gui",
+                    click_steps=1,
+                    run_id="r1",
+                )
+
+    def test_gui_screenshot_empty_file_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "step_1_before.png").write_bytes(b"")
+            (evidence / "step_1_after.png").write_text("x", encoding="utf-8")
+            report = OIReport(
+                task_id="r1",
+                goal="gui",
+                actions=["cmd: xdotool search --name Browser", "cmd: xdotool click 1"],
+                observations=["step 1 verify visible result"],
+                console_errors=[],
+                network_findings=[],
+                ui_findings=[],
+                result="partial",
+                evidence_paths=[
+                    str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                    str((evidence / "step_1_after.png").resolve().relative_to(Path.cwd())),
                 ],
             )
             with self.assertRaises(SystemExit):

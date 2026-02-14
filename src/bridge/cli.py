@@ -7,6 +7,9 @@ import json
 import os
 import re
 import shlex
+import shutil
+import socket
+import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,16 +59,25 @@ def main() -> None:
             args.task,
             confirm_sensitive=args.confirm_sensitive,
             mode=args.mode,
+            verified=args.verified,
         )
         return
     if args.command == "gui-run":
-        run_command(args.task, confirm_sensitive=args.confirm_sensitive, mode="gui")
+        run_command(
+            args.task,
+            confirm_sensitive=args.confirm_sensitive,
+            mode="gui",
+            verified=args.verified,
+        )
         return
     if args.command == "status":
         print(json.dumps(status_payload(), indent=2, ensure_ascii=False))
         return
     if args.command == "logs":
         logs_command(args.tail)
+        return
+    if args.command == "doctor":
+        doctor_command(mode=args.mode)
         return
 
     parser.print_help()
@@ -88,6 +100,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Approve sensitive observation actions without interactive prompt.",
     )
+    run_parser.add_argument(
+        "--verified",
+        action="store_true",
+        help="Enable strict verified mode checks before accepting run output.",
+    )
 
     gui_run_parser = subparsers.add_parser(
         "gui-run",
@@ -99,19 +116,36 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Required for GUI tasks that can alter state.",
     )
+    gui_run_parser.add_argument(
+        "--verified",
+        action="store_true",
+        help="Enable strict verified mode checks before accepting run output.",
+    )
 
     subparsers.add_parser("status", help="Show latest run status")
 
     logs_parser = subparsers.add_parser("logs", help="Tail logs for latest run")
     logs_parser.add_argument("--tail", type=int, default=200)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Validate runtime prerequisites",
+    )
+    doctor_parser.add_argument(
+        "--mode",
+        choices=("shell", "gui"),
+        default="shell",
+        help="Check shell or gui prerequisites.",
+    )
     return parser
 
 
-def run_command(task: str, confirm_sensitive: bool, mode: str) -> None:
+def run_command(task: str, confirm_sensitive: bool, mode: str, verified: bool = False) -> None:
     if task_violates_code_edit_rule(task):
         raise SystemExit("Task rejected: requests source-code modification (forbidden by guardrails).")
     _validate_oi_runtime_config()
     _validate_mode_preconditions(mode, confirm_sensitive)
+    _preflight_runtime(mode)
 
     sensitive_intent = task_has_sensitive_intent(task)
     require_sensitive_confirmation(sensitive_intent, auto_confirm=confirm_sensitive)
@@ -203,6 +237,12 @@ def run_command(task: str, confirm_sensitive: bool, mode: str) -> None:
         click_steps=click_steps,
         button_targets=button_targets,
     )
+    _validate_verified_mode(
+        report,
+        mode=mode,
+        verified=verified,
+        stdout_text=result.stdout,
+    )
 
     write_json(ctx.report_path, report.to_dict())
     write_status(
@@ -238,10 +278,13 @@ def _validate_report_actions(
         command = action.split("cmd:", 1)[1].strip()
         if not command:
             raise SystemExit("Guardrail blocked action: empty command after 'cmd:'.")
+        if "\n" in command or "\r" in command:
+            raise SystemExit("Malformed command: multiline commands are not allowed.")
 
         decision = evaluate_command(command, allowlist=allowlist)
         if not decision.allowed:
             raise SystemExit(f"Guardrail blocked action '{command}': {decision.reason}")
+        _validate_malformed_command(command)
 
         _validate_command_targets(command, expected)
 
@@ -289,6 +332,14 @@ def logs_command(tail_count: int) -> None:
     output_lines.extend(tail_lines(oi_stdout, tail_count))
     output_lines.extend(tail_lines(oi_stderr, tail_count))
     print("\n".join(output_lines))
+
+
+def doctor_command(mode: str) -> None:
+    checks = _collect_runtime_checks(mode)
+    ok = all(item["ok"] for item in checks)
+    print(json.dumps({"mode": mode, "ok": ok, "checks": checks}, indent=2, ensure_ascii=False))
+    if not ok:
+        raise SystemExit(1)
 
 
 def _validate_evidence_paths(
@@ -348,6 +399,8 @@ def _validate_evidence_paths(
                         "missing on disk. "
                         f"step={step}, path={rel}, run_dir={run_dir}"
                     )
+                if rel.endswith(("_before.png", "_after.png")) and full.stat().st_size <= 0:
+                    raise SystemExit(f"Screenshot evidence missing/empty for step {step}: {full}")
     return safe_paths
 
 
@@ -447,6 +500,87 @@ def _validate_oi_runtime_config() -> None:
 def _validate_mode_preconditions(mode: str, confirm_sensitive: bool) -> None:
     if mode == "gui" and not confirm_sensitive:
         raise SystemExit("GUI mode requires explicit --confirm-sensitive.")
+
+
+def _preflight_runtime(mode: str) -> None:
+    checks = _collect_runtime_checks(mode)
+    failed = [item for item in checks if not item["ok"]]
+    if failed:
+        summary = "; ".join(item["name"] for item in failed)
+        raise SystemExit(
+            "Runtime preflight failed: "
+            f"{summary}. Run `bridge doctor --mode {mode}` for details."
+        )
+
+
+def _collect_runtime_checks(mode: str) -> list[dict[str, object]]:
+    checks: list[dict[str, object]] = []
+
+    def add(name: str, ok: bool, detail: str) -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail})
+
+    has_key = bool(os.getenv("OPENAI_API_KEY"))
+    add("openai_api_key", has_key, "OPENAI_API_KEY present" if has_key else "Missing OPENAI_API_KEY")
+
+    dns_ok = _can_resolve("api.openai.com")
+    add("dns_api_openai", dns_ok, "api.openai.com resolvable" if dns_ok else "Cannot resolve api.openai.com")
+
+    interpreter_path = shutil.which(os.getenv("OI_BRIDGE_COMMAND", "interpreter")) or str(
+        Path(".venv") / "bin" / os.getenv("OI_BRIDGE_COMMAND", "interpreter")
+    )
+    add(
+        "interpreter_binary",
+        Path(interpreter_path).exists() or bool(shutil.which(os.getenv("OI_BRIDGE_COMMAND", "interpreter"))),
+        f"Using {interpreter_path}",
+    )
+
+    if mode == "gui":
+        display = os.getenv("DISPLAY", "")
+        add("display_env", bool(display), f"DISPLAY={display or '<unset>'}")
+        for cmd in ("xdotool", "wmctrl", "xwininfo"):
+            found = shutil.which(cmd) is not None
+            add(f"tool_{cmd}", found, f"{cmd} {'found' if found else 'missing'}")
+        screenshot_found = (shutil.which("scrot") is not None) or (shutil.which("import") is not None)
+        add(
+            "tool_screenshot",
+            screenshot_found,
+            "scrot/import available" if screenshot_found else "Missing both scrot and import",
+        )
+        shot_ok, shot_detail = _doctor_screenshot_runtime_check()
+        add("screenshot_runtime", shot_ok, shot_detail)
+
+    return checks
+
+
+def _can_resolve(hostname: str) -> bool:
+    try:
+        socket.getaddrinfo(hostname, None)
+        return True
+    except OSError:
+        return False
+
+
+def _doctor_screenshot_runtime_check() -> tuple[bool, str]:
+    doctor_dir = Path("runs") / ".doctor"
+    doctor_dir.mkdir(parents=True, exist_ok=True)
+    out_file = doctor_dir / "doctor_screenshot.png"
+    if out_file.exists():
+        out_file.unlink()
+
+    cmd: list[str] | None = None
+    if shutil.which("scrot"):
+        cmd = ["scrot", str(out_file)]
+    elif shutil.which("import"):
+        cmd = ["import", "-window", "root", str(out_file)]
+    if cmd is None:
+        return False, "No screenshot binary available (scrot/import)."
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+    ok = proc.returncode == 0 and out_file.exists() and out_file.is_file() and out_file.stat().st_size > 0
+    detail = f"cmd={' '.join(cmd)} rc={proc.returncode}"
+    if proc.stderr.strip():
+        detail = f"{detail} stderr={proc.stderr.strip()[:120]}"
+    return ok, detail
 
 
 def _mode_allowlist(mode: str) -> tuple[str, ...]:
@@ -563,6 +697,42 @@ def _is_mousemove_command(command: str) -> bool:
 def _is_state_changing_gui_action(command: str) -> bool:
     low = command.lower()
     return any(token in low for token in GUI_STATE_CHANGING_TOKENS)
+
+
+def _validate_malformed_command(command: str) -> None:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        raise SystemExit("Malformed command: shell parsing failed.") from None
+    if not parts:
+        raise SystemExit("Malformed command: empty command payload.")
+    if parts[0].startswith("-"):
+        raise SystemExit("Malformed command: missing executable prefix.")
+
+
+def _validate_verified_mode(
+    report: OIReport,
+    *,
+    mode: str,
+    verified: bool,
+    stdout_text: str,
+) -> None:
+    if not verified:
+        return
+    if mode == "gui":
+        return
+    has_observable = any(
+        (
+            report.observations,
+            report.console_errors,
+            report.network_findings,
+            report.ui_findings,
+        )
+    )
+    if report.actions and (not stdout_text.strip() or not has_observable):
+        raise SystemExit(
+            "Verified mode failed: shell/api run lacks observable non-empty output."
+        )
 
 
 if __name__ == "__main__":
