@@ -170,8 +170,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def run_command(task: str, confirm_sensitive: bool, mode: str, verified: bool = False) -> None:
     if task_violates_code_edit_rule(task):
         raise SystemExit("Task rejected: requests source-code modification (forbidden by guardrails).")
+    use_window_backend = mode == "gui" and should_handle_window_task(task)
     _validate_mode_preconditions(mode, confirm_sensitive)
-    _preflight_runtime(mode)
+    preflight_mode = "gui-window" if use_window_backend else mode
+    _preflight_runtime(preflight_mode)
 
     sensitive_intent = task_has_sensitive_intent(task)
     require_sensitive_confirmation(sensitive_intent, auto_confirm=confirm_sensitive)
@@ -203,7 +205,7 @@ def run_command(task: str, confirm_sensitive: bool, mode: str, verified: bool = 
         append_log(ctx.bridge_log, "oi_returncode=0")
         append_log(ctx.bridge_log, "oi_timed_out=False")
         write_json(ctx.run_dir / "prompt.json", {"mode": "web", "task": task})
-    elif mode == "gui" and should_handle_window_task(task):
+    elif use_window_backend:
         report = run_window_task(task, run_dir=ctx.run_dir, timeout_seconds=timeout_seconds)
         stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
         ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
@@ -580,10 +582,11 @@ def _preflight_runtime(mode: str) -> None:
     checks = _collect_runtime_checks(mode)
     failed = [item for item in checks if not item["ok"]]
     if failed:
+        doctor_mode = "gui" if mode == "gui-window" else mode
         summary = "; ".join(item["name"] for item in failed)
         raise SystemExit(
             "Runtime preflight failed: "
-            f"{summary}. Run `bridge doctor --mode {mode}` for details."
+            f"{summary}. Run `bridge doctor --mode {doctor_mode}` for details."
         )
 
 
@@ -619,7 +622,7 @@ def _collect_runtime_checks(mode: str) -> list[dict[str, object]]:
             f"Using {interpreter_path}",
         )
 
-    if mode == "gui":
+    if mode in ("gui", "gui-window"):
         display = os.getenv("DISPLAY", "")
         add("display_env", bool(display), f"DISPLAY={display or '<unset>'}")
         for cmd in ("xdotool", "wmctrl", "xwininfo"):
