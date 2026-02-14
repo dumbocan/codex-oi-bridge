@@ -36,7 +36,14 @@ from bridge.storage import (
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
-_BUTTON_QUOTED_RE = re.compile(r"[\"'“”]([^\"'“”]{2,80})[\"'“”]")
+_BUTTON_DIRECT_RE = re.compile(
+    r"(?:button|bot[oó]n)\s*[=:]?\s*[\"'“”]([^\"'“”]{1,120})[\"'“”]",
+    flags=re.IGNORECASE,
+)
+_CLICK_QUOTED_RE = re.compile(
+    r"(?:click(?:\s+en)?|haz\s+click(?:\s+en)?)\s+[\"'“”]([^\"'“”]{1,120})[\"'“”]",
+    flags=re.IGNORECASE,
+)
 
 
 def main() -> None:
@@ -212,6 +219,7 @@ def _validate_report_actions(
     expected = expected_targets or set()
     click_steps = 0
     explicit_window_target_seen = False
+    saw_mousemove_since_last_target = False
 
     for action in report.actions:
         if not action.startswith("cmd:"):
@@ -230,14 +238,24 @@ def _validate_report_actions(
         _validate_command_targets(command, expected)
 
         if mode == "gui":
-            explicit_window_target_seen = explicit_window_target_seen or _is_window_target_command(command)
+            if _is_window_target_command(command):
+                explicit_window_target_seen = True
+                saw_mousemove_since_last_target = False
+            if _is_mousemove_command(command):
+                saw_mousemove_since_last_target = True
             if _is_coordinate_click(command):
                 raise SystemExit("Guardrail blocked coordinate-based click without safe fallback.")
             if _is_click_command(command):
                 click_steps += 1
+                if saw_mousemove_since_last_target:
+                    raise SystemExit(
+                        "Guardrail blocked click: coordinate-based sequence "
+                        "detected (mousemove + click)."
+                    )
                 if not explicit_window_target_seen:
                     raise SystemExit("Guardrail blocked click without explicit target window step.")
                 sensitive_hits.append(command)
+                saw_mousemove_since_last_target = False
             if _is_state_changing_gui_action(command):
                 sensitive_hits.append(command)
 
@@ -283,6 +301,11 @@ def _validate_evidence_paths(
         else:
             resolved = (Path.cwd() / candidate).resolve(strict=False)
         if run_root == resolved or run_root in resolved.parents:
+            if not resolved.exists() or not resolved.is_file():
+                raise SystemExit(
+                    "Guardrail blocked evidence path: file missing or not a file: "
+                    f"{raw_path}"
+                )
             rel = resolved.relative_to(Path.cwd())
             safe_paths.append(str(rel))
             rel_paths.append(Path(rel).relative_to(run_dir))
@@ -306,6 +329,12 @@ def _validate_evidence_paths(
                         "Guardrail blocked GUI report: missing required evidence "
                         f"for click step {step}: {rel}"
                     )
+                full = (run_dir / rel).resolve(strict=False)
+                if not full.exists() or not full.is_file():
+                    raise SystemExit(
+                        "Guardrail blocked GUI report: required evidence file "
+                        f"missing on disk for click step {step}: {rel}"
+                    )
     return safe_paths
 
 
@@ -319,20 +348,22 @@ def _validate_gui_post_conditions(
     if mode != "gui":
         return
 
-    combined = " ".join(report.observations + report.ui_findings).lower()
+    lines = [line.lower() for line in (report.observations + report.ui_findings)]
+    combined = " ".join(lines)
     verify_tokens = ("verify", "verified", "cambio", "changed", "visible", "result")
 
     for step in range(1, click_steps + 1):
         step_tokens = (f"step {step}", f"step_{step}", f"paso {step}")
-        if not any(token in combined for token in step_tokens):
+        step_lines = [line for line in lines if any(token in line for token in step_tokens)]
+        if not step_lines:
             raise SystemExit(
                 "Guardrail blocked GUI report: missing step marker in "
                 f"observations/ui_findings for click step {step}."
             )
-        if not any(token in combined for token in verify_tokens):
+        if not any(any(token in line for token in verify_tokens) for line in step_lines):
             raise SystemExit(
                 "Guardrail blocked GUI report: missing verify post-click "
-                "details in observations/ui_findings."
+                f"details for click step {step}."
             )
 
     for label in button_targets:
@@ -385,10 +416,26 @@ def _extract_urls(text: str) -> list[str]:
 
 
 def _extract_button_targets(task: str) -> set[str]:
+    targets: set[str] = set()
     lowered = task.lower()
-    if "button" not in lowered and "boton" not in lowered and "botón" not in lowered:
-        return set()
-    return {item.strip() for item in _BUTTON_QUOTED_RE.findall(task) if item.strip()}
+    has_button_word = ("button" in lowered) or ("boton" in lowered) or ("botón" in lowered)
+
+    for match in _BUTTON_DIRECT_RE.finditer(task):
+        label = match.group(1).strip()
+        if label and _origin(label) is None:
+            targets.add(label)
+
+    for match in _CLICK_QUOTED_RE.finditer(task):
+        label = match.group(1).strip()
+        if not label or _origin(label) is not None:
+            continue
+        if not has_button_word:
+            continue
+        start, end = match.span()
+        window = task[max(0, start - 40):min(len(task), end + 40)].lower()
+        if "button" in window or "boton" in window or "botón" in window:
+            targets.add(label)
+    return targets
 
 
 def _origin(url: str) -> str | None:
@@ -454,6 +501,10 @@ def _is_click_command(command: str) -> bool:
 def _is_coordinate_click(command: str) -> bool:
     low = command.lower()
     return "mousemove" in low and "click" in low
+
+
+def _is_mousemove_command(command: str) -> bool:
+    return "xdotool mousemove" in command.lower()
 
 
 def _is_state_changing_gui_action(command: str) -> bool:
