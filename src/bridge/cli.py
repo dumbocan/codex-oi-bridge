@@ -141,7 +141,11 @@ def run_command(task: str, confirm_sensitive: bool, mode: str) -> None:
     write_json(ctx.run_dir / "prompt.json", {"prompt": prompt})
 
     timeout_seconds = int(os.getenv("OI_BRIDGE_TIMEOUT_SECONDS", "300"))
-    result = run_open_interpreter(prompt=prompt, timeout_seconds=timeout_seconds)
+    result = run_open_interpreter(
+        prompt=prompt,
+        timeout_seconds=timeout_seconds,
+        run_dir=ctx.run_dir,
+    )
     ctx.stdout_log.write_text(result.stdout, encoding="utf-8")
     ctx.stderr_log.write_text(result.stderr, encoding="utf-8")
     append_log(ctx.bridge_log, f"oi_returncode={result.returncode}")

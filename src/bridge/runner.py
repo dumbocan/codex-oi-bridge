@@ -49,12 +49,13 @@ goal: {task}
 """.strip()
 
 
-def run_open_interpreter(prompt: str, timeout_seconds: int) -> RunnerResult:
+def run_open_interpreter(prompt: str, timeout_seconds: int, run_dir: Path) -> RunnerResult:
     command = os.getenv("OI_BRIDGE_COMMAND", "interpreter").strip()
     command = _resolve_command(command)
     args = _normalize_args(shlex.split(os.getenv("OI_BRIDGE_ARGS", "")))
     args = _ensure_non_interactive_args(args)
     prompt = _prompt_for_stdin_mode(prompt)
+    env = _build_runner_env(run_dir)
     try:
         proc = subprocess.run(
             [command, *args],
@@ -63,6 +64,7 @@ def run_open_interpreter(prompt: str, timeout_seconds: int) -> RunnerResult:
             capture_output=True,
             timeout=timeout_seconds,
             check=False,
+            env=env,
         )
         return RunnerResult(
             stdout=proc.stdout,
@@ -120,6 +122,20 @@ def _prompt_for_stdin_mode(prompt: str) -> str:
     # --stdin uses input(), so only the first line is consumed.
     collapsed = " ".join(line.strip() for line in prompt.splitlines() if line.strip())
     return collapsed + "\n"
+
+
+def _build_runner_env(run_dir: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    home_dir = run_dir / ".oi_home"
+    cache_dir = home_dir / ".cache"
+    config_dir = home_dir / ".config"
+    (cache_dir / "open-interpreter").mkdir(parents=True, exist_ok=True)
+    (config_dir / "matplotlib").mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home_dir)
+    env["XDG_CACHE_HOME"] = str(cache_dir)
+    env["XDG_CONFIG_HOME"] = str(config_dir)
+    env["MPLCONFIGDIR"] = str(config_dir / "matplotlib")
+    return env
 
 
 def _shell_mode_block() -> str:

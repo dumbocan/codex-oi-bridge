@@ -19,9 +19,10 @@ class GUIModeTests(unittest.TestCase):
     def test_run_command_gui_creates_evidence_dir_before_oi(self) -> None:
         captured = {}
 
-        def fake_run_open_interpreter(*, prompt: str, timeout_seconds: int):
+        def fake_run_open_interpreter(*, prompt: str, timeout_seconds: int, run_dir: Path):
             # Called after run context/evidence dir are set up.
             captured["called"] = True
+            captured["run_dir"] = str(run_dir)
             return type(
                 "RunnerResult",
                 (),
@@ -73,6 +74,7 @@ class GUIModeTests(unittest.TestCase):
             self.assertTrue((run_dir / "evidence").exists())
             self.assertTrue((run_dir / "evidence").is_dir())
             self.assertIn("called", captured)
+            self.assertEqual(captured["run_dir"], str(run_dir))
 
     def test_gui_rejects_click_without_target_window(self) -> None:
         report = OIReport(
