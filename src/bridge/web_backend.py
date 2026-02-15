@@ -128,7 +128,10 @@ def release_session_control_overlay(session: WebSession) -> None:
         return
 
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        try:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        except Exception:
+            return
         context = browser.contexts[0] if browser.contexts else None
         if context is None:
             return
@@ -149,7 +152,10 @@ def destroy_session_top_bar(session: WebSession) -> None:
         return
 
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        try:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        except Exception:
+            return
         context = browser.contexts[0] if browser.contexts else None
         if context is None:
             return
@@ -169,7 +175,10 @@ def ensure_session_top_bar(session: WebSession) -> None:
         return
 
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        try:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        except Exception:
+            return
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.pages[0] if context.pages else context.new_page()
         try:
@@ -663,6 +672,53 @@ def _install_visual_overlay(
         trailLayer.style.zIndex = '2147483646';
         root.appendChild(trailLayer);
 
+        const stateBorder = document.createElement('div');
+        stateBorder.id = '__bridge_state_border';
+        stateBorder.style.position = 'fixed';
+        stateBorder.style.inset = '0';
+        stateBorder.style.pointerEvents = 'none';
+        stateBorder.style.zIndex = '2147483642';
+        stateBorder.style.boxSizing = 'border-box';
+        stateBorder.style.borderRadius = String(14 * cfg.scale) + 'px';
+        stateBorder.style.border = String(6 * cfg.scale) + 'px solid rgba(210,210,210,0.22)';
+        stateBorder.style.boxShadow = '0 0 0 1px rgba(0,0,0,0.28) inset';
+        stateBorder.style.transition = 'border-color 180ms ease-out, box-shadow 180ms ease-out, border-width 180ms ease-out';
+        root.appendChild(stateBorder);
+
+        window.__bridgeSetStateBorder = (state) => {
+          const s = state || {};
+          const controlled = !!s.controlled;
+          const open = String(s.state || 'open') === 'open';
+          const incidentOpen = !!s.incident_open;
+          const controlUrl = window.__bridgeResolveControlUrl ? window.__bridgeResolveControlUrl(s) : null;
+          const agentOnline = !!controlUrl && s.agent_online !== false;
+          const readyManual = open && !controlled && agentOnline && !incidentOpen;
+
+          let color = 'rgba(210,210,210,0.22)';
+          let glow = '0 0 0 1px rgba(0,0,0,0.28) inset';
+          if (!open) {
+            color = 'rgba(40,40,40,0.55)';
+            glow = '0 0 0 1px rgba(0,0,0,0.35) inset';
+          } else if (controlled) {
+            color = 'rgba(59,167,255,0.95)';
+            glow = '0 0 0 2px rgba(59,167,255,0.35) inset, 0 0 26px rgba(59,167,255,0.22)';
+          } else if (incidentOpen) {
+            color = 'rgba(255,82,82,0.95)';
+            glow = '0 0 0 2px rgba(255,82,82,0.32) inset, 0 0 26px rgba(255,82,82,0.18)';
+          } else if (readyManual) {
+            color = 'rgba(34,197,94,0.95)';
+            glow = '0 0 0 2px rgba(34,197,94,0.32) inset, 0 0 26px rgba(34,197,94,0.18)';
+          } else {
+            color = 'rgba(210,210,210,0.22)';
+            glow = '0 0 0 1px rgba(0,0,0,0.28) inset';
+          }
+
+          const emphasized = (controlled || incidentOpen || readyManual);
+          stateBorder.style.borderWidth = String((emphasized ? 10 : 6) * cfg.scale) + 'px';
+          stateBorder.style.borderColor = color;
+          stateBorder.style.boxShadow = glow;
+        };
+
         const emitTrail = (x, y) => {
         if (!cfg.traceEnabled) return;
         const dot = document.createElement('div');
@@ -1051,6 +1107,7 @@ def _install_visual_overlay(
             : '1px solid rgba(255,255,255,0.18)';
           bar.dataset.state = JSON.stringify(s);
           window.__bridgeSetIncidentOverlay(incidentOpen && !controlled, incidentText || 'INCIDENT DETECTED');
+          window.__bridgeSetStateBorder?.(s);
           window.__bridgeEnsureSessionObserver();
           window.__bridgeStartTopBarPolling(s);
           const ctrl = controlled ? 'assistant' : 'user';
