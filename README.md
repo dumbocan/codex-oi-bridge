@@ -132,6 +132,9 @@ Session Observer (Fase 2):
   - apaga estado rojo sin cerrar la sesión,
   - mantiene traza (`ack_count`, `last_ack_at`).
 
+Indicador verde (badge):
+- Muestra un badge verde sólido con `● READY FOR MANUAL TEST` (alto contraste).
+
 Notas operativas:
 - Interacción manual (click/move/resize) está soportada durante sesiones persistentes.
 - La sesión solo debe cerrarse con `bridge web-close --attach <session_id>`.

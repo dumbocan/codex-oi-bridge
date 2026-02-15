@@ -351,3 +351,6 @@ Colores de estado en barra:
 - Rojo: `incident_open=true`.
 - Gris: sesión `open` bajo control usuario.
 - Oscuro: sesión `closed` o agente offline.
+
+UX badge verde:
+- Cuando `READY FOR MANUAL TEST`, aparece badge verde sólido con texto `● READY FOR MANUAL TEST` y `aria-label=session-ready-manual-test`.

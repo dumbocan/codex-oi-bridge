@@ -529,6 +529,10 @@ class WebModeTests(unittest.TestCase):
         self.assertIn("network_warn", script)
         self.assertIn("READY FOR MANUAL TEST", script)
         self.assertIn("readyManual", script)
+        self.assertIn('aria-label="session-ready-manual-test"', script)
+        self.assertIn("background:#16a34a", script)
+        self.assertIn("border:1px solid #22c55e", script)
+        self.assertIn(">● READY FOR MANUAL TEST</span>", script)
 
     def test_top_bar_semantics_keep_blue_red_gray_and_add_green_ready(self) -> None:
         page = _FakePage()
@@ -547,7 +551,18 @@ class WebModeTests(unittest.TestCase):
         self.assertIn("readyManual", script)
         self.assertIn("rgba(59,167,255,0.22)", script)
         self.assertIn("rgba(255,82,82,0.26)", script)
-        self.assertIn("rgba(70,189,120,0.24)", script)
+        self.assertIn("rgba(22,163,74,0.22)", script)
+        self.assertIn("rgba(34,197,94,0.95)", script)
+
+        # Priority: controlled (blue) > incident (red) > ready (green)
+        bg_idx = script.find("bar.style.background")
+        ctrl_idx = script.find("controlled", bg_idx)
+        inc_idx = script.find("incidentOpen", bg_idx)
+        ready_idx = script.find("readyManual", bg_idx)
+        self.assertNotEqual(bg_idx, -1)
+        self.assertTrue(ctrl_idx != -1 and inc_idx != -1 and ready_idx != -1)
+        self.assertLess(ctrl_idx, inc_idx)
+        self.assertLess(inc_idx, ready_idx)
 
     def test_web_open_can_inject_top_bar_without_web_run(self) -> None:
         page = _FakePage()

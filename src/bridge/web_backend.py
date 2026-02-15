@@ -1042,12 +1042,12 @@ def _install_visual_overlay(
                 ? 'rgba(255,82,82,0.26)'
                 : (
                   readyManual
-                    ? 'rgba(70,189,120,0.24)'
+                    ? 'rgba(22,163,74,0.22)'
                     : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)')
                 )
             );
           bar.style.borderBottom = readyManual
-            ? '1px solid rgba(70,189,120,0.72)'
+            ? '2px solid rgba(34,197,94,0.95)'
             : '1px solid rgba(255,255,255,0.18)';
           bar.dataset.state = JSON.stringify(s);
           window.__bridgeSetIncidentOverlay(incidentOpen && !controlled, incidentText || 'INCIDENT DETECTED');
@@ -1061,14 +1061,32 @@ def _install_visual_overlay(
             : (
               incidentOpen
                 ? `incident open (${Number(s.error_count || 0)})`
-                : (readyManual ? 'READY FOR MANUAL TEST' : '')
+                : ''
             );
+          const readyBadge = readyManual
+            ? `<span
+                 id=\"__bridge_ready_badge\"
+                 aria-label=\"session-ready-manual-test\"
+                 style=\"
+                   display:inline-flex;
+                   align-items:center;
+                   gap:6px;
+                   background:#16a34a;
+                   color:#fff;
+                   border:1px solid #22c55e;
+                   font-size:13px;
+                   font-weight:700;
+                   padding:6px 10px;
+                   border-radius:999px;\"
+               >● READY FOR MANUAL TEST</span>`
+            : '';
           bar.innerHTML = `
             <strong>session ${s.session_id || '-'}</strong>
             <span>state:${s.state || '-'}</span>
             <span>control:${ctrl}</span>
             <span>url:${url}</span>
             <span>seen:${last}</span>
+            ${readyBadge}
             <span id=\"__bridge_status_msg\" style=\"color:${agentOnline ? '#b7d8ff' : '#ffb3b3'}\">${status}</span>
             <button
               id=\"__bridge_ack_btn\" ${(open && agentOnline && incidentOpen) ? '' : 'disabled'}
