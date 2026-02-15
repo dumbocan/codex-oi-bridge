@@ -148,6 +148,10 @@ Flujo recomendado Fase 2:
 4. Pulsar `Clear incident` en top bar.
 5. `bridge status` para confirmar `incident_open=false` con sesión `open`.
 
+Modo push (terminal):
+- `bridge watch --attach <session_id>` imprime eventos nuevos e incidentes sin ejecutar `status` manualmente.
+- Ejemplo: `bridge watch --attach last --interval-ms 800 --since-last --only warn --notify`.
+
 ## Window Management (v1.3)
 
 En `gui` mode el bridge soporta operaciones deterministas de ventanas:

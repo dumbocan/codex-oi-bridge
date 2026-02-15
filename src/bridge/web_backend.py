@@ -682,7 +682,9 @@ def _install_visual_overlay(
         stateBorder.style.borderRadius = String(14 * cfg.scale) + 'px';
         stateBorder.style.border = String(6 * cfg.scale) + 'px solid rgba(210,210,210,0.22)';
         stateBorder.style.boxShadow = '0 0 0 1px rgba(0,0,0,0.28) inset';
-        stateBorder.style.transition = 'border-color 180ms ease-out, box-shadow 180ms ease-out, border-width 180ms ease-out';
+        stateBorder.style.transition =
+          'border-color 180ms ease-out, box-shadow 180ms ease-out, ' +
+          'border-width 180ms ease-out';
         root.appendChild(stateBorder);
 
         window.__bridgeSetStateBorder = (state) => {

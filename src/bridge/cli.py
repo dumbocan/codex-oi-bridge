@@ -57,6 +57,7 @@ from bridge.web_session import (
     session_is_alive,
 )
 from bridge.window_backend import run_window_task, should_handle_window_task
+from bridge.watch import watch_command
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
@@ -214,6 +215,17 @@ def main() -> None:
     if args.command == "doctor":
         doctor_command(mode=args.mode)
         return
+    if args.command == "watch":
+        watch_command(
+            attach=args.attach,
+            interval_ms=args.interval_ms,
+            since_last=args.since_last,
+            json_mode=args.json,
+            print_events=args.print_events,
+            only=args.only,
+            notify=args.notify,
+        )
+        return
 
     parser.print_help()
 
@@ -339,6 +351,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default="shell",
         help="Check shell, gui, or web prerequisites.",
     )
+
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Watch web session observer state in real-time (polls /state)",
+    )
+    watch_parser.add_argument(
+        "--attach",
+        type=str,
+        required=True,
+        help="Session id to watch, or 'last' for last session.",
+    )
+    watch_parser.add_argument("--interval-ms", type=int, default=800)
+    watch_parser.add_argument("--since-last", action="store_true")
+    watch_parser.add_argument("--json", action="store_true")
+    watch_parser.add_argument("--print-events", type=int, default=0)
+    watch_parser.add_argument(
+        "--only",
+        choices=("errors", "warn", "info"),
+        default="info",
+    )
+    watch_parser.add_argument("--notify", action="store_true")
     return parser
 
 

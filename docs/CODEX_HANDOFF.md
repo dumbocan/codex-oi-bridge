@@ -354,3 +354,15 @@ Colores de estado en barra:
 
 UX badge verde:
 - Cuando `READY FOR MANUAL TEST`, aparece badge verde sólido con texto `● READY FOR MANUAL TEST` y `aria-label=session-ready-manual-test`.
+
+## 30) Watch (Push To Terminal)
+
+Mientras haces clicks manuales, puedes ver eventos/incidentes en terminal sin ejecutar `status` a mano:
+
+- `bridge watch --attach <session_id> [--interval-ms 800] [--since-last] [--json] [--print-events N] [--only errors|warn|info] [--notify]`
+- `--attach last` usa la última sesión abierta.
+
+Salida humana (ejemplo):
+- `17:53:10 click target="Reproducir" url=/`
+- `17:53:12 ERROR http 502 GET /tracks/.../stream`
+- `INCIDENT OPEN: http 502`
