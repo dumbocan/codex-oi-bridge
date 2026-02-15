@@ -266,6 +266,14 @@ def _playwright_available() -> bool:
     return importlib.util.find_spec("playwright") is not None
 
 
+
+
+def _safe_page_title(page: object) -> str:
+    try:
+        # Playwright can throw if execution context is destroyed during navigation/HMR.
+        return str(getattr(page, 'title')())
+    except Exception:
+        return ""
 def _execute_playwright(
     url: str,
     steps: list[WebStep],
@@ -308,7 +316,7 @@ def _execute_playwright(
             browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.pages[0] if context.pages else context.new_page()
-            mark_controlled(session, True, url=page.url, title=page.title())
+            mark_controlled(session, True, url=page.url, title=_safe_page_title(page))
         else:
             browser = _launch_browser(
                 p,
@@ -352,7 +360,7 @@ def _execute_playwright(
         control_enabled = False
         try:
             initial_url = page.url
-            initial_title = page.title()
+            initial_title = _safe_page_title(page)
             observations.append(f"Initial url/title: {initial_url} | {initial_title}")
             target_matches = _same_origin_path(initial_url, url)
             if target_matches:
@@ -370,9 +378,9 @@ def _execute_playwright(
                     page,
                     _session_state_payload(session, override_controlled=True),
                 )
-            observations.append(f"Page title: {page.title()}")
+            observations.append(f"Page title: {_safe_page_title(page)}")
             if attached and session is not None:
-                mark_controlled(session, True, url=page.url, title=page.title())
+                mark_controlled(session, True, url=page.url, title=_safe_page_title(page))
 
             interactive_step = 0
             total = len(steps)
@@ -415,7 +423,7 @@ def _execute_playwright(
                     )
                 ui_findings.append("control released")
             if attached and session is not None:
-                mark_controlled(session, False, url=page.url, title=page.title())
+                mark_controlled(session, False, url=page.url, title=_safe_page_title(page))
             if not attached and not keep_open:
                 browser.close()
 
@@ -475,7 +483,7 @@ def _apply_interactive_step(
         else:
             locator.click()
         observations.append(f"Clicked selector in step {step_num}: {step.target}")
-        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={page.title()}")
+        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
         return
 
     if step.kind == "click_text":
@@ -503,7 +511,7 @@ def _apply_interactive_step(
                 locator.click()
             observations.append(f"Clicked text in step {step_num}: {step.target}")
             ui_findings.append(
-                f"step {step_num} verify visible result: url={page.url}, title={page.title()}"
+                f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
             )
             return
         except Exception:
@@ -533,7 +541,7 @@ def _apply_interactive_step(
         observations.append(
             f"Selected option by label in step {step_num}: selector={step.target}, label={step.value}"
         )
-        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={page.title()}")
+        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
         return
 
     if step.kind == "select_value":
@@ -552,7 +560,7 @@ def _apply_interactive_step(
         observations.append(
             f"Selected option by value in step {step_num}: selector={step.target}, value={step.value}"
         )
-        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={page.title()}")
+        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
         return
 
     raise RuntimeError(f"Unsupported interactive step kind: {step.kind}")
