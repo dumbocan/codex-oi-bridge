@@ -534,12 +534,26 @@ class CLITests(unittest.TestCase):
         with patch("bridge.cli.status_payload", return_value={"status": "ok"}), patch(
             "bridge.cli.get_last_session", return_value=session
         ), patch("bridge.cli.refresh_session_state", return_value=session), patch(
-            "sys.argv", ["bridge", "status"]
-        ):
+            "bridge.cli.session_agent_online", return_value=True
+        ), patch(
+            "bridge.cli.request_session_state",
+            return_value={
+                "incident_open": True,
+                "last_error": "boom",
+                "error_count": 2,
+                "ack_count": 1,
+                "last_ack_at": "2026-01-01T00:01:00+00:00",
+                "last_event_at": "2026-01-01",
+                "recent_events": [{"type": "console_error"}],
+            },
+        ), patch("sys.argv", ["bridge", "status"]):
             with redirect_stdout(out):
                 main()
         self.assertIn('"web_session"', out.getvalue())
         self.assertIn('"controlled": true', out.getvalue())
+        self.assertIn('"observer"', out.getvalue())
+        self.assertIn('"incident_open": true', out.getvalue())
+        self.assertIn('"ack_count": 1', out.getvalue())
 
     def test_attach_refreshes_liveness_before_use(self) -> None:
         dead = WebSession(

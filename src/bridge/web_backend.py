@@ -758,6 +758,160 @@ def _install_visual_overlay(
             bar.style.opacity = '0';
           }
         };
+        window.__bridgeSetIncidentOverlay = (enabled, message) => {
+          const id = '__bridge_incident_overlay';
+          const existing = document.getElementById(id);
+          if (!enabled) {
+            if (existing) existing.remove();
+            return;
+          }
+          if (existing) {
+            const badge = existing.querySelector('[data-role="badge"]');
+            if (badge) badge.textContent = message || 'INCIDENT DETECTED';
+            return;
+          }
+          const wrap = document.createElement('div');
+          wrap.id = id;
+          wrap.style.position = 'fixed';
+          wrap.style.inset = '0';
+          wrap.style.border = '3px solid #ff5252';
+          wrap.style.boxSizing = 'border-box';
+          wrap.style.pointerEvents = 'none';
+          wrap.style.zIndex = '2147483645';
+          const badge = document.createElement('div');
+          badge.dataset.role = 'badge';
+          badge.textContent = message || 'INCIDENT DETECTED';
+          badge.style.position = 'fixed';
+          badge.style.top = '10px';
+          badge.style.left = '12px';
+          badge.style.padding = '4px 8px';
+          badge.style.borderRadius = '999px';
+          badge.style.font = '11px/1.2 monospace';
+          badge.style.color = '#fff';
+          badge.style.background = 'rgba(255,82,82,0.92)';
+          badge.style.pointerEvents = 'none';
+          wrap.appendChild(badge);
+          document.documentElement.appendChild(wrap);
+        };
+        window.__bridgeSendSessionEvent = (event) => {
+          const bar = document.getElementById('__bridge_session_top_bar');
+          const stateRaw = bar?.dataset?.state || '{}';
+          let state;
+          try { state = JSON.parse(stateRaw); } catch (_e) { state = {}; }
+          const controlUrl = window.__bridgeResolveControlUrl(state);
+          if (!controlUrl) return;
+          const payload = {
+            ...(event || {}),
+            session_id: state.session_id || '',
+            url: String((event && event.url) || location.href || ''),
+          };
+          fetch(`${controlUrl}/event`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            keepalive: true,
+          }).catch(() => null);
+        };
+        window.__bridgeEnsureSessionObserver = () => {
+          if (window.__bridgeObserverInstalled) return;
+          window.__bridgeObserverInstalled = true;
+          document.addEventListener('click', (ev) => {
+            const el = ev.target;
+            let target = '';
+            if (el && typeof el.closest === 'function') {
+              const btn = el.closest('button,[role="button"],a,input,select,textarea');
+              if (btn) target = (btn.textContent || btn.id || btn.className || '').trim();
+            }
+            window.__bridgeSendSessionEvent({
+              type: 'click',
+              target,
+              message: `click ${target}`,
+              x: Number(ev.clientX || 0),
+              y: Number(ev.clientY || 0),
+            });
+          }, true);
+          window.addEventListener('error', (ev) => {
+            window.__bridgeSendSessionEvent({
+              type: 'page_error',
+              message: String(ev.message || 'window error'),
+            });
+          });
+          window.addEventListener('unhandledrejection', (ev) => {
+            window.__bridgeSendSessionEvent({
+              type: 'page_error',
+              message: String(ev.reason || 'unhandled rejection'),
+            });
+          });
+          if (!window.__bridgeFetchWrapped && typeof window.fetch === 'function') {
+            window.__bridgeFetchWrapped = true;
+            const origFetch = window.fetch.bind(window);
+            window.fetch = async (...args) => {
+              try {
+                const resp = await origFetch(...args);
+                if (resp && Number(resp.status || 0) >= 400) {
+                  window.__bridgeSendSessionEvent({
+                    type: Number(resp.status || 0) >= 500 ? 'network_error' : 'network_warn',
+                    status: Number(resp.status || 0),
+                    url: String(resp.url || args[0] || ''),
+                    message: `http ${resp.status}`,
+                  });
+                }
+                return resp;
+              } catch (err) {
+                window.__bridgeSendSessionEvent({
+                  type: 'network_error',
+                  status: 0,
+                  url: String(args[0] || ''),
+                  message: String(err || 'fetch failed'),
+                });
+                throw err;
+              }
+            };
+          }
+          if (!window.__bridgeXhrWrapped && window.XMLHttpRequest) {
+            window.__bridgeXhrWrapped = true;
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+              this.__bridgeMethod = String(method || 'GET');
+              this.__bridgeUrl = String(url || '');
+              return origOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(...args) {
+              this.addEventListener('loadend', () => {
+                const st = Number(this.status || 0);
+                if (st >= 400 || st === 0) {
+                  window.__bridgeSendSessionEvent({
+                    type: (st === 0 || st >= 500) ? 'network_error' : 'network_warn',
+                    status: st,
+                    url: String(this.responseURL || this.__bridgeUrl || ''),
+                    message: `xhr ${st}`,
+                  });
+                }
+              });
+              return origSend.apply(this, args);
+            };
+          }
+        };
+        window.__bridgeStartTopBarPolling = (state) => {
+          const controlUrl = window.__bridgeResolveControlUrl(state || {});
+          if (window.__bridgeTopBarPollTimer) {
+            clearInterval(window.__bridgeTopBarPollTimer);
+            window.__bridgeTopBarPollTimer = null;
+          }
+          if (!controlUrl) return;
+          window.__bridgeTopBarPollTimer = setInterval(async () => {
+            try {
+              const resp = await fetch(`${controlUrl}/state`, { cache: 'no-store' });
+              const payload = await resp.json();
+              if (resp.ok && payload && typeof payload === 'object') {
+                window.__bridgeUpdateTopBarState(payload);
+              }
+            } catch (_err) {
+              // keep previous state; button actions will surface offline errors.
+            }
+          }, 2500);
+        };
         window.__bridgeControlRequest = async (action) => {
           const bar = document.getElementById('__bridge_session_top_bar');
           const stateRaw = bar?.dataset?.state || '{}';
@@ -852,14 +1006,21 @@ def _install_visual_overlay(
           const open = String(s.state || 'open') === 'open';
           const controlUrl = window.__bridgeResolveControlUrl(s);
           const agentOnline = !!controlUrl && s.agent_online !== false;
+          const incidentOpen = !!s.incident_open;
+          const incidentText = String(s.last_error || '').slice(0, 96);
           bar.style.background = controlled
             ? 'rgba(59,167,255,0.22)'
-            : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)');
+            : (incidentOpen ? 'rgba(255,82,82,0.26)' : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)'));
           bar.dataset.state = JSON.stringify(s);
+          window.__bridgeSetIncidentOverlay(incidentOpen && !controlled, incidentText || 'INCIDENT DETECTED');
+          window.__bridgeEnsureSessionObserver();
+          window.__bridgeStartTopBarPolling(s);
           const ctrl = controlled ? 'assistant' : 'user';
           const url = String(s.url || '').slice(0, 70);
           const last = String(s.last_seen_at || '').replace('T', ' ').slice(0, 16);
-          const status = agentOnline ? '' : 'agent offline';
+          const status = !agentOnline
+            ? 'agent offline'
+            : (incidentOpen ? `incident open (${Number(s.error_count || 0)})` : '');
           bar.innerHTML = `
             <strong>session ${s.session_id || '-'}</strong>
             <span>state:${s.state || '-'}</span>
@@ -867,11 +1028,15 @@ def _install_visual_overlay(
             <span>url:${url}</span>
             <span>seen:${last}</span>
             <span id=\"__bridge_status_msg\" style=\"color:${agentOnline ? '#b7d8ff' : '#ffb3b3'}\">${status}</span>
+            <button
+              id=\"__bridge_ack_btn\" ${(open && agentOnline && incidentOpen) ? '' : 'disabled'}
+            >Clear incident</button>
             <button id=\"__bridge_release_btn\" ${(open && agentOnline) ? '' : 'disabled'}>Release</button>
             <button id=\"__bridge_close_btn\" ${(open && agentOnline) ? '' : 'disabled'}>Close</button>
             <button id=\"__bridge_refresh_btn\" ${agentOnline ? '' : 'disabled'}>Refresh</button>
           `;
           const statusEl = bar.querySelector('#__bridge_status_msg');
+          const ackBtn = bar.querySelector('#__bridge_ack_btn');
           const release = bar.querySelector('#__bridge_release_btn');
           const closeBtn = bar.querySelector('#__bridge_close_btn');
           const refresh = bar.querySelector('#__bridge_refresh_btn');
@@ -890,6 +1055,7 @@ def _install_visual_overlay(
               window.__bridgeUpdateTopBarState(result.payload || s);
             };
           };
+          wire(ackBtn, 'ack');
           wire(release, 'release');
           wire(closeBtn, 'close');
           wire(refresh, 'refresh');
@@ -898,6 +1064,11 @@ def _install_visual_overlay(
           document.getElementById('__bridge_session_top_bar')?.remove();
           document.getElementById('__bridge_top_hot')?.remove();
           document.getElementById('__bridge_top_toggle')?.remove();
+          window.__bridgeSetIncidentOverlay(false);
+          if (window.__bridgeTopBarPollTimer) {
+            clearInterval(window.__bridgeTopBarPollTimer);
+            window.__bridgeTopBarPollTimer = null;
+          }
         };
         if (sessionState && sessionState.session_id) {
           window.__bridgeEnsureTopBar(sessionState);

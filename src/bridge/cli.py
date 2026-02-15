@@ -47,6 +47,7 @@ from bridge.web_session import (
     load_and_refresh_session,
     mark_controlled,
     refresh_session_state,
+    request_session_state,
     session_agent_online,
     session_is_alive,
 )
@@ -175,15 +176,31 @@ def main() -> None:
         last_session = get_last_session()
         if last_session is not None:
             last_session = refresh_session_state(last_session)
-            payload["web_session"] = {
+            agent_online = session_agent_online(last_session)
+            session_payload = {
                 "session_id": last_session.session_id,
                 "url": last_session.url,
                 "title": last_session.title,
                 "controlled": last_session.controlled,
                 "state": last_session.state,
-                "agent_online": session_agent_online(last_session),
+                "agent_online": agent_online,
                 "last_seen_at": last_session.last_seen_at,
             }
+            if agent_online:
+                try:
+                    live = request_session_state(last_session)
+                    session_payload["observer"] = {
+                        "incident_open": bool(live.get("incident_open", False)),
+                        "last_error": str(live.get("last_error", "")),
+                        "error_count": int(live.get("error_count", 0) or 0),
+                        "ack_count": int(live.get("ack_count", 0) or 0),
+                        "last_ack_at": str(live.get("last_ack_at", "")),
+                        "last_event_at": str(live.get("last_event_at", "")),
+                        "recent_events": list(live.get("recent_events", []))[-8:],
+                    }
+                except SystemExit:
+                    pass
+            payload["web_session"] = session_payload
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     if args.command == "logs":

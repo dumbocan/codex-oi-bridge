@@ -507,6 +507,8 @@ class WebModeTests(unittest.TestCase):
         self.assertIn("window.__bridgeControlRequest = async", script)
         self.assertIn("fetch(`${controlUrl}/action`", script)
         self.assertNotIn("__bridgeSessionAction?.", script)
+        self.assertIn("Clear incident", script)
+        self.assertIn("wire(ackBtn, 'ack')", script)
 
     def test_top_bar_includes_slide_transition_and_offline_label(self) -> None:
         page = _FakePage()
@@ -523,6 +525,7 @@ class WebModeTests(unittest.TestCase):
         self.assertIn("translateY(-110%)", script)
         self.assertIn("transform 210ms ease-out", script)
         self.assertIn("agent offline", script)
+        self.assertIn("network_warn", script)
 
     def test_overlay_ready_retries_until_visible(self) -> None:
         page = _FakePage()

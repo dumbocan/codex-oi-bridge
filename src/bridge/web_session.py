@@ -308,6 +308,30 @@ def _stop_control_agent(session: WebSession) -> None:
             return
 
 
+def request_session_state(session: WebSession, timeout_seconds: float = 3.0) -> dict[str, Any]:
+    port = int(session.control_port or 0)
+    if port <= 0:
+        raise SystemExit("Session control agent offline: no control port configured.")
+    if not session_agent_online(session):
+        raise SystemExit("Session control agent offline.")
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/state", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        reason = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"Session state request failed: {reason}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise SystemExit(f"Session state request failed: {exc}") from exc
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("Session state request returned invalid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit("Session state request returned invalid payload")
+    return parsed
+
+
 def _find_browser_binary() -> str:
     candidates = (
         "google-chrome",

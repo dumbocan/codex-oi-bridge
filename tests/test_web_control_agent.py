@@ -1,11 +1,20 @@
 import unittest
 from unittest.mock import patch
 
-from bridge.web_control_agent import perform_session_action
+from bridge.web_control_agent import _RUNTIME, perform_session_action
 from bridge.web_session import WebSession
 
 
 class WebControlAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _RUNTIME._events.clear()
+        _RUNTIME._incident_open = False
+        _RUNTIME._last_error = ""
+        _RUNTIME._error_count = 0
+        _RUNTIME._ack_count = 0
+        _RUNTIME._last_ack_at = ""
+        _RUNTIME._last_ack_by = ""
+
     def _session(self) -> WebSession:
         return WebSession(
             session_id="s1",
@@ -67,6 +76,36 @@ class WebControlAgentTests(unittest.TestCase):
     def test_invalid_action_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             perform_session_action("s1", "noop")
+
+    def test_event_marks_incident_open(self) -> None:
+        _RUNTIME.record_event({"type": "console_error", "message": "boom"})
+        snap = _RUNTIME.snapshot()
+        self.assertTrue(snap["incident_open"])
+        self.assertGreaterEqual(int(snap["error_count"]), 1)
+        self.assertTrue(any(evt.get("type") == "console_error" for evt in snap["recent_events"]))
+
+    def test_warn_event_does_not_open_incident(self) -> None:
+        _RUNTIME.record_event({"type": "network_warn", "status": 404, "message": "http 404"})
+        snap = _RUNTIME.snapshot()
+        self.assertFalse(snap["incident_open"])
+        self.assertEqual(int(snap["error_count"]), 0)
+        self.assertEqual(snap["recent_events"][-1]["severity"], "warn")
+
+    def test_ack_action_clears_incident_without_closing_session(self) -> None:
+        session = self._session()
+        _RUNTIME.record_event({"type": "page_error", "message": "boom"})
+        self.assertTrue(_RUNTIME.snapshot()["incident_open"])
+
+        with patch("bridge.web_control_agent.load_session", return_value=session), patch(
+            "bridge.web_control_agent.refresh_session_state", return_value=session
+        ):
+            payload, should_shutdown = perform_session_action("s1", "ack")
+
+        self.assertFalse(should_shutdown)
+        self.assertEqual(payload["state"], "open")
+        self.assertFalse(payload["incident_open"])
+        self.assertEqual(payload["message"], "incident acknowledged")
+        self.assertGreaterEqual(int(payload["ack_count"]), 1)
 
 
 if __name__ == "__main__":

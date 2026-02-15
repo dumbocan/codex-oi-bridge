@@ -332,9 +332,19 @@ Comportamiento:
 - Si hay excepción durante run attach/keep-open, el bridge intenta liberar control automáticamente.
 - La top bar usa canal persistente (agente local HTTP por sesión), no binding efímero de Playwright.
 - La top bar aplica animación `translateY(-110%) -> translateY(0)` y muestra feedback de acción.
+- La top bar implementa observabilidad en vivo:
+  - `GET /state` (polling),
+  - `POST /event` (click/error/network),
+  - `POST /action` (`refresh`, `release`, `close`, `ack`).
+- `Clear incident` (`action=ack`) limpia estado rojo sin cerrar sesión.
 
 Troubleshooting:
 - Move/resize/manual interaction en la ventana persistente está soportada.
 - La sesión no debería cerrarse salvo `web-close`; si aparece `closed`, recrear con `web-open`.
 - `bridge status` y `runs/web_sessions/<id>.json` se sincronizan por liveness real (PID+CDP) antes de reportar estado.
 - Si la barra indica `agent offline`, las acciones se deshabilitan; recuperar con `web-open` (nueva sesión) o `web-close` de la sesión muerta.
+
+Colores de estado en barra:
+- Azul: `controlled=true` (assistant control).
+- Rojo: `incident_open=true`.
+- Gris: sesión `open` bajo control usuario.

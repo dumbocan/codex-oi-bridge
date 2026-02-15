@@ -119,11 +119,29 @@ Session Top Bar (Fase 1.1):
 - Botones `Refresh`, `Release`, `Close` siguen funcionando aunque `web-run` ya haya terminado.
 - La barra se muestra al acercar el cursor al borde superior (hot area) y tiene animación suave de entrada/salida.
 
+Session Observer (Fase 2):
+- La barra hace polling de estado (`GET /state`) y publica eventos (`POST /event`) al agente.
+- Colores:
+  - Azul: control asistente (`controlled=true`).
+  - Rojo: incidente abierto (`incident_open=true`).
+  - Gris: sesión abierta en control usuario.
+- Acción `Clear incident` (ack):
+  - envía `POST /action` con `action=ack`,
+  - apaga estado rojo sin cerrar la sesión,
+  - mantiene traza (`ack_count`, `last_ack_at`).
+
 Notas operativas:
 - Interacción manual (click/move/resize) está soportada durante sesiones persistentes.
 - La sesión solo debe cerrarse con `bridge web-close --attach <session_id>`.
 - Si una sesión muere, `bridge status` lo reflejará como `closed`; recuperación: ejecutar `bridge web-open` de nuevo.
 - Si la barra muestra `agent offline`, recrear la sesión con `bridge web-open` o cerrar con `bridge web-close --attach <id>`.
+
+Flujo recomendado Fase 2:
+1. `bridge web-open --url "http://127.0.0.1:5180"`
+2. `bridge web-run --attach <session_id> --keep-open --visual "..."`
+3. Forzar un error de UI/red para abrir incidente.
+4. Pulsar `Clear incident` en top bar.
+5. `bridge status` para confirmar `incident_open=false` con sesión `open`.
 
 ## Window Management (v1.3)
 
