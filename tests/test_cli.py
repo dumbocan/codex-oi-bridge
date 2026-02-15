@@ -1,12 +1,13 @@
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from bridge.constants import SHELL_ALLOWED_COMMAND_PREFIXES
-from bridge.cli import _validate_evidence_paths, _validate_report_actions, logs_command
+from bridge.constants import SHELL_ALLOWED_COMMAND_PREFIXES, WEB_ALLOWED_COMMAND_PREFIXES
+from bridge.cli import _validate_evidence_paths, _validate_report_actions, logs_command, run_command
 from bridge.models import OIReport
 
 
@@ -158,6 +159,215 @@ class CLITests(unittest.TestCase):
                 allowlist=SHELL_ALLOWED_COMMAND_PREFIXES,
                 mode="shell",
             )
+
+    def test_run_command_writes_failed_report_on_runtime_exception(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            ctx = type(
+                "RunContext",
+                (),
+                {
+                    "run_id": "r1",
+                    "run_dir": run_dir,
+                    "bridge_log": run_dir / "bridge.log",
+                    "stdout_log": run_dir / "oi_stdout.log",
+                    "stderr_log": run_dir / "oi_stderr.log",
+                    "report_path": run_dir / "report.json",
+                },
+            )()
+            status_path = Path(tmp) / "status.json"
+
+            with patch("bridge.cli.create_run_context", return_value=ctx), patch(
+                "bridge.cli._preflight_runtime"
+            ), patch("bridge.cli.require_sensitive_confirmation"), patch(
+                "bridge.cli.write_status",
+                side_effect=lambda **kwargs: Path(status_path).write_text(
+                    json.dumps(kwargs, default=str), encoding="utf-8"
+                ),
+            ), patch(
+                "bridge.cli.run_web_task",
+                side_effect=SystemExit("web backend boom"),
+            ):
+                with self.assertRaises(SystemExit):
+                    run_command("abre http://localhost:5173", confirm_sensitive=True, mode="web")
+
+            report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["result"], "failed")
+            self.assertTrue(report["console_errors"])
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["result"], "failed")
+            self.assertEqual(status["state"], "completed")
+
+    def test_run_command_web_updates_running_progress_status(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r2"
+            run_dir.mkdir(parents=True)
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "step_1_before.png").write_bytes(b"png")
+            (evidence / "step_1_after.png").write_bytes(b"png")
+            ctx = type(
+                "RunContext",
+                (),
+                {
+                    "run_id": "r2",
+                    "run_dir": run_dir,
+                    "bridge_log": run_dir / "bridge.log",
+                    "stdout_log": run_dir / "oi_stdout.log",
+                    "stderr_log": run_dir / "oi_stderr.log",
+                    "report_path": run_dir / "report.json",
+                },
+            )()
+            status_path = Path(tmp) / "status.json"
+            snapshots: list[dict] = []
+
+            def fake_write_status(**kwargs):
+                snapshots.append(dict(kwargs))
+                status_path.write_text(json.dumps(kwargs, default=str), encoding="utf-8")
+
+            def fake_run_web_task(
+                task,
+                run_dir,
+                timeout_seconds,
+                verified,
+                progress_cb,
+                visual=False,
+                visual_cursor=True,
+                visual_click_pulse=True,
+                visual_scale=1.0,
+                visual_color="#3BA7FF",
+            ):
+                progress_cb(1, 1, "web step 1/1: click_text")
+                return OIReport(
+                    task_id="r2",
+                    goal="web: http://localhost:5173",
+                    actions=[
+                        "cmd: playwright goto http://localhost:5173",
+                        "cmd: playwright click text:Entrar demo",
+                    ],
+                    observations=["Opened URL", "Clicked text in step 1"],
+                    console_errors=[],
+                    network_findings=[],
+                    ui_findings=["step 1 verify visible result"],
+                    result="success",
+                    evidence_paths=[
+                        str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                        str((evidence / "step_1_after.png").resolve().relative_to(Path.cwd())),
+                    ],
+                )
+
+            with patch("bridge.cli.create_run_context", return_value=ctx), patch(
+                "bridge.cli._preflight_runtime"
+            ), patch("bridge.cli.require_sensitive_confirmation"), patch(
+                "bridge.cli.write_status",
+                side_effect=fake_write_status,
+            ), patch(
+                "bridge.cli.run_web_task",
+                side_effect=fake_run_web_task,
+            ):
+                with redirect_stdout(io.StringIO()):
+                    run_command(
+                        "abre http://localhost:5173 y haz click en 'Entrar demo'",
+                        confirm_sensitive=True,
+                        mode="web",
+                    )
+
+            self.assertTrue(any(item.get("state") == "running" for item in snapshots))
+            self.assertTrue(
+                any(item.get("progress") == "web step 1/1: click_text" for item in snapshots)
+            )
+            final_status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(final_status["state"], "completed")
+            self.assertEqual(final_status["result"], "success")
+
+    def test_run_command_timeout_error_closes_failed_report_and_status(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r3"
+            run_dir.mkdir(parents=True)
+            ctx = type(
+                "RunContext",
+                (),
+                {
+                    "run_id": "r3",
+                    "run_dir": run_dir,
+                    "bridge_log": run_dir / "bridge.log",
+                    "stdout_log": run_dir / "oi_stdout.log",
+                    "stderr_log": run_dir / "oi_stderr.log",
+                    "report_path": run_dir / "report.json",
+                },
+            )()
+            status_path = Path(tmp) / "status.json"
+
+            with patch("bridge.cli.create_run_context", return_value=ctx), patch(
+                "bridge.cli._preflight_runtime"
+            ), patch("bridge.cli.require_sensitive_confirmation"), patch(
+                "bridge.cli.write_status",
+                side_effect=lambda **kwargs: Path(status_path).write_text(
+                    json.dumps(kwargs, default=str), encoding="utf-8"
+                ),
+            ), patch(
+                "bridge.cli.run_web_task",
+                side_effect=TimeoutError("web step timeout"),
+            ):
+                with self.assertRaises(SystemExit):
+                    run_command("abre http://localhost:5173", confirm_sensitive=True, mode="web")
+
+            report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["result"], "failed")
+            self.assertTrue(any("timeout" in item.lower() for item in report["console_errors"]))
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["result"], "failed")
+            self.assertEqual(status["state"], "completed")
+
+    def test_visual_flag_only_supported_in_web_mode(self) -> None:
+        with self.assertRaises(SystemExit):
+            run_command("window:list", confirm_sensitive=True, mode="gui", visual=True)
+
+    def test_web_wait_steps_do_not_increment_interactive_evidence_count(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r4"
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            before = evidence / "step_1_before.png"
+            after = evidence / "step_1_after.png"
+            before.write_bytes(b"png")
+            after.write_bytes(b"png")
+            report = OIReport(
+                task_id="r4",
+                goal="web",
+                actions=[
+                    "cmd: playwright goto http://localhost:5173",
+                    "cmd: playwright wait selector:#form",
+                    "cmd: playwright wait text:Cargando",
+                    "cmd: playwright click text:Entrar demo",
+                ],
+                observations=["Opened URL", "Waited selector", "Clicked text in step 1"],
+                console_errors=[],
+                network_findings=[],
+                ui_findings=["step 1 verify visible result"],
+                result="success",
+                evidence_paths=[
+                    str(before.resolve().relative_to(Path.cwd())),
+                    str(after.resolve().relative_to(Path.cwd())),
+                ],
+            )
+            click_steps = _validate_report_actions(
+                report,
+                confirm_sensitive=True,
+                expected_targets={"http://localhost:5173"},
+                allowlist=WEB_ALLOWED_COMMAND_PREFIXES,
+                mode="web",
+            )
+            self.assertEqual(click_steps, 1)
+            safe = _validate_evidence_paths(
+                report,
+                run_dir,
+                mode="web",
+                click_steps=click_steps,
+                run_id="r4",
+            )
+            self.assertEqual(len(safe), 2)
 
 
 if __name__ == "__main__":

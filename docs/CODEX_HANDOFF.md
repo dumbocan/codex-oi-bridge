@@ -288,3 +288,24 @@ Flujo:
 2. `bridge-safe run ...` / `bridge-safe web-run ...` / `bridge-safe gui-run ...`
 
 No usar `bridge` directo salvo que la sesión tenga `.venv` y `.env` cargados manualmente.
+
+## 28) v1.4.0 Visual Debug Mode
+
+Objetivo:
+- depurar interacciones web en vivo (ventana visible + overlay de click/cursor),
+- mantener headless actual como default para runs rápidos.
+
+Uso:
+- `bridge web-run --visual "<task web>"`
+- `bridge run --mode web --visual "<task web>"`
+- Flags:
+  - `--visual-cursor on|off`
+  - `--visual-click-pulse on|off`
+  - `--visual-scale <float>`
+  - `--visual-color "#3BA7FF"`
+
+Comportamiento:
+- en modo visual, Playwright corre headed (no headless),
+- instala overlay en la página y marca cada interacción (click/select) por paso,
+- `actions[]` incluye `cmd: playwright visual on`,
+- se mantiene evidencia before/after y validaciones de `--verified`.

@@ -54,6 +54,37 @@ _CLICK_QUOTED_RE = re.compile(
 )
 
 
+def _add_visual_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--visual-cursor",
+        choices=("on", "off"),
+        default="on",
+        help="Visual mode cursor overlay toggle (default: on).",
+    )
+    parser.add_argument(
+        "--visual-click-pulse",
+        choices=("on", "off"),
+        default="on",
+        help="Visual mode click pulse overlay toggle (default: on).",
+    )
+    parser.add_argument(
+        "--visual-scale",
+        type=float,
+        default=1.0,
+        help="Visual overlay scale factor (default: 1.0).",
+    )
+    parser.add_argument(
+        "--visual-color",
+        type=str,
+        default="#3BA7FF",
+        help="Visual overlay color hex (default: #3BA7FF).",
+    )
+
+
+def _flag_on(value: str) -> bool:
+    return value.lower() == "on"
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
@@ -64,6 +95,11 @@ def main() -> None:
             confirm_sensitive=args.confirm_sensitive,
             mode=args.mode,
             verified=args.verified,
+            visual=args.visual,
+            visual_cursor=_flag_on(args.visual_cursor),
+            visual_click_pulse=_flag_on(args.visual_click_pulse),
+            visual_scale=args.visual_scale,
+            visual_color=args.visual_color,
         )
         return
     if args.command == "gui-run":
@@ -80,6 +116,11 @@ def main() -> None:
             confirm_sensitive=args.confirm_sensitive,
             mode="web",
             verified=args.verified,
+            visual=args.visual,
+            visual_cursor=_flag_on(args.visual_cursor),
+            visual_click_pulse=_flag_on(args.visual_click_pulse),
+            visual_scale=args.visual_scale,
+            visual_color=args.visual_color,
         )
         return
     if args.command == "status":
@@ -117,6 +158,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable strict verified mode checks before accepting run output.",
     )
+    run_parser.add_argument(
+        "--visual",
+        action="store_true",
+        help="Enable visual debug mode for web runs (headed browser with overlay).",
+    )
+    _add_visual_flags(run_parser)
 
     gui_run_parser = subparsers.add_parser(
         "gui-run",
@@ -148,6 +195,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable strict verified mode checks before accepting run output.",
     )
+    web_run_parser.add_argument(
+        "--visual",
+        action="store_true",
+        help="Run browser in visible visual debug mode with click overlay.",
+    )
+    _add_visual_flags(web_run_parser)
 
     subparsers.add_parser("status", help="Show latest run status")
 
@@ -167,143 +220,240 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_command(task: str, confirm_sensitive: bool, mode: str, verified: bool = False) -> None:
+def run_command(
+    task: str,
+    confirm_sensitive: bool,
+    mode: str,
+    verified: bool = False,
+    visual: bool = False,
+    visual_cursor: bool = True,
+    visual_click_pulse: bool = True,
+    visual_scale: float = 1.0,
+    visual_color: str = "#3BA7FF",
+) -> None:
+    ctx = None
     if task_violates_code_edit_rule(task):
         raise SystemExit("Task rejected: requests source-code modification (forbidden by guardrails).")
-    use_window_backend = mode == "gui" and should_handle_window_task(task)
-    _validate_mode_preconditions(mode, confirm_sensitive)
-    preflight_mode = "gui-window" if use_window_backend else mode
-    _preflight_runtime(preflight_mode)
+    if visual and mode != "web":
+        raise SystemExit("--visual is only supported with --mode web / web-run.")
+    if visual_scale <= 0:
+        raise SystemExit("--visual-scale must be > 0.")
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", visual_color):
+        raise SystemExit("--visual-color must be a hex color like #3BA7FF.")
+    try:
+        use_window_backend = mode == "gui" and should_handle_window_task(task)
+        _validate_mode_preconditions(mode, confirm_sensitive)
+        preflight_mode = "gui-window" if use_window_backend else mode
+        _preflight_runtime(preflight_mode)
 
-    sensitive_intent = task_has_sensitive_intent(task)
-    require_sensitive_confirmation(sensitive_intent, auto_confirm=confirm_sensitive)
+        sensitive_intent = task_has_sensitive_intent(task)
+        require_sensitive_confirmation(sensitive_intent, auto_confirm=confirm_sensitive)
 
-    expected_targets = _extract_expected_targets(task)
-    button_targets = _extract_button_targets(task)
-    allowlist = _mode_allowlist(mode)
+        expected_targets = _extract_expected_targets(task)
+        button_targets = _extract_button_targets(task)
+        allowlist = _mode_allowlist(mode)
 
-    ctx = create_run_context()
-    if mode in ("gui", "web"):
-        (ctx.run_dir / "evidence").mkdir(parents=True, exist_ok=True)
-    append_log(ctx.bridge_log, f"run_id={ctx.run_id}")
-    append_log(ctx.bridge_log, f"goal={task}")
-    append_log(ctx.bridge_log, f"mode={mode}")
-    if expected_targets:
-        append_log(ctx.bridge_log, f"expected_targets={sorted(expected_targets)}")
-    if button_targets:
-        append_log(ctx.bridge_log, f"button_targets={sorted(button_targets)}")
-
-    timeout_seconds = int(os.getenv("OI_BRIDGE_TIMEOUT_SECONDS", "300"))
-    stdout_text = ""
-
-    if mode == "web":
-        report = run_web_task(task, run_dir=ctx.run_dir, timeout_seconds=timeout_seconds, verified=verified)
-        stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
-        ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
-        ctx.stderr_log.write_text("", encoding="utf-8")
-        append_log(ctx.bridge_log, "runner=web-backend")
-        append_log(ctx.bridge_log, "oi_returncode=0")
-        append_log(ctx.bridge_log, "oi_timed_out=False")
-        write_json(ctx.run_dir / "prompt.json", {"mode": "web", "task": task})
-    elif use_window_backend:
-        report = run_window_task(task, run_dir=ctx.run_dir, timeout_seconds=timeout_seconds)
-        stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
-        ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
-        ctx.stderr_log.write_text("", encoding="utf-8")
-        append_log(ctx.bridge_log, "runner=window-backend")
-        append_log(ctx.bridge_log, "oi_returncode=0")
-        append_log(ctx.bridge_log, "oi_timed_out=False")
-        write_json(ctx.run_dir / "prompt.json", {"mode": "gui-window", "task": task})
-    else:
-        _validate_oi_runtime_config()
-        prompt = build_oi_prompt(
-            task_id=ctx.run_id,
+        ctx = create_run_context()
+        if mode in ("gui", "web"):
+            (ctx.run_dir / "evidence").mkdir(parents=True, exist_ok=True)
+        append_log(ctx.bridge_log, f"run_id={ctx.run_id}")
+        append_log(ctx.bridge_log, f"goal={task}")
+        append_log(ctx.bridge_log, f"mode={mode}")
+        if expected_targets:
+            append_log(ctx.bridge_log, f"expected_targets={sorted(expected_targets)}")
+        if button_targets:
+            append_log(ctx.bridge_log, f"button_targets={sorted(button_targets)}")
+        write_status(
+            run_id=ctx.run_id,
+            run_dir=ctx.run_dir,
             task=task,
-            run_dir=ctx.run_dir,
-            allowlist=allowlist,
-            mode=mode,
+            result="running",
+            state="running",
+            progress="run started",
+            report_path=ctx.report_path,
         )
-        write_json(ctx.run_dir / "prompt.json", {"prompt": prompt})
 
-        result = run_open_interpreter(
-            prompt=prompt,
-            timeout_seconds=timeout_seconds,
-            run_dir=ctx.run_dir,
-        )
-        stdout_text = result.stdout
-        ctx.stdout_log.write_text(result.stdout, encoding="utf-8")
-        ctx.stderr_log.write_text(result.stderr, encoding="utf-8")
-        append_log(ctx.bridge_log, f"oi_returncode={result.returncode}")
-        append_log(ctx.bridge_log, f"oi_timed_out={result.timed_out}")
+        timeout_seconds = int(os.getenv("OI_BRIDGE_TIMEOUT_SECONDS", "300"))
+        stdout_text = ""
 
-        try:
-            report = parse_oi_report(result.stdout)
-        except ValueError as exc:
+        if mode == "web":
+            def _web_progress(step_current: int, step_total: int, detail: str) -> None:
+                if ctx is None:
+                    return
+                write_status(
+                    run_id=ctx.run_id,
+                    run_dir=ctx.run_dir,
+                    task=task,
+                    result="running",
+                    state="running",
+                    progress=detail,
+                    step_current=step_current,
+                    step_total=step_total,
+                    report_path=ctx.report_path,
+                )
+
+            report = run_web_task(
+                task,
+                run_dir=ctx.run_dir,
+                timeout_seconds=timeout_seconds,
+                verified=verified,
+                progress_cb=_web_progress,
+                visual=visual,
+                visual_cursor=visual_cursor,
+                visual_click_pulse=visual_click_pulse,
+                visual_scale=visual_scale,
+                visual_color=visual_color,
+            )
+            stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
+            ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
+            ctx.stderr_log.write_text("", encoding="utf-8")
+            append_log(ctx.bridge_log, "runner=web-backend")
+            append_log(ctx.bridge_log, "oi_returncode=0")
+            append_log(ctx.bridge_log, "oi_timed_out=False")
+            write_json(
+                ctx.run_dir / "prompt.json",
+                {
+                    "mode": "web",
+                    "task": task,
+                    "visual": visual,
+                    "visual_cursor": visual_cursor,
+                    "visual_click_pulse": visual_click_pulse,
+                    "visual_scale": visual_scale,
+                    "visual_color": visual_color,
+                },
+            )
+        elif use_window_backend:
             write_status(
                 run_id=ctx.run_id,
                 run_dir=ctx.run_dir,
                 task=task,
-                result="failed",
+                result="running",
+                state="running",
+                progress="executing window backend",
                 report_path=ctx.report_path,
             )
-            message = str(exc)
-            if "OpenAI API key not found" in result.stdout:
-                message = (
-                    "Open Interpreter requires API key/model configuration. "
-                    "Set OPENAI_API_KEY and retry."
-                )
-            if result.timed_out:
-                message = (
-                    f"Open Interpreter timed out after {timeout_seconds}s "
-                    "without producing a valid report JSON"
-                )
-            raise SystemExit(
-                f"Open Interpreter output is not valid JSON: {message}. "
-                f"Inspect {ctx.stdout_log} and {ctx.stderr_log}"
+            report = run_window_task(task, run_dir=ctx.run_dir, timeout_seconds=timeout_seconds)
+            stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
+            ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
+            ctx.stderr_log.write_text("", encoding="utf-8")
+            append_log(ctx.bridge_log, "runner=window-backend")
+            append_log(ctx.bridge_log, "oi_returncode=0")
+            append_log(ctx.bridge_log, "oi_timed_out=False")
+            write_json(ctx.run_dir / "prompt.json", {"mode": "gui-window", "task": task})
+        else:
+            _validate_oi_runtime_config()
+            prompt = build_oi_prompt(
+                task_id=ctx.run_id,
+                task=task,
+                run_dir=ctx.run_dir,
+                allowlist=allowlist,
+                mode=mode,
             )
-        if result.returncode != 0:
-            append_log(
-                ctx.bridge_log,
-                "warning=non-zero-returncode-but-valid-report-parsed",
+            write_json(ctx.run_dir / "prompt.json", {"prompt": prompt})
+
+            write_status(
+                run_id=ctx.run_id,
+                run_dir=ctx.run_dir,
+                task=task,
+                result="running",
+                state="running",
+                progress="executing open-interpreter",
+                report_path=ctx.report_path,
             )
+            result = run_open_interpreter(
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                run_dir=ctx.run_dir,
+            )
+            stdout_text = result.stdout
+            ctx.stdout_log.write_text(result.stdout, encoding="utf-8")
+            ctx.stderr_log.write_text(result.stderr, encoding="utf-8")
+            append_log(ctx.bridge_log, f"oi_returncode={result.returncode}")
+            append_log(ctx.bridge_log, f"oi_timed_out={result.timed_out}")
 
-    click_steps = _validate_report_actions(
-        report,
-        confirm_sensitive,
-        expected_targets=expected_targets,
-        allowlist=allowlist,
-        mode=mode,
-    )
-    safe_evidence_paths = _validate_evidence_paths(
-        report,
-        ctx.run_dir,
-        mode=mode,
-        click_steps=click_steps,
-        run_id=ctx.run_id,
-    )
-    report = replace(report, evidence_paths=safe_evidence_paths)
-    _validate_gui_post_conditions(
-        report,
-        mode=mode,
-        click_steps=click_steps,
-        button_targets=button_targets,
-    )
-    _validate_verified_mode(
-        report,
-        mode=mode,
-        verified=verified,
-        stdout_text=stdout_text,
-    )
+            try:
+                report = parse_oi_report(result.stdout)
+            except ValueError as exc:
+                message = str(exc)
+                if "OpenAI API key not found" in result.stdout:
+                    message = (
+                        "Open Interpreter requires API key/model configuration. "
+                        "Set OPENAI_API_KEY and retry."
+                    )
+                if result.timed_out:
+                    message = (
+                        f"Open Interpreter timed out after {timeout_seconds}s "
+                        "without producing a valid report JSON"
+                    )
+                raise SystemExit(
+                    f"Open Interpreter output is not valid JSON: {message}. "
+                    f"Inspect {ctx.stdout_log} and {ctx.stderr_log}"
+                )
+            if result.returncode != 0:
+                append_log(
+                    ctx.bridge_log,
+                    "warning=non-zero-returncode-but-valid-report-parsed",
+                )
 
-    write_json(ctx.report_path, report.to_dict())
-    write_status(
-        run_id=ctx.run_id,
-        run_dir=ctx.run_dir,
-        task=task,
-        result=report.result,
-        report_path=ctx.report_path,
-    )
-    print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        write_status(
+            run_id=ctx.run_id,
+            run_dir=ctx.run_dir,
+            task=task,
+            result="running",
+            state="running",
+            progress="validating report and evidence",
+            report_path=ctx.report_path,
+        )
+        click_steps = _validate_report_actions(
+            report,
+            confirm_sensitive,
+            expected_targets=expected_targets,
+            allowlist=allowlist,
+            mode=mode,
+        )
+        safe_evidence_paths = _validate_evidence_paths(
+            report,
+            ctx.run_dir,
+            mode=mode,
+            click_steps=click_steps,
+            run_id=ctx.run_id,
+        )
+        report = replace(report, evidence_paths=safe_evidence_paths)
+        _validate_gui_post_conditions(
+            report,
+            mode=mode,
+            click_steps=click_steps,
+            button_targets=button_targets,
+        )
+        _validate_verified_mode(
+            report,
+            mode=mode,
+            verified=verified,
+            stdout_text=stdout_text,
+        )
+
+        write_json(ctx.report_path, report.to_dict())
+        write_status(
+            run_id=ctx.run_id,
+            run_dir=ctx.run_dir,
+            task=task,
+            result=report.result,
+            state="completed",
+            report_path=ctx.report_path,
+        )
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+    except KeyboardInterrupt:
+        if ctx is not None:
+            _finalize_failed_run(ctx, task, "Interrupted by user")
+        raise SystemExit("Run interrupted by user")
+    except SystemExit as exc:
+        if ctx is not None:
+            _finalize_failed_run(ctx, task, str(exc) or "run failed")
+        raise
+    except Exception as exc:
+        if ctx is not None:
+            _finalize_failed_run(ctx, task, f"Unhandled runtime error: {exc}")
+        raise SystemExit(f"Run failed: {exc}") from exc
 
 
 def _validate_report_actions(
@@ -820,8 +970,39 @@ def _is_state_changing_gui_action(command: str) -> bool:
 
 
 def _is_web_click_command(command: str) -> bool:
-    low = command.lower()
-    return low.startswith("playwright ") and " click " in f" {low} "
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if len(parts) < 2:
+        return False
+    if parts[0].lower() != "playwright":
+        return False
+    return parts[1].lower() in {"click", "select"}
+
+
+def _finalize_failed_run(ctx, task: str, reason: str) -> None:
+    report = OIReport(
+        task_id=ctx.run_id,
+        goal=task,
+        actions=[],
+        observations=[],
+        console_errors=[reason],
+        network_findings=[],
+        ui_findings=[],
+        result="failed",
+        evidence_paths=[],
+    )
+    write_json(ctx.report_path, report.to_dict())
+    write_status(
+        run_id=ctx.run_id,
+        run_dir=ctx.run_dir,
+        task=task,
+        result="failed",
+        state="completed",
+        progress="failed",
+        report_path=ctx.report_path,
+    )
 
 
 def _validate_malformed_command(command: str) -> None:

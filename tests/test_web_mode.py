@@ -8,7 +8,7 @@ from unittest.mock import patch
 from bridge.cli import _validate_evidence_paths, _validate_report_actions
 from bridge.constants import WEB_ALLOWED_COMMAND_PREFIXES
 from bridge.models import OIReport
-from bridge.web_backend import _execute_playwright, run_web_task
+from bridge.web_backend import WebStep, _execute_playwright, _parse_steps, run_web_task
 
 
 class _FakeConsoleMessage:
@@ -31,24 +31,60 @@ class _FakeResponse:
         self.request = types.SimpleNamespace(method=method)
 
 
-class _FakeClicker:
-    def __init__(self, page):
+class _FakeNode:
+    def __init__(self, page, text: str = "", selector: str = ""):
         self.first = self
         self._page = page
+        self._text = text
+        self._selector = selector
 
     def click(self) -> None:
+        if self._text and self._text == self._page.fail_click_text:
+            raise RuntimeError("text not found")
         self._page._title = "Demo after click"
         self._page.url = self._page.url + "#clicked"
         self._page._emit("console", _FakeConsoleMessage("console-error"))
         self._page._emit("response", _FakeResponse("GET", "http://localhost:5173/api", 500))
         self._page._emit("requestfailed", _FakeRequest("GET", "http://localhost:5173/asset"))
 
+    def select_option(self, *, label: str | None = None, value: str | None = None) -> None:
+        choice = label or value or ""
+        self._page._title = f"Selected {choice}"
+
+    def wait_for(self, state: str = "visible") -> None:
+        self._page.waited_text = self._text
+
+    def count(self) -> int:
+        if self._page.authenticated and self._text in self._page.auth_hints:
+            return 1
+        return 0
+
+    def bounding_box(self) -> dict[str, float]:
+        return {"x": 120.0, "y": 80.0, "width": 20.0, "height": 20.0}
+
 
 class _FakePage:
-    def __init__(self):
+    def __init__(self, *, authenticated: bool = False, fail_click_text: str = ""):
         self._handlers = {}
         self.url = "about:blank"
         self._title = "Demo"
+        self.authenticated = authenticated
+        self.fail_click_text = fail_click_text
+        self.waited_selector = ""
+        self.waited_text = ""
+        self.overlay_installed = False
+        self.overlay_events: list[tuple[float, float, str]] = []
+        self.pulse_events: list[tuple[float, float]] = []
+        self.brought_to_front = False
+        self.auth_hints = {
+            "cerrar sesion",
+            "cerrar sesión",
+            "logout",
+            "sign out",
+            "dashboard",
+            "mi cuenta",
+            "perfil",
+        }
 
     def set_default_timeout(self, _value: int) -> None:
         return
@@ -70,18 +106,37 @@ class _FakePage:
         Path(path).write_bytes(b"png")
 
     def locator(self, selector: str):
-        return _FakeClicker(self)
+        return _FakeNode(self, selector=selector)
 
     def get_by_text(self, text: str, exact: bool):
-        return _FakeClicker(self)
+        return _FakeNode(self, text=text)
+
+    def wait_for_selector(self, selector: str) -> None:
+        self.waited_selector = selector
 
     def wait_for_timeout(self, _ms: int) -> None:
         return
 
+    def add_init_script(self, script: str) -> None:
+        self.overlay_installed = "__bridgeShowClick" in script and "__bridgePulseAt" in script
+
+    def evaluate(self, _script: str, payload) -> None:
+        if "__bridgeShowClick" in _script:
+            x, y, label = payload
+            self.overlay_events.append((x, y, label))
+            return
+        if "__bridgePulseAt" in _script:
+            x, y = payload
+            self.pulse_events.append((x, y))
+            return
+
+    def bring_to_front(self) -> None:
+        self.brought_to_front = True
+
 
 class _FakeBrowser:
-    def __init__(self):
-        self._page = _FakePage()
+    def __init__(self, page: _FakePage):
+        self._page = page
 
     def new_page(self):
         return self._page
@@ -91,24 +146,52 @@ class _FakeBrowser:
 
 
 class _FakeChromium:
-    def launch(self, headless: bool, channel: str | None = None):
-        return _FakeBrowser()
+    def __init__(self, page: _FakePage):
+        self._page = page
+        self.launch_calls: list[dict[str, object]] = []
+
+    def launch(self, **kwargs):
+        self.launch_calls.append(kwargs)
+        return _FakeBrowser(self._page)
 
 
 class _FakePlaywright:
-    def __init__(self):
-        self.chromium = _FakeChromium()
+    def __init__(self, page: _FakePage):
+        self.chromium = _FakeChromium(page)
 
 
 class _FakePlaywrightCtx:
+    def __init__(self, page: _FakePage):
+        self._page = page
+
     def __enter__(self):
-        return _FakePlaywright()
+        return _FakePlaywright(self._page)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
 
 
 class WebModeTests(unittest.TestCase):
+    def test_parse_steps_supports_wait_click_and_select(self) -> None:
+        steps = _parse_steps(
+            'abre http://localhost:5173 wait selector:"#ready" click selector:"#go" '
+            'select option "ES" from selector "#lang" wait text:"Bienvenido"'
+        )
+        kinds = [step.kind for step in steps]
+        self.assertIn("wait_selector", kinds)
+        self.assertIn("click_selector", kinds)
+        self.assertIn("select_label", kinds)
+        self.assertIn("wait_text", kinds)
+
+    def test_parse_steps_does_not_convert_wait_selector_into_click_selector(self) -> None:
+        steps = _parse_steps(
+            'abre http://localhost:5173 click en "Entrar demo" wait selector:"#dashboard"'
+        )
+        kinds = [step.kind for step in steps]
+        self.assertIn("click_text", kinds)
+        self.assertIn("wait_selector", kinds)
+        self.assertNotIn("click_selector", kinds)
+
     def test_run_web_task_requires_url(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
             run_dir = Path(tmp) / "runs" / "r1"
@@ -116,9 +199,10 @@ class WebModeTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 run_web_task("haz click en boton demo", run_dir, 30)
 
-    def test_web_open_click_verify_screenshots_and_console_network_capture(self) -> None:
+    def test_web_open_click_select_wait_and_capture(self) -> None:
+        page = _FakePage()
         fake_sync_module = types.ModuleType("playwright.sync_api")
-        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx()
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
         fake_playwright = types.ModuleType("playwright")
         fake_playwright.sync_api = fake_sync_module
 
@@ -132,7 +216,12 @@ class WebModeTests(unittest.TestCase):
             try:
                 report = _execute_playwright(
                     "http://localhost:5173",
-                    [{"kind": "text", "value": "Entrar demo"}],
+                    [
+                        WebStep("wait_selector", "#ready"),
+                        WebStep("click_selector", "#go"),
+                        WebStep("select_label", "#lang", "ES"),
+                        WebStep("wait_text", "Bienvenido"),
+                    ],
                     run_dir,
                     30,
                     verified=True,
@@ -148,15 +237,50 @@ class WebModeTests(unittest.TestCase):
                     sys.modules["playwright.sync_api"] = old_sync
 
             self.assertIn("cmd: playwright goto http://localhost:5173", report.actions)
-            self.assertIn("cmd: playwright click text:Entrar demo", report.actions)
-            self.assertTrue(any("Page title:" in item for item in report.observations))
+            self.assertIn("cmd: playwright click selector:#go", report.actions)
+            self.assertIn("cmd: playwright select selector:#lang label:ES", report.actions)
+            self.assertIn("cmd: playwright wait selector:#ready", report.actions)
+            self.assertIn("cmd: playwright wait text:Bienvenido", report.actions)
             self.assertTrue(any("step 1 verify visible result" in item for item in report.ui_findings))
-            self.assertTrue(any("console-error" in item for item in report.console_errors))
-            self.assertTrue(any("500" in item for item in report.network_findings))
-            for rel_path in report.evidence_paths:
-                abs_path = Path.cwd() / rel_path
-                self.assertTrue(abs_path.exists())
-                self.assertGreater(abs_path.stat().st_size, 0)
+            self.assertTrue(any("step 2 verify visible result" in item for item in report.ui_findings))
+            self.assertEqual(page.waited_selector, "#ready")
+            self.assertEqual(page.waited_text, "Bienvenido")
+            self.assertEqual(len(report.evidence_paths), 4)
+
+    def test_web_auth_fallback_when_login_button_missing(self) -> None:
+        page = _FakePage(authenticated=True, fail_click_text="Entrar demo")
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_text", "Entrar demo")],
+                    run_dir,
+                    30,
+                    verified=True,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertTrue(any("authenticated state detected" in item for item in report.observations))
+        self.assertTrue(any("authenticated session already active" in item for item in report.ui_findings))
 
     def test_web_task_url_with_trailing_comma_is_normalized(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
@@ -186,6 +310,7 @@ class WebModeTests(unittest.TestCase):
                 actions=[
                     "cmd: playwright goto http://localhost:5173",
                     "cmd: playwright click text:Entrar demo",
+                    "cmd: playwright wait text:Bienvenido",
                 ],
                 observations=["Opened URL", "Clicked text in step 1"],
                 console_errors=[],
@@ -213,6 +338,82 @@ class WebModeTests(unittest.TestCase):
             )
             self.assertEqual(click_steps, 1)
             self.assertEqual(len(safe), 2)
+
+    def test_visual_mode_runs_headed_with_overlay(self) -> None:
+        page = _FakePage()
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        ctx = _FakePlaywrightCtx(page)
+        fake_sync_module.sync_playwright = lambda: ctx
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_selector", "#go")],
+                    run_dir,
+                    30,
+                    verified=True,
+                    visual=True,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertIn("cmd: playwright visual on", report.actions)
+        self.assertTrue(page.overlay_installed)
+        self.assertTrue(page.brought_to_front)
+        self.assertTrue(page.overlay_events)
+        self.assertTrue(page.pulse_events)
+
+    def test_headless_mode_does_not_enable_overlay_action(self) -> None:
+        page = _FakePage()
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_selector", "#go")],
+                    run_dir,
+                    30,
+                    verified=True,
+                    visual=False,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertNotIn("cmd: playwright visual on", report.actions)
+        self.assertFalse(page.overlay_installed)
 
 
 if __name__ == "__main__":

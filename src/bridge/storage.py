@@ -68,18 +68,27 @@ def write_status(
     task: str,
     result: str,
     report_path: Path,
+    state: str = "completed",
+    progress: str | None = None,
+    step_current: int | None = None,
+    step_total: int | None = None,
 ) -> None:
-    write_json(
-        STATUS_PATH,
-        {
-            "run_id": run_id,
-            "run_dir": str(run_dir),
-            "task": task,
-            "result": result,
-            "report_path": str(report_path),
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "task": task,
+        "result": result,
+        "state": state,
+        "report_path": str(report_path),
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    if progress:
+        payload["progress"] = progress
+    if step_current is not None:
+        payload["step_current"] = step_current
+    if step_total is not None:
+        payload["step_total"] = step_total
+    write_json(STATUS_PATH, payload)
 
 
 def status_payload() -> dict[str, Any]:

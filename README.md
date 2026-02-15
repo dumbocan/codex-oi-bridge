@@ -13,6 +13,9 @@ bajo control de Codex.
 - `bridge status`
 - `bridge logs --tail 200`
 - `bridge doctor --mode shell|gui|web`
+- `bridge web-run --visual "<task>"` (debug visual con overlay, no headless)
+  - Flags: `--visual-cursor on|off`, `--visual-click-pulse on|off`,
+    `--visual-scale <float>`, `--visual-color "#3BA7FF"`
 
 ## Runtime recomendado (obligatorio)
 
@@ -67,6 +70,8 @@ Evidencia obligatoria por click `N`:
 ## Web Mode (Playwright) (v1.3)
 
 - Activación: `bridge run --mode web ...` o `bridge web-run ...`.
+- Por defecto: ejecución headless (rápida) para runs normales.
+- Visual debug opcional: `--visual` para abrir navegador visible con overlay de cursor/click por paso.
 - Backend determinista desde bridge (no depende del output narrativo de OI).
 - Capacidades:
   - abrir URL explícita del task,
@@ -84,6 +89,13 @@ Evidencia web por click `N`:
 Hallazgos runtime:
 - `console_errors[]` desde consola del navegador.
 - `network_findings[]` desde responses >= 400 y requests fallidas.
+
+Pasos web soportados (nativos):
+- `click` por texto.
+- `click selector:"..."`.
+- `select ... from selector "..."` por label/value.
+- `wait selector:"..."`.
+- `wait text:"..."`.
 
 ## Window Management (v1.3)
 
@@ -186,5 +198,9 @@ Resultado esperado:
   - operaciones de ventana deterministas en `gui` (`window:*`)
 - `v1.3.1`: estabilidad de web mode:
   - fix de parseo de URL con puntuación final (`trailing punctuation`) en tasks (`http://... ,`)
+- `v1.4.0`: Visual Debug Mode:
+  - flag `--visual` en `web-run` / `run --mode web`
+  - navegador visible con overlay de click/cursor
+  - modo headless actual se mantiene como default para runs rápidos
 
 Ver handoff completo en `docs/CODEX_HANDOFF.md`.
