@@ -13,6 +13,7 @@ from bridge.web_backend import (
     _ensure_visual_overlay_ready,
     _execute_playwright,
     _install_visual_overlay,
+    ensure_session_top_bar,
     _session_state_payload,
     _parse_steps,
     run_web_task,
@@ -526,6 +527,65 @@ class WebModeTests(unittest.TestCase):
         self.assertIn("transform 210ms ease-out", script)
         self.assertIn("agent offline", script)
         self.assertIn("network_warn", script)
+        self.assertIn("READY FOR MANUAL TEST", script)
+        self.assertIn("readyManual", script)
+
+    def test_top_bar_semantics_keep_blue_red_gray_and_add_green_ready(self) -> None:
+        page = _FakePage()
+        _install_visual_overlay(
+            page,
+            cursor_enabled=False,
+            click_pulse_enabled=False,
+            scale=1.0,
+            color="#3BA7FF",
+            trace_enabled=False,
+            session_state={"session_id": "s1"},
+        )
+        script = page.init_scripts[-1]
+        self.assertIn("controlled", script)
+        self.assertIn("incidentOpen", script)
+        self.assertIn("readyManual", script)
+        self.assertIn("rgba(59,167,255,0.22)", script)
+        self.assertIn("rgba(255,82,82,0.26)", script)
+        self.assertIn("rgba(70,189,120,0.24)", script)
+
+    def test_web_open_can_inject_top_bar_without_web_run(self) -> None:
+        page = _FakePage()
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-open",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=False,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+        old_playwright = sys.modules.get("playwright")
+        old_sync = sys.modules.get("playwright.sync_api")
+        sys.modules["playwright"] = fake_playwright
+        sys.modules["playwright.sync_api"] = fake_sync_module
+        try:
+            ensure_session_top_bar(session)
+        finally:
+            if old_playwright is None:
+                sys.modules.pop("playwright", None)
+            else:
+                sys.modules["playwright"] = old_playwright
+            if old_sync is None:
+                sys.modules.pop("playwright.sync_api", None)
+            else:
+                sys.modules["playwright.sync_api"] = old_sync
+        self.assertTrue(page.init_scripts)
 
     def test_overlay_ready_retries_until_visible(self) -> None:
         page = _FakePage()

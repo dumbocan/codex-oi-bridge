@@ -337,6 +337,7 @@ Comportamiento:
   - `POST /event` (click/error/network),
   - `POST /action` (`refresh`, `release`, `close`, `ack`).
 - `Clear incident` (`action=ack`) limpia estado rojo sin cerrar sesión.
+- `web-open` inyecta la top bar automáticamente en la sesión actual (sin requerir `web-run --visual`).
 
 Troubleshooting:
 - Move/resize/manual interaction en la ventana persistente está soportada.
@@ -345,6 +346,8 @@ Troubleshooting:
 - Si la barra indica `agent offline`, las acciones se deshabilitan; recuperar con `web-open` (nueva sesión) o `web-close` de la sesión muerta.
 
 Colores de estado en barra:
+- Verde: `READY FOR MANUAL TEST` (`state=open`, `controlled=false`, `agent_online=true`, `incident_open=false`).
 - Azul: `controlled=true` (assistant control).
 - Rojo: `incident_open=true`.
 - Gris: sesión `open` bajo control usuario.
+- Oscuro: sesión `closed` o agente offline.

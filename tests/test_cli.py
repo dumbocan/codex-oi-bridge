@@ -419,10 +419,13 @@ class CLITests(unittest.TestCase):
         out = io.StringIO()
         with patch("bridge.cli.get_last_session", return_value=None), patch(
             "bridge.cli.create_session", return_value=session
+        ), patch("bridge.cli.session_is_alive", return_value=True), patch(
+            "bridge.cli.ensure_session_top_bar"
         ):
             with redirect_stdout(out):
                 web_open_command("http://localhost:5173")
         self.assertIn('"session_id": "s1"', out.getvalue())
+        self.assertIn('"top_bar_injected": true', out.getvalue())
 
         out = io.StringIO()
         with patch("bridge.cli.load_and_refresh_session", return_value=session), patch(

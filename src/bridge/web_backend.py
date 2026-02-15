@@ -162,6 +162,32 @@ def destroy_session_top_bar(session: WebSession) -> None:
             return
 
 
+def ensure_session_top_bar(session: WebSession) -> None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            _install_visual_overlay(
+                page,
+                cursor_enabled=False,
+                click_pulse_enabled=False,
+                scale=1.0,
+                color="#3BA7FF",
+                trace_enabled=False,
+                session_state=_session_state_payload(session),
+            )
+            _set_assistant_control_overlay(page, bool(session.controlled))
+            _update_top_bar_state(page, _session_state_payload(session))
+        except Exception:
+            return
+
+
 def _parse_steps(task: str) -> list[WebStep]:
     captures: list[tuple[int, int, WebStep]] = []
 
@@ -1007,10 +1033,22 @@ def _install_visual_overlay(
           const controlUrl = window.__bridgeResolveControlUrl(s);
           const agentOnline = !!controlUrl && s.agent_online !== false;
           const incidentOpen = !!s.incident_open;
+          const readyManual = open && !controlled && agentOnline && !incidentOpen;
           const incidentText = String(s.last_error || '').slice(0, 96);
           bar.style.background = controlled
             ? 'rgba(59,167,255,0.22)'
-            : (incidentOpen ? 'rgba(255,82,82,0.26)' : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)'));
+            : (
+              incidentOpen
+                ? 'rgba(255,82,82,0.26)'
+                : (
+                  readyManual
+                    ? 'rgba(70,189,120,0.24)'
+                    : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)')
+                )
+            );
+          bar.style.borderBottom = readyManual
+            ? '1px solid rgba(70,189,120,0.72)'
+            : '1px solid rgba(255,255,255,0.18)';
           bar.dataset.state = JSON.stringify(s);
           window.__bridgeSetIncidentOverlay(incidentOpen && !controlled, incidentText || 'INCIDENT DETECTED');
           window.__bridgeEnsureSessionObserver();
@@ -1020,7 +1058,11 @@ def _install_visual_overlay(
           const last = String(s.last_seen_at || '').replace('T', ' ').slice(0, 16);
           const status = !agentOnline
             ? 'agent offline'
-            : (incidentOpen ? `incident open (${Number(s.error_count || 0)})` : '');
+            : (
+              incidentOpen
+                ? `incident open (${Number(s.error_count || 0)})`
+                : (readyManual ? 'READY FOR MANUAL TEST' : '')
+            );
           bar.innerHTML = `
             <strong>session ${s.session_id || '-'}</strong>
             <span>state:${s.state || '-'}</span>

@@ -121,7 +121,9 @@ Session Top Bar (Fase 1.1):
 
 Session Observer (Fase 2):
 - La barra hace polling de estado (`GET /state`) y publica eventos (`POST /event`) al agente.
+- `web-open` inyecta automáticamente la top bar en la página actual (sin necesitar `web-run --visual`).
 - Colores:
+  - Verde: `READY FOR MANUAL TEST` (`open`, `controlled=false`, `agent_online=true`, `incident_open=false`).
   - Azul: control asistente (`controlled=true`).
   - Rojo: incidente abierto (`incident_open=true`).
   - Gris: sesión abierta en control usuario.

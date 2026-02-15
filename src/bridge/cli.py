@@ -39,7 +39,12 @@ from bridge.storage import (
     write_json,
     write_status,
 )
-from bridge.web_backend import destroy_session_top_bar, release_session_control_overlay, run_web_task
+from bridge.web_backend import (
+    destroy_session_top_bar,
+    ensure_session_top_bar,
+    release_session_control_overlay,
+    run_web_task,
+)
 from bridge.web_session import (
     close_session,
     create_session,
@@ -640,6 +645,13 @@ def web_open_command(url: str | None) -> None:
         session = existing
     else:
         session = create_session(initial_url=url)
+    top_bar_injected = False
+    if session_is_alive(session):
+        try:
+            ensure_session_top_bar(session)
+            top_bar_injected = True
+        except Exception:
+            top_bar_injected = False
     print(
         json.dumps(
             {
@@ -648,6 +660,7 @@ def web_open_command(url: str | None) -> None:
                 "title": session.title,
                 "controlled": session.controlled,
                 "state": session.state,
+                "top_bar_injected": top_bar_injected,
             },
             indent=2,
             ensure_ascii=False,
