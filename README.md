@@ -10,6 +10,9 @@ bajo control de Codex.
 - `bridge run --mode web "<task>"`
 - `bridge gui-run "<task>"`
 - `bridge web-run "<task>"`
+- `bridge web-open [--url ...]`
+- `bridge web-release --attach <session_id>`
+- `bridge web-close --attach <session_id>`
 - `bridge status`
 - `bridge logs --tail 200`
 - `bridge doctor --mode shell|gui|web`
@@ -99,6 +102,22 @@ Pasos web soportados (nativos):
 - `select ... from selector "..."` por label/value.
 - `wait selector:"..."`.
 - `wait text:"..."`.
+
+## Persistent Web Session + Control Handoff
+
+- `bridge web-open --url "http://127.0.0.1:5180"`: abre/reusa sesión persistente y devuelve `session_id`.
+- `bridge web-run --attach <session_id> ...`: ejecuta en la misma ventana/sesión.
+- `bridge web-run --keep-open ...`: crea sesión persistente implícita y no cierra al finalizar.
+- `bridge web-release --attach <session_id>`: libera control asistente (quita borde azul).
+- `bridge web-close --attach <session_id>`: cierra sesión explícitamente.
+
+Mientras el asistente controla una sesión web visual, aparece borde azul con etiqueta `ASSISTANT CONTROL`.
+Al terminar run/release se retira y se registra `control released`.
+
+Notas operativas:
+- Interacción manual (click/move/resize) está soportada durante sesiones persistentes.
+- La sesión solo debe cerrarse con `bridge web-close --attach <session_id>`.
+- Si una sesión muere, `bridge status` lo reflejará como `closed`; recuperación: ejecutar `bridge web-open` de nuevo.
 
 ## Window Management (v1.3)
 

@@ -10,11 +10,13 @@ from bridge.constants import WEB_ALLOWED_COMMAND_PREFIXES
 from bridge.models import OIReport
 from bridge.web_backend import (
     WebStep,
+    _ensure_visual_overlay_ready,
     _execute_playwright,
     _install_visual_overlay,
     _parse_steps,
     run_web_task,
 )
+from bridge.web_session import WebSession
 
 
 class _FakeConsoleMessage:
@@ -106,6 +108,9 @@ class _FakePage:
         self.pulse_events: list[tuple[float, float]] = []
         self.brought_to_front = False
         self.init_scripts: list[str] = []
+        self.eval_calls: list[tuple[str, object]] = []
+        self.overlay_visible_after = 0
+        self._overlay_visible_checks = 0
         self.auth_hints = {
             "cerrar sesion",
             "cerrar sesión",
@@ -152,10 +157,12 @@ class _FakePage:
         self.init_scripts.append(script)
 
     def evaluate(self, _script: str, payload=None):
+        self.eval_calls.append((_script, payload))
         if "window.__bridgeEnsureOverlay" in _script:
             return True
         if "getElementById('__bridge_cursor_overlay')" in _script:
-            return True
+            self._overlay_visible_checks += 1
+            return self._overlay_visible_checks > self.overlay_visible_after
         if "__bridgeShowClick" in _script:
             x, y, label = payload
             self.overlay_events.append((x, y, label))
@@ -176,6 +183,7 @@ class _FakePage:
 class _FakeBrowser:
     def __init__(self, page: _FakePage):
         self._page = page
+        self.contexts = [types.SimpleNamespace(pages=[page], new_page=lambda: page)]
 
     def new_page(self):
         return self._page
@@ -191,6 +199,9 @@ class _FakeChromium:
 
     def launch(self, **kwargs):
         self.launch_calls.append(kwargs)
+        return _FakeBrowser(self._page)
+
+    def connect_over_cdp(self, endpoint: str):
         return _FakeBrowser(self._page)
 
 
@@ -474,6 +485,63 @@ class WebModeTests(unittest.TestCase):
         self.assertNotEqual(flag_idx, -1)
         self.assertGreater(flag_idx, root_idx)
         self.assertIn("window.__bridgeEnsureOverlay = () => installOverlay()", script)
+
+    def test_overlay_ready_retries_until_visible(self) -> None:
+        page = _FakePage()
+        page.overlay_visible_after = 2
+        _ensure_visual_overlay_ready(page, retries=5, delay_ms=1)
+        self.assertGreaterEqual(page._overlay_visible_checks, 3)
+
+    def test_attach_session_skips_navigation_when_already_at_target(self) -> None:
+        page = _FakePage()
+        page.url = "http://localhost:5173/"
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s1",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url=page.url,
+            title="Audio3",
+            controlled=False,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+        )
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("wait_text", "Audio3")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        session=session,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertFalse(any(action.startswith("cmd: playwright goto") for action in report.actions))
+        self.assertTrue(any("navigation skipped" in item.lower() for item in report.observations))
 
 
 if __name__ == "__main__":

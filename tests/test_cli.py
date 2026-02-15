@@ -7,8 +7,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bridge.constants import SHELL_ALLOWED_COMMAND_PREFIXES, WEB_ALLOWED_COMMAND_PREFIXES
-from bridge.cli import _validate_evidence_paths, _validate_report_actions, logs_command, run_command
+from bridge.cli import (
+    _validate_evidence_paths,
+    _validate_report_actions,
+    main,
+    logs_command,
+    run_command,
+    web_close_command,
+    web_open_command,
+    web_release_command,
+)
 from bridge.models import OIReport
+from bridge.web_session import WebSession
 
 
 class CLITests(unittest.TestCase):
@@ -240,6 +250,8 @@ class CLITests(unittest.TestCase):
                 visual_human_mouse=True,
                 visual_mouse_speed=1.0,
                 visual_click_hold_ms=180,
+                session=None,
+                keep_open=False,
             ):
                 progress_cb(1, 1, "web step 1/1: click_text")
                 return OIReport(
@@ -389,6 +401,172 @@ class CLITests(unittest.TestCase):
                 run_id="r4",
             )
             self.assertEqual(len(safe), 2)
+
+    def test_web_open_release_close_lifecycle(self) -> None:
+        session = WebSession(
+            session_id="s1",
+            pid=101,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=False,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+        )
+        out = io.StringIO()
+        with patch("bridge.cli.get_last_session", return_value=None), patch(
+            "bridge.cli.create_session", return_value=session
+        ):
+            with redirect_stdout(out):
+                web_open_command("http://localhost:5173")
+        self.assertIn('"session_id": "s1"', out.getvalue())
+
+        out = io.StringIO()
+        with patch("bridge.cli.load_and_refresh_session", return_value=session), patch(
+            "bridge.cli.session_is_alive", return_value=True
+        ), patch("bridge.cli.release_session_control_overlay"), patch(
+            "bridge.cli.mark_controlled"
+        ):
+            with redirect_stdout(out):
+                web_release_command("s1")
+        self.assertIn('"result": "released"', out.getvalue())
+
+        out = io.StringIO()
+        with patch("bridge.cli.load_and_refresh_session", return_value=session), patch(
+            "bridge.cli.session_is_alive", return_value=True
+        ), patch("bridge.cli.release_session_control_overlay"), patch(
+            "bridge.cli.close_session"
+        ):
+            with redirect_stdout(out):
+                web_close_command("s1")
+        self.assertIn('"state": "closed"', out.getvalue())
+
+    def test_keep_open_does_not_close_persistent_browser(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "rk"
+            run_dir.mkdir(parents=True)
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "step_1_before.png").write_bytes(b"png")
+            (evidence / "step_1_after.png").write_bytes(b"png")
+            ctx = type(
+                "RunContext",
+                (),
+                {
+                    "run_id": "rk",
+                    "run_dir": run_dir,
+                    "bridge_log": run_dir / "bridge.log",
+                    "stdout_log": run_dir / "oi_stdout.log",
+                    "stderr_log": run_dir / "oi_stderr.log",
+                    "report_path": run_dir / "report.json",
+                },
+            )()
+            session = WebSession(
+                session_id="sk",
+                pid=101,
+                port=9222,
+                user_data_dir="/tmp/x",
+                browser_binary="/usr/bin/chromium",
+                url="about:blank",
+                title="",
+                controlled=False,
+                created_at="2026-01-01T00:00:00+00:00",
+                last_seen_at="2026-01-01T00:00:00+00:00",
+                state="open",
+            )
+
+            def fake_run_web_task(*args, **kwargs):
+                self.assertEqual(kwargs["session"].session_id, "sk")
+                self.assertTrue(kwargs["keep_open"])
+                return OIReport(
+                    task_id="rk",
+                    goal="web: http://localhost:5173",
+                    actions=[
+                        "cmd: playwright goto http://localhost:5173",
+                        "cmd: playwright click text:Entrar demo",
+                    ],
+                    observations=["Opened URL", "Clicked text in step 1"],
+                    console_errors=[],
+                    network_findings=[],
+                    ui_findings=["step 1 verify visible result", "control released"],
+                    result="success",
+                    evidence_paths=[
+                        str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd())),
+                        str((evidence / "step_1_after.png").resolve().relative_to(Path.cwd())),
+                    ],
+                )
+
+            with patch("bridge.cli.create_run_context", return_value=ctx), patch(
+                "bridge.cli._preflight_runtime"
+            ), patch("bridge.cli.require_sensitive_confirmation"), patch(
+                "bridge.cli.write_status"
+            ), patch("bridge.cli.create_session", return_value=session), patch(
+                "bridge.cli.run_web_task",
+                side_effect=fake_run_web_task,
+            ), patch("bridge.cli.mark_controlled") as mark_mock:
+                with redirect_stdout(io.StringIO()):
+                    run_command(
+                        "abre http://localhost:5173 y haz click en 'Entrar demo'",
+                        confirm_sensitive=True,
+                        mode="web",
+                        keep_open=True,
+                    )
+            mark_mock.assert_called()
+
+    def test_status_includes_web_session(self) -> None:
+        session = WebSession(
+            session_id="s9",
+            pid=109,
+            port=9333,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+        )
+        out = io.StringIO()
+        with patch("bridge.cli.status_payload", return_value={"status": "ok"}), patch(
+            "bridge.cli.get_last_session", return_value=session
+        ), patch("bridge.cli.refresh_session_state", return_value=session), patch(
+            "sys.argv", ["bridge", "status"]
+        ):
+            with redirect_stdout(out):
+                main()
+        self.assertIn('"web_session"', out.getvalue())
+        self.assertIn('"controlled": true', out.getvalue())
+
+    def test_attach_refreshes_liveness_before_use(self) -> None:
+        dead = WebSession(
+            session_id="dead1",
+            pid=111,
+            port=9333,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=False,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="closed",
+        )
+        with patch("bridge.cli.load_and_refresh_session", return_value=dead), patch(
+            "bridge.cli.session_is_alive", return_value=False
+        ), patch("bridge.cli._preflight_runtime"), patch(
+            "bridge.cli.require_sensitive_confirmation"
+        ), self.assertRaises(SystemExit) as ctx:
+            run_command(
+                "abre http://localhost:5173",
+                confirm_sensitive=True,
+                mode="web",
+                attach_session_id="dead1",
+            )
+        self.assertIn("run web-open again", str(ctx.exception))
 
 
 if __name__ == "__main__":

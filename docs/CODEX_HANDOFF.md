@@ -314,3 +314,24 @@ Comportamiento:
 - click humano opcional (`mousemove` por pasos + `mousedown` hold + `mouseup`),
 - `actions[]` incluye `cmd: playwright visual on`,
 - se mantiene evidencia before/after y validaciones de `--verified`.
+
+## 29) Persistent Web Session + Control Handoff
+
+Nuevos comandos:
+- `bridge web-open [--url ...]`
+- `bridge web-run --attach <session_id> ...`
+- `bridge web-run --keep-open ...`
+- `bridge web-release --attach <session_id>`
+- `bridge web-close --attach <session_id>`
+
+Comportamiento:
+- Sesiones persistentes guardan estado (`session_id`, `url`, `title`, `controlled`, `last_seen_at`).
+- `bridge status` muestra `web_session` cuando existe.
+- En control asistente, se muestra overlay global con borde azul + `ASSISTANT CONTROL`.
+- Al finalizar o hacer `web-release`, se retira overlay y se registra `control released`.
+- Si hay excepción durante run attach/keep-open, el bridge intenta liberar control automáticamente.
+
+Troubleshooting:
+- Move/resize/manual interaction en la ventana persistente está soportada.
+- La sesión no debería cerrarse salvo `web-close`; si aparece `closed`, recrear con `web-open`.
+- `bridge status` y `runs/web_sessions/<id>.json` se sincronizan por liveness real (PID+CDP) antes de reportar estado.

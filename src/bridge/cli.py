@@ -39,7 +39,16 @@ from bridge.storage import (
     write_json,
     write_status,
 )
-from bridge.web_backend import run_web_task
+from bridge.web_backend import destroy_session_top_bar, release_session_control_overlay, run_web_task
+from bridge.web_session import (
+    close_session,
+    create_session,
+    get_last_session,
+    load_and_refresh_session,
+    mark_controlled,
+    refresh_session_state,
+    session_is_alive,
+)
 from bridge.window_backend import run_window_task, should_handle_window_task
 
 
@@ -121,6 +130,8 @@ def main() -> None:
             visual_human_mouse=_flag_on(args.visual_human_mouse),
             visual_mouse_speed=args.visual_mouse_speed,
             visual_click_hold_ms=args.visual_click_hold_ms,
+            attach_session_id=args.attach,
+            keep_open=args.keep_open,
         )
         return
     if args.command == "gui-run":
@@ -145,10 +156,33 @@ def main() -> None:
             visual_human_mouse=_flag_on(args.visual_human_mouse),
             visual_mouse_speed=args.visual_mouse_speed,
             visual_click_hold_ms=args.visual_click_hold_ms,
+            attach_session_id=args.attach,
+            keep_open=args.keep_open,
         )
         return
+    if args.command == "web-open":
+        web_open_command(args.url)
+        return
+    if args.command == "web-release":
+        web_release_command(args.attach)
+        return
+    if args.command == "web-close":
+        web_close_command(args.attach)
+        return
     if args.command == "status":
-        print(json.dumps(status_payload(), indent=2, ensure_ascii=False))
+        payload = status_payload()
+        last_session = get_last_session()
+        if last_session is not None:
+            last_session = refresh_session_state(last_session)
+            payload["web_session"] = {
+                "session_id": last_session.session_id,
+                "url": last_session.url,
+                "title": last_session.title,
+                "controlled": last_session.controlled,
+                "state": last_session.state,
+                "last_seen_at": last_session.last_seen_at,
+            }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     if args.command == "logs":
         logs_command(args.tail)
@@ -187,6 +221,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable visual debug mode for web runs (headed browser with overlay).",
     )
+    run_parser.add_argument(
+        "--attach",
+        type=str,
+        default=None,
+        help="Attach to persistent web session id (web mode only).",
+    )
+    run_parser.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="Keep web browser open after run (web mode only).",
+    )
     _add_visual_flags(run_parser)
 
     gui_run_parser = subparsers.add_parser(
@@ -224,7 +269,36 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run browser in visible visual debug mode with click overlay.",
     )
+    web_run_parser.add_argument(
+        "--attach",
+        type=str,
+        default=None,
+        help="Attach to persistent web session id.",
+    )
+    web_run_parser.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="Keep browser open after run.",
+    )
     _add_visual_flags(web_run_parser)
+
+    web_open_parser = subparsers.add_parser(
+        "web-open",
+        help="Open/reuse persistent web session",
+    )
+    web_open_parser.add_argument("--url", type=str, default=None)
+
+    web_release_parser = subparsers.add_parser(
+        "web-release",
+        help="Release assistant control from session",
+    )
+    web_release_parser.add_argument("--attach", type=str, required=True)
+
+    web_close_parser = subparsers.add_parser(
+        "web-close",
+        help="Close persistent web session",
+    )
+    web_close_parser.add_argument("--attach", type=str, required=True)
 
     subparsers.add_parser("status", help="Show latest run status")
 
@@ -257,12 +331,17 @@ def run_command(
     visual_human_mouse: bool = True,
     visual_mouse_speed: float = 1.0,
     visual_click_hold_ms: int = 180,
+    attach_session_id: str | None = None,
+    keep_open: bool = False,
 ) -> None:
     ctx = None
+    active_web_session = None
     if task_violates_code_edit_rule(task):
         raise SystemExit("Task rejected: requests source-code modification (forbidden by guardrails).")
     if visual and mode != "web":
         raise SystemExit("--visual is only supported with --mode web / web-run.")
+    if (attach_session_id or keep_open) and mode != "web":
+        raise SystemExit("--attach/--keep-open are only supported in web mode.")
     if visual_scale <= 0:
         raise SystemExit("--visual-scale must be > 0.")
     if visual_mouse_speed <= 0:
@@ -308,6 +387,20 @@ def run_command(
         stdout_text = ""
 
         if mode == "web":
+            session = None
+            created_session_here = False
+            if attach_session_id:
+                session = load_and_refresh_session(attach_session_id)
+                if not session_is_alive(session):
+                    raise SystemExit(
+                        "Attached session is not alive; run web-open again. "
+                        f"session_id={attach_session_id}"
+                    )
+            elif keep_open:
+                session = create_session()
+                created_session_here = True
+            active_web_session = session
+
             def _web_progress(step_current: int, step_total: int, detail: str) -> None:
                 if ctx is None:
                     return
@@ -337,7 +430,17 @@ def run_command(
                 visual_human_mouse=visual_human_mouse,
                 visual_mouse_speed=visual_mouse_speed,
                 visual_click_hold_ms=visual_click_hold_ms,
+                session=session,
+                keep_open=keep_open,
             )
+            if session is not None:
+                mark_controlled(session, False)
+                report = replace(
+                    report,
+                    ui_findings=report.ui_findings
+                    + [f"session_id: {session.session_id}"]
+                    + (["control released"] if "control released" not in report.ui_findings else []),
+                )
             stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
             ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
             ctx.stderr_log.write_text("", encoding="utf-8")
@@ -357,8 +460,12 @@ def run_command(
                     "visual_human_mouse": visual_human_mouse,
                     "visual_mouse_speed": visual_mouse_speed,
                     "visual_click_hold_ms": visual_click_hold_ms,
+                    "attach_session_id": session.session_id if session else None,
+                    "keep_open": keep_open,
                 },
             )
+            if created_session_here and session is not None:
+                append_log(ctx.bridge_log, f"created_session_id={session.session_id}")
         elif use_window_backend:
             write_status(
                 run_id=ctx.run_id,
@@ -480,17 +587,90 @@ def run_command(
         )
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
     except KeyboardInterrupt:
+        if active_web_session is not None:
+            try:
+                mark_controlled(active_web_session, False)
+            except Exception:
+                pass
         if ctx is not None:
             _finalize_failed_run(ctx, task, "Interrupted by user")
         raise SystemExit("Run interrupted by user")
     except SystemExit as exc:
+        if active_web_session is not None:
+            try:
+                mark_controlled(active_web_session, False)
+            except Exception:
+                pass
         if ctx is not None:
             _finalize_failed_run(ctx, task, str(exc) or "run failed")
         raise
     except Exception as exc:
+        if active_web_session is not None:
+            try:
+                mark_controlled(active_web_session, False)
+            except Exception:
+                pass
         if ctx is not None:
             _finalize_failed_run(ctx, task, f"Unhandled runtime error: {exc}")
         raise SystemExit(f"Run failed: {exc}") from exc
+
+
+def web_open_command(url: str | None) -> None:
+    existing = get_last_session()
+    if existing is not None and session_is_alive(existing):
+        session = existing
+    else:
+        session = create_session(initial_url=url)
+    print(
+        json.dumps(
+            {
+                "session_id": session.session_id,
+                "url": session.url,
+                "title": session.title,
+                "controlled": session.controlled,
+                "state": session.state,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+
+
+def web_release_command(session_id: str) -> None:
+    session = load_and_refresh_session(session_id)
+    if session_is_alive(session):
+        release_session_control_overlay(session)
+    mark_controlled(session, False)
+    print(
+        json.dumps(
+            {
+                "session_id": session.session_id,
+                "controlled": False,
+                "result": "released",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+
+
+def web_close_command(session_id: str) -> None:
+    session = load_and_refresh_session(session_id)
+    if session_is_alive(session):
+        release_session_control_overlay(session)
+        destroy_session_top_bar(session)
+    close_session(session)
+    print(
+        json.dumps(
+            {
+                "session_id": session.session_id,
+                "controlled": False,
+                "state": "closed",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 def _validate_report_actions(

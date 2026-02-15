@@ -11,6 +11,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from bridge.models import OIReport
+from bridge.web_session import WebSession, close_session, mark_controlled
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
@@ -83,6 +84,8 @@ def run_web_task(
     visual_human_mouse: bool = True,
     visual_mouse_speed: float = 1.0,
     visual_click_hold_ms: int = 180,
+    session: WebSession | None = None,
+    keep_open: bool = False,
 ) -> OIReport:
     url_match = _URL_RE.search(task)
     if not url_match:
@@ -113,7 +116,50 @@ def run_web_task(
         visual_human_mouse=visual_human_mouse,
         visual_mouse_speed=visual_mouse_speed,
         visual_click_hold_ms=visual_click_hold_ms,
+        session=session,
+        keep_open=keep_open,
     )
+
+
+def release_session_control_overlay(session: WebSession) -> None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        context = browser.contexts[0] if browser.contexts else None
+        if context is None:
+            return
+        page = context.pages[0] if context.pages else None
+        if page is None:
+            return
+        try:
+            _set_assistant_control_overlay(page, False)
+            _update_top_bar_state(page, _session_state_payload(session, override_controlled=False))
+        except Exception:
+            return
+
+
+def destroy_session_top_bar(session: WebSession) -> None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+        context = browser.contexts[0] if browser.contexts else None
+        if context is None:
+            return
+        page = context.pages[0] if context.pages else None
+        if page is None:
+            return
+        try:
+            _destroy_top_bar(page)
+        except Exception:
+            return
 
 
 def _parse_steps(task: str) -> list[WebStep]:
@@ -201,13 +247,15 @@ def _execute_playwright(
     visual_human_mouse: bool = True,
     visual_mouse_speed: float = 1.0,
     visual_click_hold_ms: int = 180,
+    session: WebSession | None = None,
+    keep_open: bool = False,
 ) -> OIReport:
     from playwright.sync_api import sync_playwright
 
     evidence_dir = run_dir / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    actions: list[str] = [f"cmd: playwright goto {url}"]
+    actions: list[str] = []
     if visual:
         actions.append("cmd: playwright visual on")
     observations: list[str] = []
@@ -217,13 +265,24 @@ def _execute_playwright(
     evidence_paths: list[str] = []
 
     with sync_playwright() as p:
-        browser = _launch_browser(
-            p,
-            visual=visual,
-            visual_mouse_speed=visual_mouse_speed,
-        )
-        page = browser.new_page()
+        browser = None
+        page = None
+        context = None
+        attached = session is not None
+        if attached:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{session.port}")
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.pages[0] if context.pages else context.new_page()
+            mark_controlled(session, True, url=page.url, title=page.title())
+        else:
+            browser = _launch_browser(
+                p,
+                visual=visual,
+                visual_mouse_speed=visual_mouse_speed,
+            )
+            page = browser.new_page()
         page.set_default_timeout(min(timeout_seconds * 1000, 120000))
+        pending_action: dict[str, str | None] = {"value": None}
         if visual:
             _install_visual_overlay(
                 page,
@@ -232,8 +291,20 @@ def _execute_playwright(
                 scale=visual_scale,
                 color=visual_color,
                 trace_enabled=True,
+                session_state=_session_state_payload(session),
             )
             page.bring_to_front()
+            if session is not None:
+                try:
+                    page.expose_binding(
+                        "__bridgeSessionAction",
+                        lambda _source, action: pending_action.__setitem__(
+                            "value",
+                            str(action).strip().lower(),
+                        ),
+                    )
+                except Exception:
+                    pass
 
         def on_console(msg: Any) -> None:
             if msg.type == "error":
@@ -255,46 +326,85 @@ def _execute_playwright(
         page.on("response", on_response)
         page.on("requestfailed", on_failed)
 
-        page.goto(url, wait_until="domcontentloaded")
-        if visual:
-            _ensure_visual_overlay_installed(page)
-            _verify_visual_overlay_visible(page)
-        observations.append(f"Opened URL: {url}")
-        observations.append(f"Page title: {page.title()}")
+        control_enabled = False
+        try:
+            initial_url = page.url
+            initial_title = page.title()
+            observations.append(f"Initial url/title: {initial_url} | {initial_title}")
+            target_matches = _same_origin_path(initial_url, url)
+            if target_matches:
+                observations.append("Navigation skipped (already at target)")
+            else:
+                actions.append(f"cmd: playwright goto {url}")
+                page.goto(url, wait_until="domcontentloaded")
+                observations.append(f"Opened URL: {url}")
 
-        interactive_step = 0
-        total = len(steps)
-        for idx, step in enumerate(steps, start=1):
-            if progress_cb:
-                progress_cb(idx, total, f"web step {idx}/{total}: {step.kind}")
-
-            if step.kind in ("click_selector", "click_text", "select_label", "select_value"):
-                interactive_step += 1
-                before = evidence_dir / f"step_{interactive_step}_before.png"
-                after = evidence_dir / f"step_{interactive_step}_after.png"
-                page.screenshot(path=str(before), full_page=True)
-                evidence_paths.append(_to_repo_rel(before))
-                _apply_interactive_step(
+            if visual:
+                _ensure_visual_overlay_ready(page)
+                _set_assistant_control_overlay(page, True)
+                control_enabled = True
+                _update_top_bar_state(
                     page,
-                    step,
-                    interactive_step,
-                    actions,
-                    observations,
-                    ui_findings,
-                    visual=visual,
-                    click_pulse_enabled=visual_click_pulse,
-                    visual_human_mouse=visual_human_mouse,
-                    visual_mouse_speed=visual_mouse_speed,
-                    visual_click_hold_ms=visual_click_hold_ms,
+                    _session_state_payload(session, override_controlled=True),
                 )
-                page.wait_for_timeout(1000)
-                page.screenshot(path=str(after), full_page=True)
-                evidence_paths.append(_to_repo_rel(after))
-                continue
+            observations.append(f"Page title: {page.title()}")
+            if attached and session is not None:
+                mark_controlled(session, True, url=page.url, title=page.title())
 
-            _apply_wait_step(page, step, idx, actions, observations, ui_findings)
+            interactive_step = 0
+            total = len(steps)
+            for idx, step in enumerate(steps, start=1):
+                if session is not None:
+                    stop = _apply_pending_session_action(
+                        page,
+                        session,
+                        pending_action,
+                        observations,
+                        ui_findings,
+                    )
+                    if stop:
+                        break
+                if progress_cb:
+                    progress_cb(idx, total, f"web step {idx}/{total}: {step.kind}")
 
-        browser.close()
+                if step.kind in ("click_selector", "click_text", "select_label", "select_value"):
+                    interactive_step += 1
+                    before = evidence_dir / f"step_{interactive_step}_before.png"
+                    after = evidence_dir / f"step_{interactive_step}_after.png"
+                    page.screenshot(path=str(before), full_page=True)
+                    evidence_paths.append(_to_repo_rel(before))
+                    _apply_interactive_step(
+                        page,
+                        step,
+                        interactive_step,
+                        actions,
+                        observations,
+                        ui_findings,
+                        visual=visual,
+                        click_pulse_enabled=visual_click_pulse,
+                        visual_human_mouse=visual_human_mouse,
+                        visual_mouse_speed=visual_mouse_speed,
+                        visual_click_hold_ms=visual_click_hold_ms,
+                    )
+                    page.wait_for_timeout(1000)
+                    page.screenshot(path=str(after), full_page=True)
+                    evidence_paths.append(_to_repo_rel(after))
+                    continue
+
+                _apply_wait_step(page, step, idx, actions, observations, ui_findings)
+        finally:
+            if visual and control_enabled:
+                _set_assistant_control_overlay(page, False)
+                if session is not None:
+                    _update_top_bar_state(
+                        page,
+                        _session_state_payload(session, override_controlled=False),
+                    )
+                ui_findings.append("control released")
+            if attached and session is not None:
+                mark_controlled(session, False, url=page.url, title=page.title())
+            if not attached and not keep_open:
+                browser.close()
 
     result = "success"
     if console_errors or network_findings:
@@ -501,6 +611,7 @@ def _install_visual_overlay(
     scale: float,
     color: str,
     trace_enabled: bool,
+    session_state: dict[str, Any] | None = None,
 ) -> None:
     config = {
         "cursorEnabled": bool(cursor_enabled),
@@ -509,9 +620,11 @@ def _install_visual_overlay(
         "color": str(color),
         "traceEnabled": bool(trace_enabled),
     }
+    session_json = json.dumps(session_state or {}, ensure_ascii=False)
     script_template = """
     (() => {
       const cfg = __CFG_JSON__;
+      const sessionState = __SESSION_JSON__;
       const installOverlay = () => {
         if (window.__bridgeOverlayInstalled) return true;
         const root = document.documentElement;
@@ -647,6 +760,99 @@ def _install_visual_overlay(
         });
         setTimeout(() => ring.remove(), 720);
         };
+        window.__bridgeEnsureTopBar = (state) => {
+          const id = '__bridge_session_top_bar';
+          let bar = document.getElementById(id);
+          if (!bar) {
+            bar = document.createElement('div');
+            bar.id = id;
+            bar.style.position = 'fixed';
+            bar.style.top = '0';
+            bar.style.left = '0';
+            bar.style.right = '0';
+            bar.style.height = '42px';
+            bar.style.display = 'none';
+            bar.style.alignItems = 'center';
+            bar.style.gap = '10px';
+            bar.style.padding = '6px 10px';
+            bar.style.font = '12px/1.2 monospace';
+            bar.style.zIndex = '2147483644';
+            bar.style.pointerEvents = 'auto';
+            bar.style.backdropFilter = 'blur(4px)';
+            bar.style.borderBottom = '1px solid rgba(255,255,255,0.18)';
+            const hot = document.createElement('div');
+            hot.id = '__bridge_top_hot';
+            hot.style.position = 'fixed';
+            hot.style.top = '0';
+            hot.style.left = '0';
+            hot.style.right = '0';
+            hot.style.height = '8px';
+            hot.style.pointerEvents = 'auto';
+            hot.style.zIndex = '2147483643';
+            hot.addEventListener('mouseenter', () => { bar.style.display = 'flex'; });
+            bar.addEventListener('mouseleave', () => { bar.style.display = 'none'; });
+            const toggle = document.createElement('button');
+            toggle.id = '__bridge_top_toggle';
+            toggle.textContent = '◉';
+            toggle.style.position = 'fixed';
+            toggle.style.top = '6px';
+            toggle.style.left = '6px';
+            toggle.style.zIndex = '2147483644';
+            toggle.style.width = '18px';
+            toggle.style.height = '18px';
+            toggle.style.padding = '0';
+            toggle.style.font = '12px monospace';
+            toggle.style.borderRadius = '999px';
+            toggle.style.border = '1px solid rgba(255,255,255,0.35)';
+            toggle.style.background = 'rgba(17,17,17,0.65)';
+            toggle.style.color = '#fff';
+            toggle.style.pointerEvents = 'auto';
+            toggle.addEventListener('click', () => {
+              bar.style.display = bar.style.display === 'flex' ? 'none' : 'flex';
+            });
+            root.appendChild(hot);
+            root.appendChild(toggle);
+            root.appendChild(bar);
+          }
+          window.__bridgeUpdateTopBarState(state);
+        };
+        window.__bridgeUpdateTopBarState = (state) => {
+          const bar = document.getElementById('__bridge_session_top_bar');
+          if (!bar) return;
+          const s = state || {};
+          const controlled = !!s.controlled;
+          const open = String(s.state || 'open') === 'open';
+          bar.style.background = controlled
+            ? 'rgba(59,167,255,0.22)'
+            : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)');
+          const ctrl = controlled ? 'assistant' : 'user';
+          const url = String(s.url || '').slice(0, 70);
+          const last = String(s.last_seen_at || '').replace('T', ' ').slice(0, 16);
+          bar.innerHTML = `
+            <strong>session ${s.session_id || '-'}</strong>
+            <span>state:${s.state || '-'}</span>
+            <span>control:${ctrl}</span>
+            <span>url:${url}</span>
+            <span>seen:${last}</span>
+            <button id=\"__bridge_release_btn\" ${open ? '' : 'disabled'}>Release</button>
+            <button id=\"__bridge_close_btn\" ${open ? '' : 'disabled'}>Close</button>
+            <button id=\"__bridge_refresh_btn\">Refresh</button>
+          `;
+          const release = bar.querySelector('#__bridge_release_btn');
+          const closeBtn = bar.querySelector('#__bridge_close_btn');
+          const refresh = bar.querySelector('#__bridge_refresh_btn');
+          if (release) release.onclick = () => window.__bridgeSessionAction?.('release');
+          if (closeBtn) closeBtn.onclick = () => window.__bridgeSessionAction?.('close');
+          if (refresh) refresh.onclick = () => window.__bridgeSessionAction?.('refresh');
+        };
+        window.__bridgeDestroyTopBar = () => {
+          document.getElementById('__bridge_session_top_bar')?.remove();
+          document.getElementById('__bridge_top_hot')?.remove();
+          document.getElementById('__bridge_top_toggle')?.remove();
+        };
+        if (sessionState && sessionState.session_id) {
+          window.__bridgeEnsureTopBar(sessionState);
+        }
         window.__bridgeOverlayInstalled = true;
         return true;
       };
@@ -656,7 +862,13 @@ def _install_visual_overlay(
     })();
     """
     script = script_template.replace("__CFG_JSON__", json.dumps(config, ensure_ascii=False))
+    script = script.replace("__SESSION_JSON__", session_json)
     page.add_init_script(script)
+    # Also execute on current page for attach/reuse flows where no navigation occurs.
+    try:
+        page.evaluate(script)
+    except Exception:
+        pass
 
 
 def _highlight_target(
@@ -714,6 +926,24 @@ def _verify_visual_overlay_visible(page: Any) -> None:
         )
 
 
+def _ensure_visual_overlay_ready(page: Any, retries: int = 12, delay_ms: int = 120) -> None:
+    last_error: BaseException | None = None
+    for _ in range(max(1, retries)):
+        try:
+            _ensure_visual_overlay_installed(page)
+            _verify_visual_overlay_visible(page)
+            return
+        except BaseException as exc:
+            last_error = exc
+            try:
+                page.wait_for_timeout(delay_ms)
+            except Exception:
+                pass
+    if isinstance(last_error, BaseException):
+        raise last_error
+    raise SystemExit("Visual overlay not visible after retries.")
+
+
 def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
     steps = int(max(20, min(40, round(24 / max(0.5, speed)))))
     page.mouse.move(x, y, steps=steps)
@@ -733,6 +963,119 @@ def _human_mouse_click(page: Any, x: float, y: float, *, speed: float, hold_ms: 
     if hold_ms > 0:
         page.wait_for_timeout(hold_ms)
     page.mouse.up()
+
+
+def _set_assistant_control_overlay(page: Any, enabled: bool) -> None:
+    page.evaluate(
+        """
+        ([enabled]) => {
+          const id = '__bridge_assistant_control_overlay';
+          const existing = document.getElementById(id);
+          if (!enabled) {
+            if (existing) existing.remove();
+            return;
+          }
+          if (existing) return;
+          const wrap = document.createElement('div');
+          wrap.id = id;
+          wrap.style.position = 'fixed';
+          wrap.style.inset = '0';
+          wrap.style.border = '3px solid #3BA7FF';
+          wrap.style.boxSizing = 'border-box';
+          wrap.style.pointerEvents = 'none';
+          wrap.style.zIndex = '2147483645';
+          const badge = document.createElement('div');
+          badge.textContent = 'ASSISTANT CONTROL';
+          badge.style.position = 'fixed';
+          badge.style.top = '10px';
+          badge.style.right = '12px';
+          badge.style.padding = '4px 8px';
+          badge.style.borderRadius = '999px';
+          badge.style.font = '11px/1.2 monospace';
+          badge.style.color = '#fff';
+          badge.style.background = 'rgba(59,167,255,0.9)';
+          badge.style.pointerEvents = 'none';
+          wrap.appendChild(badge);
+          document.documentElement.appendChild(wrap);
+        }
+        """,
+        [enabled],
+    )
+
+
+def _session_state_payload(
+    session: WebSession | None,
+    *,
+    override_controlled: bool | None = None,
+    override_state: str | None = None,
+) -> dict[str, Any]:
+    if session is None:
+        return {}
+    return {
+        "session_id": session.session_id,
+        "url": session.url,
+        "title": session.title,
+        "controlled": session.controlled if override_controlled is None else override_controlled,
+        "state": session.state if override_state is None else override_state,
+        "last_seen_at": session.last_seen_at,
+    }
+
+
+def _update_top_bar_state(page: Any, payload: dict[str, Any]) -> None:
+    page.evaluate("([payload]) => window.__bridgeUpdateTopBarState?.(payload)", [payload])
+
+
+def _destroy_top_bar(page: Any) -> None:
+    page.evaluate("() => window.__bridgeDestroyTopBar?.()")
+
+
+def _apply_pending_session_action(
+    page: Any,
+    session: WebSession,
+    pending_action: dict[str, str | None],
+    observations: list[str],
+    ui_findings: list[str],
+) -> bool:
+    action = (pending_action.get("value") or "").strip().lower()
+    if not action:
+        return False
+    pending_action["value"] = None
+    if action == "refresh":
+        mark_controlled(session, session.controlled, url=page.url, title=page.title())
+        _update_top_bar_state(page, _session_state_payload(session))
+        observations.append("Session top bar refreshed")
+        return False
+    if action == "release":
+        mark_controlled(session, False, url=page.url, title=page.title())
+        _set_assistant_control_overlay(page, False)
+        _update_top_bar_state(page, _session_state_payload(session, override_controlled=False))
+        observations.append("Control released from top bar")
+        ui_findings.append("control released")
+        return True
+    if action == "close":
+        mark_controlled(session, False, url=page.url, title=page.title())
+        _update_top_bar_state(page, _session_state_payload(session, override_state="closed"))
+        _destroy_top_bar(page)
+        close_session(session)
+        observations.append("Session closed from top bar")
+        ui_findings.append("session closed")
+        return True
+    return False
+
+
+def _same_origin_path(current_url: str, target_url: str) -> bool:
+    try:
+        current = urlparse(current_url)
+        target = urlparse(target_url)
+    except ValueError:
+        return False
+    if not current.scheme or not current.netloc:
+        return False
+    return (
+        current.scheme == target.scheme
+        and current.netloc == target.netloc
+        and (current.path or "/") == (target.path or "/")
+    )
 
 
 def _to_repo_rel(path: Path) -> str:
