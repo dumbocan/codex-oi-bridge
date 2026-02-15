@@ -8,6 +8,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +36,8 @@ class WebSession:
     created_at: str
     last_seen_at: str
     state: str = "open"
+    control_port: int = 0
+    agent_pid: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +101,7 @@ def create_session(initial_url: str | None = None) -> WebSession:
         last_seen_at=now,
         state="open",
     )
+    _ensure_control_agent(session)
     save_session(session)
     set_last_session_id(session.session_id)
     return session
@@ -117,6 +121,8 @@ def load_session(session_id: str) -> WebSession:
         raise SystemExit(f"Unknown session_id: {session_id}")
     with path.open("r", encoding="utf-8") as fh:
         payload = json.load(fh)
+    payload.setdefault("control_port", 0)
+    payload.setdefault("agent_pid", 0)
     return WebSession(**payload)
 
 
@@ -149,48 +155,80 @@ def session_is_alive(session: WebSession) -> bool:
     return _pid_alive(session.pid) and _cdp_alive(session.port)
 
 
+def session_agent_online(session: WebSession) -> bool:
+    if session.agent_pid <= 0 or session.control_port <= 0:
+        return False
+    if not _pid_alive(session.agent_pid):
+        return False
+    return _agent_ping(session.control_port)
+
+
+def request_session_action(session: WebSession, action: str, timeout_seconds: float = 4.0) -> dict[str, Any]:
+    port = int(session.control_port or 0)
+    if port <= 0:
+        raise SystemExit("Session control agent offline: no control port configured.")
+    if not session_agent_online(session):
+        raise SystemExit("Session control agent offline.")
+    payload = json.dumps({"action": action}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/action",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        reason = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"Session control action failed ({action}): {reason}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise SystemExit(f"Session control action failed ({action}): {exc}") from exc
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Session control action returned invalid JSON ({action})") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(f"Session control action returned invalid payload ({action})")
+    return parsed
+
+
 def refresh_session_state(session: WebSession) -> WebSession:
     alive = session_is_alive(session)
-    changed = False
 
     if alive:
         if session.state != "open":
             session.state = "open"
-            changed = True
         target = _cdp_primary_target(session.port)
         if target is not None:
             target_url = str(target.get("url", "")).strip()
             target_title = str(target.get("title", "")).strip()
-            if target_url and target_url != session.url:
+            if target_url:
                 session.url = target_url
-                changed = True
-            if target_title != session.title:
-                session.title = target_title
-                changed = True
+            session.title = target_title
     else:
-        if session.state != "closed":
-            session.state = "closed"
-            changed = True
-        if session.controlled:
-            session.controlled = False
-            changed = True
+        session.state = "closed"
+        session.controlled = False
+
+    if alive:
+        _ensure_control_agent(session)
+    else:
+        session.agent_pid = 0
+        session.control_port = 0
 
     session.last_seen_at = datetime.now(timezone.utc).isoformat()
-    changed = True
-    if changed:
-        save_session(session)
+    save_session(session)
     return session
 
 
 def mark_controlled(session: WebSession, controlled: bool, url: str | None = None, title: str | None = None) -> None:
     session = refresh_session_state(session)
-    session.controlled = controlled
+    session.controlled = controlled and session.state == "open"
     if url is not None:
         session.url = url
     if title is not None:
         session.title = title
     session.last_seen_at = datetime.now(timezone.utc).isoformat()
-    session.state = "open" if session_is_alive(session) else "closed"
     save_session(session)
 
 
@@ -210,10 +248,64 @@ def close_session(session: WebSession) -> None:
                 os.kill(session.pid, signal.SIGKILL)
             except OSError:
                 pass
+    _stop_control_agent(session)
     session.controlled = False
     session.state = "closed"
+    session.agent_pid = 0
+    session.control_port = 0
     session.last_seen_at = datetime.now(timezone.utc).isoformat()
     save_session(session)
+
+
+def _ensure_control_agent(session: WebSession) -> None:
+    if session.control_port > 0 and session_agent_online(session):
+        return
+
+    control_port = _get_free_port()
+    session_dir = Path(session.user_data_dir).parent
+    out_log = session_dir / "agent_stdout.log"
+    err_log = session_dir / "agent_stderr.log"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "bridge.web_control_agent",
+        "--session-id",
+        session.session_id,
+        "--port",
+        str(control_port),
+    ]
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+        "start_new_session": True,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+
+    with out_log.open("a", encoding="utf-8") as out_fh, err_log.open("a", encoding="utf-8") as err_fh:
+        proc = subprocess.Popen(cmd, stdout=out_fh, stderr=err_fh, **popen_kwargs)
+
+    _wait_for_agent(control_port, timeout_seconds=8)
+    session.control_port = control_port
+    session.agent_pid = proc.pid
+
+
+def _stop_control_agent(session: WebSession) -> None:
+    pid = int(session.agent_pid or 0)
+    if pid <= 0:
+        return
+    if pid == os.getpid():
+        return
+    if _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
 
 
 def _find_browser_binary() -> str:
@@ -236,6 +328,24 @@ def _pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _agent_ping(port: int) -> bool:
+    url = f"http://127.0.0.1:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=1.5) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, TimeoutError):
+        return False
+
+
+def _wait_for_agent(port: int, timeout_seconds: int) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _agent_ping(port):
+            return
+        time.sleep(0.2)
+    raise SystemExit(f"Timed out waiting for session control agent on port {port}")
 
 
 def _cdp_alive(port: int) -> bool:

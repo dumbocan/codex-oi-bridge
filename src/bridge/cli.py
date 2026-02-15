@@ -47,6 +47,7 @@ from bridge.web_session import (
     load_and_refresh_session,
     mark_controlled,
     refresh_session_state,
+    session_agent_online,
     session_is_alive,
 )
 from bridge.window_backend import run_window_task, should_handle_window_task
@@ -180,6 +181,7 @@ def main() -> None:
                 "title": last_session.title,
                 "controlled": last_session.controlled,
                 "state": last_session.state,
+                "agent_online": session_agent_online(last_session),
                 "last_seen_at": last_session.last_seen_at,
             }
         print(json.dumps(payload, indent=2, ensure_ascii=False))

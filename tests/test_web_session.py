@@ -90,8 +90,10 @@ class WebSessionTests(unittest.TestCase):
             with patch("bridge.web_session.SESSIONS_DIR", sessions_dir), patch(
                 "bridge.web_session.INDEX_PATH", index_path
             ), patch("bridge.web_session._find_browser_binary", return_value="/usr/bin/chromium"), patch(
-                "bridge.web_session._get_free_port", return_value=9444
+                "bridge.web_session._get_free_port", side_effect=[9444, 9555]
             ), patch("bridge.web_session._wait_for_cdp"), patch(
+                "bridge.web_session._wait_for_agent"
+            ), patch(
                 "bridge.web_session.subprocess.Popen", side_effect=fake_popen
             ):
                 session = create_session("http://127.0.0.1:5180")

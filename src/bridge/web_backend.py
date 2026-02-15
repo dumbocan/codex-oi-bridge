@@ -11,7 +11,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from bridge.models import OIReport
-from bridge.web_session import WebSession, close_session, mark_controlled
+from bridge.web_session import WebSession, mark_controlled
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
@@ -282,7 +282,6 @@ def _execute_playwright(
             )
             page = browser.new_page()
         page.set_default_timeout(min(timeout_seconds * 1000, 120000))
-        pending_action: dict[str, str | None] = {"value": None}
         if visual:
             _install_visual_overlay(
                 page,
@@ -294,17 +293,6 @@ def _execute_playwright(
                 session_state=_session_state_payload(session),
             )
             page.bring_to_front()
-            if session is not None:
-                try:
-                    page.expose_binding(
-                        "__bridgeSessionAction",
-                        lambda _source, action: pending_action.__setitem__(
-                            "value",
-                            str(action).strip().lower(),
-                        ),
-                    )
-                except Exception:
-                    pass
 
         def on_console(msg: Any) -> None:
             if msg.type == "error":
@@ -354,16 +342,6 @@ def _execute_playwright(
             interactive_step = 0
             total = len(steps)
             for idx, step in enumerate(steps, start=1):
-                if session is not None:
-                    stop = _apply_pending_session_action(
-                        page,
-                        session,
-                        pending_action,
-                        observations,
-                        ui_findings,
-                    )
-                    if stop:
-                        break
                 if progress_cb:
                     progress_cb(idx, total, f"web step {idx}/{total}: {step.kind}")
 
@@ -760,6 +738,52 @@ def _install_visual_overlay(
         });
         setTimeout(() => ring.remove(), 720);
         };
+        window.__bridgeResolveControlUrl = (state) => {
+          const s = state || {};
+          if (s.control_url && typeof s.control_url === 'string') return s.control_url;
+          const p = Number(s.control_port || 0);
+          if (p > 0) return `http://127.0.0.1:${p}`;
+          return '';
+        };
+        window.__bridgeSetTopBarVisible = (visible) => {
+          const bar = document.getElementById('__bridge_session_top_bar');
+          if (!bar) return;
+          if (visible) {
+            bar.dataset.visible = '1';
+            bar.style.transform = 'translateY(0)';
+            bar.style.opacity = '1';
+          } else {
+            bar.dataset.visible = '0';
+            bar.style.transform = 'translateY(-110%)';
+            bar.style.opacity = '0';
+          }
+        };
+        window.__bridgeControlRequest = async (action) => {
+          const bar = document.getElementById('__bridge_session_top_bar');
+          const stateRaw = bar?.dataset?.state || '{}';
+          let state;
+          try { state = JSON.parse(stateRaw); } catch (_e) { state = {}; }
+          const controlUrl = window.__bridgeResolveControlUrl(state);
+          if (!controlUrl) {
+            return { ok: false, error: 'agent offline' };
+          }
+          try {
+            const resp = await fetch(`${controlUrl}/action`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action }),
+            });
+            let payload = {};
+            try { payload = await resp.json(); } catch (_e) { payload = {}; }
+            if (!resp.ok) {
+              const msg = payload.error || `http ${resp.status}`;
+              return { ok: false, error: String(msg), payload };
+            }
+            return { ok: true, payload };
+          } catch (err) {
+            return { ok: false, error: String(err || 'agent offline') };
+          }
+        };
         window.__bridgeEnsureTopBar = (state) => {
           const id = '__bridge_session_top_bar';
           let bar = document.getElementById(id);
@@ -771,7 +795,7 @@ def _install_visual_overlay(
             bar.style.left = '0';
             bar.style.right = '0';
             bar.style.height = '42px';
-            bar.style.display = 'none';
+            bar.style.display = 'flex';
             bar.style.alignItems = 'center';
             bar.style.gap = '10px';
             bar.style.padding = '6px 10px';
@@ -780,6 +804,10 @@ def _install_visual_overlay(
             bar.style.pointerEvents = 'auto';
             bar.style.backdropFilter = 'blur(4px)';
             bar.style.borderBottom = '1px solid rgba(255,255,255,0.18)';
+            bar.style.transform = 'translateY(-110%)';
+            bar.style.opacity = '0';
+            bar.style.transition = 'transform 210ms ease-out, opacity 210ms ease-out';
+            bar.dataset.visible = '0';
             const hot = document.createElement('div');
             hot.id = '__bridge_top_hot';
             hot.style.position = 'fixed';
@@ -789,8 +817,8 @@ def _install_visual_overlay(
             hot.style.height = '8px';
             hot.style.pointerEvents = 'auto';
             hot.style.zIndex = '2147483643';
-            hot.addEventListener('mouseenter', () => { bar.style.display = 'flex'; });
-            bar.addEventListener('mouseleave', () => { bar.style.display = 'none'; });
+            hot.addEventListener('mouseenter', () => window.__bridgeSetTopBarVisible(true));
+            bar.addEventListener('mouseleave', () => window.__bridgeSetTopBarVisible(false));
             const toggle = document.createElement('button');
             toggle.id = '__bridge_top_toggle';
             toggle.textContent = '◉';
@@ -808,7 +836,7 @@ def _install_visual_overlay(
             toggle.style.color = '#fff';
             toggle.style.pointerEvents = 'auto';
             toggle.addEventListener('click', () => {
-              bar.style.display = bar.style.display === 'flex' ? 'none' : 'flex';
+              window.__bridgeSetTopBarVisible(bar.dataset.visible !== '1');
             });
             root.appendChild(hot);
             root.appendChild(toggle);
@@ -822,28 +850,49 @@ def _install_visual_overlay(
           const s = state || {};
           const controlled = !!s.controlled;
           const open = String(s.state || 'open') === 'open';
+          const controlUrl = window.__bridgeResolveControlUrl(s);
+          const agentOnline = !!controlUrl && s.agent_online !== false;
           bar.style.background = controlled
             ? 'rgba(59,167,255,0.22)'
             : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)');
+          bar.dataset.state = JSON.stringify(s);
           const ctrl = controlled ? 'assistant' : 'user';
           const url = String(s.url || '').slice(0, 70);
           const last = String(s.last_seen_at || '').replace('T', ' ').slice(0, 16);
+          const status = agentOnline ? '' : 'agent offline';
           bar.innerHTML = `
             <strong>session ${s.session_id || '-'}</strong>
             <span>state:${s.state || '-'}</span>
             <span>control:${ctrl}</span>
             <span>url:${url}</span>
             <span>seen:${last}</span>
-            <button id=\"__bridge_release_btn\" ${open ? '' : 'disabled'}>Release</button>
-            <button id=\"__bridge_close_btn\" ${open ? '' : 'disabled'}>Close</button>
-            <button id=\"__bridge_refresh_btn\">Refresh</button>
+            <span id=\"__bridge_status_msg\" style=\"color:${agentOnline ? '#b7d8ff' : '#ffb3b3'}\">${status}</span>
+            <button id=\"__bridge_release_btn\" ${(open && agentOnline) ? '' : 'disabled'}>Release</button>
+            <button id=\"__bridge_close_btn\" ${(open && agentOnline) ? '' : 'disabled'}>Close</button>
+            <button id=\"__bridge_refresh_btn\" ${agentOnline ? '' : 'disabled'}>Refresh</button>
           `;
+          const statusEl = bar.querySelector('#__bridge_status_msg');
           const release = bar.querySelector('#__bridge_release_btn');
           const closeBtn = bar.querySelector('#__bridge_close_btn');
           const refresh = bar.querySelector('#__bridge_refresh_btn');
-          if (release) release.onclick = () => window.__bridgeSessionAction?.('release');
-          if (closeBtn) closeBtn.onclick = () => window.__bridgeSessionAction?.('close');
-          if (refresh) refresh.onclick = () => window.__bridgeSessionAction?.('refresh');
+          const wire = (btn, action) => {
+            if (!btn) return;
+            btn.onclick = async () => {
+              btn.disabled = true;
+              if (statusEl) statusEl.textContent = `${action}...`;
+              const result = await window.__bridgeControlRequest(action);
+              if (!result.ok) {
+                if (statusEl) statusEl.textContent = result.error || 'action failed';
+                window.__bridgeUpdateTopBarState({ ...s, agent_online: false });
+                return;
+              }
+              if (statusEl) statusEl.textContent = 'ok';
+              window.__bridgeUpdateTopBarState(result.payload || s);
+            };
+          };
+          wire(release, 'release');
+          wire(closeBtn, 'close');
+          wire(refresh, 'refresh');
         };
         window.__bridgeDestroyTopBar = () => {
           document.getElementById('__bridge_session_top_bar')?.remove();
@@ -1011,6 +1060,7 @@ def _session_state_payload(
 ) -> dict[str, Any]:
     if session is None:
         return {}
+    control_port = int(session.control_port or 0)
     return {
         "session_id": session.session_id,
         "url": session.url,
@@ -1018,6 +1068,9 @@ def _session_state_payload(
         "controlled": session.controlled if override_controlled is None else override_controlled,
         "state": session.state if override_state is None else override_state,
         "last_seen_at": session.last_seen_at,
+        "control_port": control_port,
+        "control_url": f"http://127.0.0.1:{control_port}" if control_port > 0 else "",
+        "agent_online": control_port > 0,
     }
 
 
@@ -1027,40 +1080,6 @@ def _update_top_bar_state(page: Any, payload: dict[str, Any]) -> None:
 
 def _destroy_top_bar(page: Any) -> None:
     page.evaluate("() => window.__bridgeDestroyTopBar?.()")
-
-
-def _apply_pending_session_action(
-    page: Any,
-    session: WebSession,
-    pending_action: dict[str, str | None],
-    observations: list[str],
-    ui_findings: list[str],
-) -> bool:
-    action = (pending_action.get("value") or "").strip().lower()
-    if not action:
-        return False
-    pending_action["value"] = None
-    if action == "refresh":
-        mark_controlled(session, session.controlled, url=page.url, title=page.title())
-        _update_top_bar_state(page, _session_state_payload(session))
-        observations.append("Session top bar refreshed")
-        return False
-    if action == "release":
-        mark_controlled(session, False, url=page.url, title=page.title())
-        _set_assistant_control_overlay(page, False)
-        _update_top_bar_state(page, _session_state_payload(session, override_controlled=False))
-        observations.append("Control released from top bar")
-        ui_findings.append("control released")
-        return True
-    if action == "close":
-        mark_controlled(session, False, url=page.url, title=page.title())
-        _update_top_bar_state(page, _session_state_payload(session, override_state="closed"))
-        _destroy_top_bar(page)
-        close_session(session)
-        observations.append("Session closed from top bar")
-        ui_findings.append("session closed")
-        return True
-    return False
 
 
 def _same_origin_path(current_url: str, target_url: str) -> bool:

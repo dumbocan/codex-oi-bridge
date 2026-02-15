@@ -114,10 +114,16 @@ Pasos web soportados (nativos):
 Mientras el asistente controla una sesión web visual, aparece borde azul con etiqueta `ASSISTANT CONTROL`.
 Al terminar run/release se retira y se registra `control released`.
 
+Session Top Bar (Fase 1.1):
+- La barra superior usa un agente local persistente por sesión (`web-open` lo inicia).
+- Botones `Refresh`, `Release`, `Close` siguen funcionando aunque `web-run` ya haya terminado.
+- La barra se muestra al acercar el cursor al borde superior (hot area) y tiene animación suave de entrada/salida.
+
 Notas operativas:
 - Interacción manual (click/move/resize) está soportada durante sesiones persistentes.
 - La sesión solo debe cerrarse con `bridge web-close --attach <session_id>`.
 - Si una sesión muere, `bridge status` lo reflejará como `closed`; recuperación: ejecutar `bridge web-open` de nuevo.
+- Si la barra muestra `agent offline`, recrear la sesión con `bridge web-open` o cerrar con `bridge web-close --attach <id>`.
 
 ## Window Management (v1.3)
 

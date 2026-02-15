@@ -13,6 +13,7 @@ from bridge.web_backend import (
     _ensure_visual_overlay_ready,
     _execute_playwright,
     _install_visual_overlay,
+    _session_state_payload,
     _parse_steps,
     run_web_task,
 )
@@ -486,11 +487,69 @@ class WebModeTests(unittest.TestCase):
         self.assertGreater(flag_idx, root_idx)
         self.assertIn("window.__bridgeEnsureOverlay = () => installOverlay()", script)
 
+    def test_top_bar_uses_persistent_agent_channel(self) -> None:
+        page = _FakePage()
+        _install_visual_overlay(
+            page,
+            cursor_enabled=True,
+            click_pulse_enabled=True,
+            scale=1.0,
+            color="#3BA7FF",
+            trace_enabled=True,
+            session_state={
+                "session_id": "s1",
+                "state": "open",
+                "controlled": True,
+                "control_url": "http://127.0.0.1:9555",
+            },
+        )
+        script = page.init_scripts[-1]
+        self.assertIn("window.__bridgeControlRequest = async", script)
+        self.assertIn("fetch(`${controlUrl}/action`", script)
+        self.assertNotIn("__bridgeSessionAction?.", script)
+
+    def test_top_bar_includes_slide_transition_and_offline_label(self) -> None:
+        page = _FakePage()
+        _install_visual_overlay(
+            page,
+            cursor_enabled=True,
+            click_pulse_enabled=True,
+            scale=1.0,
+            color="#3BA7FF",
+            trace_enabled=True,
+            session_state={"session_id": "s1"},
+        )
+        script = page.init_scripts[-1]
+        self.assertIn("translateY(-110%)", script)
+        self.assertIn("transform 210ms ease-out", script)
+        self.assertIn("agent offline", script)
+
     def test_overlay_ready_retries_until_visible(self) -> None:
         page = _FakePage()
         page.overlay_visible_after = 2
         _ensure_visual_overlay_ready(page, retries=5, delay_ms=1)
         self.assertGreaterEqual(page._overlay_visible_checks, 3)
+
+    def test_session_state_payload_includes_control_channel(self) -> None:
+        session = WebSession(
+            session_id="s1",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+        payload = _session_state_payload(session)
+        self.assertEqual(payload["control_port"], 9555)
+        self.assertEqual(payload["control_url"], "http://127.0.0.1:9555")
+        self.assertTrue(payload["agent_online"])
 
     def test_attach_session_skips_navigation_when_already_at_target(self) -> None:
         page = _FakePage()

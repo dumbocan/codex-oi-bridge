@@ -330,8 +330,11 @@ Comportamiento:
 - En control asistente, se muestra overlay global con borde azul + `ASSISTANT CONTROL`.
 - Al finalizar o hacer `web-release`, se retira overlay y se registra `control released`.
 - Si hay excepción durante run attach/keep-open, el bridge intenta liberar control automáticamente.
+- La top bar usa canal persistente (agente local HTTP por sesión), no binding efímero de Playwright.
+- La top bar aplica animación `translateY(-110%) -> translateY(0)` y muestra feedback de acción.
 
 Troubleshooting:
 - Move/resize/manual interaction en la ventana persistente está soportada.
 - La sesión no debería cerrarse salvo `web-close`; si aparece `closed`, recrear con `web-open`.
 - `bridge status` y `runs/web_sessions/<id>.json` se sincronizan por liveness real (PID+CDP) antes de reportar estado.
+- Si la barra indica `agent offline`, las acciones se deshabilitan; recuperar con `web-open` (nueva sesión) o `web-close` de la sesión muerta.
