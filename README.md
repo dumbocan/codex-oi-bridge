@@ -15,7 +15,9 @@ bajo control de Codex.
 - `bridge doctor --mode shell|gui|web`
 - `bridge web-run --visual "<task>"` (debug visual con overlay, no headless)
   - Flags: `--visual-cursor on|off`, `--visual-click-pulse on|off`,
-    `--visual-scale <float>`, `--visual-color "#3BA7FF"`
+    `--visual-scale <float>`, `--visual-color "#3BA7FF"`,
+    `--visual-human-mouse on|off`, `--visual-mouse-speed <float>`,
+    `--visual-click-hold-ms <int>`
 
 ## Runtime recomendado (obligatorio)
 
@@ -72,6 +74,7 @@ Evidencia obligatoria por click `N`:
 - Activación: `bridge run --mode web ...` o `bridge web-run ...`.
 - Por defecto: ejecución headless (rápida) para runs normales.
 - Visual debug opcional: `--visual` para abrir navegador visible con overlay de cursor/click por paso.
+- Mouse humano opcional: trayectoria visible + `mousedown` hold + `mouseup`.
 - Backend determinista desde bridge (no depende del output narrativo de OI).
 - Capacidades:
   - abrir URL explícita del task,

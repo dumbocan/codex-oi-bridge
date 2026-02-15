@@ -80,6 +80,9 @@ def run_web_task(
     visual_click_pulse: bool = True,
     visual_scale: float = 1.0,
     visual_color: str = "#3BA7FF",
+    visual_human_mouse: bool = True,
+    visual_mouse_speed: float = 1.0,
+    visual_click_hold_ms: int = 180,
 ) -> OIReport:
     url_match = _URL_RE.search(task)
     if not url_match:
@@ -107,6 +110,9 @@ def run_web_task(
         visual_click_pulse=visual_click_pulse,
         visual_scale=visual_scale,
         visual_color=visual_color,
+        visual_human_mouse=visual_human_mouse,
+        visual_mouse_speed=visual_mouse_speed,
+        visual_click_hold_ms=visual_click_hold_ms,
     )
 
 
@@ -192,6 +198,9 @@ def _execute_playwright(
     visual_click_pulse: bool = True,
     visual_scale: float = 1.0,
     visual_color: str = "#3BA7FF",
+    visual_human_mouse: bool = True,
+    visual_mouse_speed: float = 1.0,
+    visual_click_hold_ms: int = 180,
 ) -> OIReport:
     from playwright.sync_api import sync_playwright
 
@@ -208,7 +217,11 @@ def _execute_playwright(
     evidence_paths: list[str] = []
 
     with sync_playwright() as p:
-        browser = _launch_browser(p, visual=visual)
+        browser = _launch_browser(
+            p,
+            visual=visual,
+            visual_mouse_speed=visual_mouse_speed,
+        )
         page = browser.new_page()
         page.set_default_timeout(min(timeout_seconds * 1000, 120000))
         if visual:
@@ -243,6 +256,9 @@ def _execute_playwright(
         page.on("requestfailed", on_failed)
 
         page.goto(url, wait_until="domcontentloaded")
+        if visual:
+            _ensure_visual_overlay_installed(page)
+            _verify_visual_overlay_visible(page)
         observations.append(f"Opened URL: {url}")
         observations.append(f"Page title: {page.title()}")
 
@@ -267,6 +283,9 @@ def _execute_playwright(
                     ui_findings,
                     visual=visual,
                     click_pulse_enabled=visual_click_pulse,
+                    visual_human_mouse=visual_human_mouse,
+                    visual_mouse_speed=visual_mouse_speed,
+                    visual_click_hold_ms=visual_click_hold_ms,
                 )
                 page.wait_for_timeout(1000)
                 page.screenshot(path=str(after), full_page=True)
@@ -306,32 +325,59 @@ def _apply_interactive_step(
     *,
     visual: bool = False,
     click_pulse_enabled: bool = True,
+    visual_human_mouse: bool = True,
+    visual_mouse_speed: float = 1.0,
+    visual_click_hold_ms: int = 180,
 ) -> None:
     if step.kind == "click_selector":
         actions.append(f"cmd: playwright click selector:{step.target}")
+        locator = page.locator(step.target).first
         if visual:
-            _highlight_target(
+            target = _highlight_target(
                 page,
-                page.locator(step.target).first,
+                locator,
                 f"step {step_num}",
                 click_pulse_enabled=click_pulse_enabled,
             )
-        page.locator(step.target).first.click()
+            if visual_human_mouse and target:
+                _human_mouse_click(
+                    page,
+                    target[0],
+                    target[1],
+                    speed=visual_mouse_speed,
+                    hold_ms=visual_click_hold_ms,
+                )
+            else:
+                locator.click()
+        else:
+            locator.click()
         observations.append(f"Clicked selector in step {step_num}: {step.target}")
         ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={page.title()}")
         return
 
     if step.kind == "click_text":
         actions.append(f"cmd: playwright click text:{step.target}")
+        locator = page.get_by_text(step.target, exact=False).first
         try:
             if visual:
-                _highlight_target(
+                target = _highlight_target(
                     page,
-                    page.get_by_text(step.target, exact=False).first,
+                    locator,
                     f"step {step_num}",
                     click_pulse_enabled=click_pulse_enabled,
                 )
-            page.get_by_text(step.target, exact=False).first.click()
+                if visual_human_mouse and target:
+                    _human_mouse_click(
+                        page,
+                        target[0],
+                        target[1],
+                        speed=visual_mouse_speed,
+                        hold_ms=visual_click_hold_ms,
+                    )
+                else:
+                    locator.click()
+            else:
+                locator.click()
             observations.append(f"Clicked text in step {step_num}: {step.target}")
             ui_findings.append(
                 f"step {step_num} verify visible result: url={page.url}, title={page.title()}"
@@ -350,14 +396,17 @@ def _apply_interactive_step(
 
     if step.kind == "select_label":
         actions.append(f"cmd: playwright select selector:{step.target} label:{step.value}")
+        locator = page.locator(step.target).first
         if visual:
-            _highlight_target(
+            target = _highlight_target(
                 page,
-                page.locator(step.target).first,
+                locator,
                 f"step {step_num}",
                 click_pulse_enabled=click_pulse_enabled,
             )
-        page.locator(step.target).first.select_option(label=step.value)
+            if visual_human_mouse and target:
+                _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
+        locator.select_option(label=step.value)
         observations.append(
             f"Selected option by label in step {step_num}: selector={step.target}, label={step.value}"
         )
@@ -366,14 +415,17 @@ def _apply_interactive_step(
 
     if step.kind == "select_value":
         actions.append(f"cmd: playwright select selector:{step.target} value:{step.value}")
+        locator = page.locator(step.target).first
         if visual:
-            _highlight_target(
+            target = _highlight_target(
                 page,
-                page.locator(step.target).first,
+                locator,
                 f"step {step_num}",
                 click_pulse_enabled=click_pulse_enabled,
             )
-        page.locator(step.target).first.select_option(value=step.value)
+            if visual_human_mouse and target:
+                _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
+        locator.select_option(value=step.value)
         observations.append(
             f"Selected option by value in step {step_num}: selector={step.target}, value={step.value}"
         )
@@ -421,10 +473,16 @@ def _looks_authenticated(page: Any) -> bool:
     return False
 
 
-def _launch_browser(playwright_obj: Any, *, visual: bool = False) -> Any:
+def _launch_browser(
+    playwright_obj: Any,
+    *,
+    visual: bool = False,
+    visual_mouse_speed: float = 1.0,
+) -> Any:
     kwargs: dict[str, Any] = {"headless": not visual}
     if visual:
-        kwargs["slow_mo"] = 120
+        slow_mo = int(max(150, min(300, 220 / max(0.25, visual_mouse_speed))))
+        kwargs["slow_mo"] = slow_mo
         kwargs["args"] = [
             "--window-size=1280,860",
             "--window-position=80,60",
@@ -453,32 +511,42 @@ def _install_visual_overlay(
     }
     script_template = """
     (() => {
-      if (window.__bridgeOverlayInstalled) return;
       const cfg = __CFG_JSON__;
-      window.__bridgeOverlayInstalled = true;
-      const cursor = document.createElement('div');
-      cursor.id = '__bridge_cursor_overlay';
-      cursor.style.position = 'fixed';
-      cursor.style.width = `${14 * cfg.scale}px`;
-      cursor.style.height = `${14 * cfg.scale}px`;
-      cursor.style.border = `${2 * cfg.scale}px solid ${cfg.color}`;
-      cursor.style.borderRadius = '50%';
-      cursor.style.boxShadow = `0 0 0 ${3 * cfg.scale}px rgba(59,167,255,0.25)`;
-      cursor.style.pointerEvents = 'none';
-      cursor.style.zIndex = '2147483647';
-      cursor.style.background = 'rgba(59,167,255,0.15)';
-      cursor.style.display = cfg.cursorEnabled ? 'block' : 'none';
-      cursor.style.transition = 'width 120ms ease, height 120ms ease, left 80ms linear, top 80ms linear';
-      document.documentElement.appendChild(cursor);
-      const trailLayer = document.createElement('div');
-      trailLayer.id = '__bridge_trail_layer';
-      trailLayer.style.position = 'fixed';
-      trailLayer.style.inset = '0';
-      trailLayer.style.pointerEvents = 'none';
-      trailLayer.style.zIndex = '2147483646';
-      document.documentElement.appendChild(trailLayer);
+      const installOverlay = () => {
+        if (window.__bridgeOverlayInstalled) return true;
+        const root = document.documentElement;
+        if (!root) {
+          if (!window.__bridgeOverlayRetryAttached) {
+            window.__bridgeOverlayRetryAttached = true;
+            document.addEventListener('DOMContentLoaded', () => {
+              installOverlay();
+            }, { once: true });
+          }
+          return false;
+        }
+        const cursor = document.createElement('div');
+        cursor.id = '__bridge_cursor_overlay';
+        cursor.style.position = 'fixed';
+        cursor.style.width = `${14 * cfg.scale}px`;
+        cursor.style.height = `${14 * cfg.scale}px`;
+        cursor.style.border = `${2 * cfg.scale}px solid ${cfg.color}`;
+        cursor.style.borderRadius = '50%';
+        cursor.style.boxShadow = `0 0 0 ${3 * cfg.scale}px rgba(59,167,255,0.25)`;
+        cursor.style.pointerEvents = 'none';
+        cursor.style.zIndex = '2147483647';
+        cursor.style.background = 'rgba(59,167,255,0.15)';
+        cursor.style.display = cfg.cursorEnabled ? 'block' : 'none';
+        cursor.style.transition = 'width 120ms ease, height 120ms ease, left 80ms linear, top 80ms linear';
+        root.appendChild(cursor);
+        const trailLayer = document.createElement('div');
+        trailLayer.id = '__bridge_trail_layer';
+        trailLayer.style.position = 'fixed';
+        trailLayer.style.inset = '0';
+        trailLayer.style.pointerEvents = 'none';
+        trailLayer.style.zIndex = '2147483646';
+        root.appendChild(trailLayer);
 
-      const emitTrail = (x, y) => {
+        const emitTrail = (x, y) => {
         if (!cfg.traceEnabled) return;
         const dot = document.createElement('div');
         dot.style.position = 'fixed';
@@ -493,25 +561,31 @@ def _install_visual_overlay(
         trailLayer.appendChild(dot);
         requestAnimationFrame(() => { dot.style.opacity = '0'; });
         setTimeout(() => dot.remove(), 420);
-      };
+        };
 
-      const setCursor = (x, y) => {
+        const setCursor = (x, y) => {
         const normal = 14 * cfg.scale;
         cursor.style.width = `${normal}px`;
         cursor.style.height = `${normal}px`;
         cursor.style.left = `${Math.max(0, x - normal / 2)}px`;
         cursor.style.top = `${Math.max(0, y - normal / 2)}px`;
-      };
+        };
 
-      window.addEventListener('mousemove', (ev) => {
+        window.addEventListener('mousemove', (ev) => {
         if (!cfg.cursorEnabled) return;
         setCursor(ev.clientX, ev.clientY);
         emitTrail(ev.clientX, ev.clientY);
-      }, true);
+        }, true);
 
-      window.__bridgeShowClick = (x, y, label) => {
+        window.__bridgeMoveCursor = (x, y) => {
+        if (!cfg.cursorEnabled) return;
+        setCursor(x, y);
+        emitTrail(x, y);
+        };
+
+        window.__bridgeShowClick = (x, y, label) => {
         if (cfg.cursorEnabled) {
-          setCursor(x, y);
+          window.__bridgeMoveCursor(x, y);
         }
         if (cfg.clickPulseEnabled) {
           window.__bridgePulseAt(x, y);
@@ -535,9 +609,9 @@ def _install_visual_overlay(
           badge.style.left = `${Math.max(0, x + 14)}px`;
           badge.style.top = `${Math.max(0, y - 8)}px`;
         }
-      };
+        };
 
-      window.__bridgePulseAt = (x, y) => {
+        window.__bridgePulseAt = (x, y) => {
         if (!cfg.clickPulseEnabled) return;
         const normal = 14 * cfg.scale;
         const click = 22 * cfg.scale;
@@ -565,14 +639,20 @@ def _install_visual_overlay(
         ring.style.pointerEvents = 'none';
         ring.style.zIndex = '2147483647';
         ring.style.transform = 'scale(0.7)';
-        ring.style.transition = 'transform 300ms ease, opacity 300ms ease';
+        ring.style.transition = 'transform 650ms ease, opacity 650ms ease';
         document.documentElement.appendChild(ring);
         requestAnimationFrame(() => {
           ring.style.transform = 'scale(2.1)';
           ring.style.opacity = '0';
         });
-        setTimeout(() => ring.remove(), 340);
+        setTimeout(() => ring.remove(), 720);
+        };
+        window.__bridgeOverlayInstalled = true;
+        return true;
       };
+
+      window.__bridgeEnsureOverlay = () => installOverlay();
+      installOverlay();
     })();
     """
     script = script_template.replace("__CFG_JSON__", json.dumps(config, ensure_ascii=False))
@@ -585,19 +665,74 @@ def _highlight_target(
     label: str,
     *,
     click_pulse_enabled: bool,
-) -> None:
+) -> tuple[float, float] | None:
     try:
+        try:
+            locator.scroll_into_view_if_needed()
+        except Exception:
+            pass
         box = locator.bounding_box()
         if not box:
-            return
+            return None
         x = float(box.get("x", 0.0)) + float(box.get("width", 0.0)) / 2.0
         y = float(box.get("y", 0.0)) + float(box.get("height", 0.0)) / 2.0
         page.evaluate("([x, y, label]) => window.__bridgeShowClick?.(x, y, label)", [x, y, label])
         if click_pulse_enabled:
             page.evaluate("([x, y]) => window.__bridgePulseAt?.(x, y)", [x, y])
         page.wait_for_timeout(120)
+        return (x, y)
+    except Exception:
+        return None
+
+
+def _ensure_visual_overlay_installed(page: Any) -> None:
+    try:
+        page.evaluate("() => window.__bridgeEnsureOverlay?.()")
     except Exception:
         return
+
+
+def _verify_visual_overlay_visible(page: Any) -> None:
+    try:
+        ok = bool(
+            page.evaluate(
+                """
+                () => {
+                  const el = document.getElementById('__bridge_cursor_overlay');
+                  if (!el) return false;
+                  const style = window.getComputedStyle(el);
+                  return style.display !== 'none' && style.visibility !== 'hidden';
+                }
+                """
+            )
+        )
+    except Exception:
+        ok = False
+    if not ok:
+        raise SystemExit(
+            "Visual overlay not visible: missing #__bridge_cursor_overlay or display is none."
+        )
+
+
+def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
+    steps = int(max(20, min(40, round(24 / max(0.5, speed)))))
+    page.mouse.move(x, y, steps=steps)
+    try:
+        page.evaluate("([x, y]) => window.__bridgeMoveCursor?.(x, y)", [x, y])
+    except Exception:
+        pass
+
+
+def _human_mouse_click(page: Any, x: float, y: float, *, speed: float, hold_ms: int) -> None:
+    _human_mouse_move(page, x, y, speed=speed)
+    try:
+        page.evaluate("([x, y]) => window.__bridgePulseAt?.(x, y)", [x, y])
+    except Exception:
+        pass
+    page.mouse.down()
+    if hold_ms > 0:
+        page.wait_for_timeout(hold_ms)
+    page.mouse.up()
 
 
 def _to_repo_rel(path: Path) -> str:

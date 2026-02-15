@@ -79,6 +79,24 @@ def _add_visual_flags(parser: argparse.ArgumentParser) -> None:
         default="#3BA7FF",
         help="Visual overlay color hex (default: #3BA7FF).",
     )
+    parser.add_argument(
+        "--visual-human-mouse",
+        choices=("on", "off"),
+        default="on",
+        help="Use human-like mouse movement/click in visual mode (default: on).",
+    )
+    parser.add_argument(
+        "--visual-mouse-speed",
+        type=float,
+        default=1.0,
+        help="Human mouse speed factor in visual mode (default: 1.0).",
+    )
+    parser.add_argument(
+        "--visual-click-hold-ms",
+        type=int,
+        default=180,
+        help="Mouse hold duration before mouseup in visual mode (default: 180).",
+    )
 
 
 def _flag_on(value: str) -> bool:
@@ -100,6 +118,9 @@ def main() -> None:
             visual_click_pulse=_flag_on(args.visual_click_pulse),
             visual_scale=args.visual_scale,
             visual_color=args.visual_color,
+            visual_human_mouse=_flag_on(args.visual_human_mouse),
+            visual_mouse_speed=args.visual_mouse_speed,
+            visual_click_hold_ms=args.visual_click_hold_ms,
         )
         return
     if args.command == "gui-run":
@@ -121,6 +142,9 @@ def main() -> None:
             visual_click_pulse=_flag_on(args.visual_click_pulse),
             visual_scale=args.visual_scale,
             visual_color=args.visual_color,
+            visual_human_mouse=_flag_on(args.visual_human_mouse),
+            visual_mouse_speed=args.visual_mouse_speed,
+            visual_click_hold_ms=args.visual_click_hold_ms,
         )
         return
     if args.command == "status":
@@ -230,6 +254,9 @@ def run_command(
     visual_click_pulse: bool = True,
     visual_scale: float = 1.0,
     visual_color: str = "#3BA7FF",
+    visual_human_mouse: bool = True,
+    visual_mouse_speed: float = 1.0,
+    visual_click_hold_ms: int = 180,
 ) -> None:
     ctx = None
     if task_violates_code_edit_rule(task):
@@ -238,6 +265,10 @@ def run_command(
         raise SystemExit("--visual is only supported with --mode web / web-run.")
     if visual_scale <= 0:
         raise SystemExit("--visual-scale must be > 0.")
+    if visual_mouse_speed <= 0:
+        raise SystemExit("--visual-mouse-speed must be > 0.")
+    if visual_click_hold_ms < 0:
+        raise SystemExit("--visual-click-hold-ms must be >= 0.")
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", visual_color):
         raise SystemExit("--visual-color must be a hex color like #3BA7FF.")
     try:
@@ -303,6 +334,9 @@ def run_command(
                 visual_click_pulse=visual_click_pulse,
                 visual_scale=visual_scale,
                 visual_color=visual_color,
+                visual_human_mouse=visual_human_mouse,
+                visual_mouse_speed=visual_mouse_speed,
+                visual_click_hold_ms=visual_click_hold_ms,
             )
             stdout_text = json.dumps(report.to_dict(), ensure_ascii=False)
             ctx.stdout_log.write_text(stdout_text + "\n", encoding="utf-8")
@@ -320,6 +354,9 @@ def run_command(
                     "visual_click_pulse": visual_click_pulse,
                     "visual_scale": visual_scale,
                     "visual_color": visual_color,
+                    "visual_human_mouse": visual_human_mouse,
+                    "visual_mouse_speed": visual_mouse_speed,
+                    "visual_click_hold_ms": visual_click_hold_ms,
                 },
             )
         elif use_window_backend:

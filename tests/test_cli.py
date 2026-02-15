@@ -237,6 +237,9 @@ class CLITests(unittest.TestCase):
                 visual_click_pulse=True,
                 visual_scale=1.0,
                 visual_color="#3BA7FF",
+                visual_human_mouse=True,
+                visual_mouse_speed=1.0,
+                visual_click_hold_ms=180,
             ):
                 progress_cb(1, 1, "web step 1/1: click_text")
                 return OIReport(
@@ -323,6 +326,24 @@ class CLITests(unittest.TestCase):
     def test_visual_flag_only_supported_in_web_mode(self) -> None:
         with self.assertRaises(SystemExit):
             run_command("window:list", confirm_sensitive=True, mode="gui", visual=True)
+
+    def test_visual_mouse_speed_must_be_positive(self) -> None:
+        with self.assertRaises(SystemExit):
+            run_command(
+                "abre http://localhost:5173",
+                confirm_sensitive=True,
+                mode="web",
+                visual_mouse_speed=0,
+            )
+
+    def test_visual_click_hold_must_be_non_negative(self) -> None:
+        with self.assertRaises(SystemExit):
+            run_command(
+                "abre http://localhost:5173",
+                confirm_sensitive=True,
+                mode="web",
+                visual_click_hold_ms=-1,
+            )
 
     def test_web_wait_steps_do_not_increment_interactive_evidence_count(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:

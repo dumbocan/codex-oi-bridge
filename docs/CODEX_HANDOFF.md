@@ -303,9 +303,14 @@ Uso:
   - `--visual-click-pulse on|off`
   - `--visual-scale <float>`
   - `--visual-color "#3BA7FF"`
+  - `--visual-human-mouse on|off`
+  - `--visual-mouse-speed <float>`
+  - `--visual-click-hold-ms <int>`
 
 Comportamiento:
 - en modo visual, Playwright corre headed (no headless),
 - instala overlay en la página y marca cada interacción (click/select) por paso,
+- cursor azul persistente + pulse por click + estela corta de movimiento,
+- click humano opcional (`mousemove` por pasos + `mousedown` hold + `mouseup`),
 - `actions[]` incluye `cmd: playwright visual on`,
 - se mantiene evidencia before/after y validaciones de `--verified`.

@@ -8,7 +8,13 @@ from unittest.mock import patch
 from bridge.cli import _validate_evidence_paths, _validate_report_actions
 from bridge.constants import WEB_ALLOWED_COMMAND_PREFIXES
 from bridge.models import OIReport
-from bridge.web_backend import WebStep, _execute_playwright, _parse_steps, run_web_task
+from bridge.web_backend import (
+    WebStep,
+    _execute_playwright,
+    _install_visual_overlay,
+    _parse_steps,
+    run_web_task,
+)
 
 
 class _FakeConsoleMessage:
@@ -63,6 +69,28 @@ class _FakeNode:
         return {"x": 120.0, "y": 80.0, "width": 20.0, "height": 20.0}
 
 
+class _FakeMouse:
+    def __init__(self, page):
+        self._page = page
+        self.moves: list[tuple[float, float, int]] = []
+        self.down_count = 0
+        self.up_count = 0
+
+    def move(self, x: float, y: float, steps: int = 1) -> None:
+        self.moves.append((x, y, steps))
+
+    def down(self) -> None:
+        self.down_count += 1
+
+    def up(self) -> None:
+        self.up_count += 1
+        self._page._title = "Demo after click"
+        self._page.url = self._page.url + "#clicked"
+        self._page._emit("console", _FakeConsoleMessage("console-error"))
+        self._page._emit("response", _FakeResponse("GET", "http://localhost:5173/api", 500))
+        self._page._emit("requestfailed", _FakeRequest("GET", "http://localhost:5173/asset"))
+
+
 class _FakePage:
     def __init__(self, *, authenticated: bool = False, fail_click_text: str = ""):
         self._handlers = {}
@@ -72,10 +100,12 @@ class _FakePage:
         self.fail_click_text = fail_click_text
         self.waited_selector = ""
         self.waited_text = ""
+        self.mouse = _FakeMouse(self)
         self.overlay_installed = False
         self.overlay_events: list[tuple[float, float, str]] = []
         self.pulse_events: list[tuple[float, float]] = []
         self.brought_to_front = False
+        self.init_scripts: list[str] = []
         self.auth_hints = {
             "cerrar sesion",
             "cerrar sesión",
@@ -119,8 +149,13 @@ class _FakePage:
 
     def add_init_script(self, script: str) -> None:
         self.overlay_installed = "__bridgeShowClick" in script and "__bridgePulseAt" in script
+        self.init_scripts.append(script)
 
-    def evaluate(self, _script: str, payload) -> None:
+    def evaluate(self, _script: str, payload=None):
+        if "window.__bridgeEnsureOverlay" in _script:
+            return True
+        if "getElementById('__bridge_cursor_overlay')" in _script:
+            return True
         if "__bridgeShowClick" in _script:
             x, y, label = payload
             self.overlay_events.append((x, y, label))
@@ -128,6 +163,10 @@ class _FakePage:
         if "__bridgePulseAt" in _script:
             x, y = payload
             self.pulse_events.append((x, y))
+            return
+        if "__bridgeMoveCursor" in _script:
+            x, y = payload
+            self.overlay_events.append((x, y, "move"))
             return
 
     def bring_to_front(self) -> None:
@@ -378,6 +417,8 @@ class WebModeTests(unittest.TestCase):
         self.assertTrue(page.brought_to_front)
         self.assertTrue(page.overlay_events)
         self.assertTrue(page.pulse_events)
+        self.assertGreater(page.mouse.down_count, 0)
+        self.assertGreater(page.mouse.up_count, 0)
 
     def test_headless_mode_does_not_enable_overlay_action(self) -> None:
         page = _FakePage()
@@ -414,6 +455,25 @@ class WebModeTests(unittest.TestCase):
 
         self.assertNotIn("cmd: playwright visual on", report.actions)
         self.assertFalse(page.overlay_installed)
+
+    def test_overlay_installed_flag_without_dom_does_not_block_real_install(self) -> None:
+        page = _FakePage()
+        _install_visual_overlay(
+            page,
+            cursor_enabled=True,
+            click_pulse_enabled=True,
+            scale=1.0,
+            color="#3BA7FF",
+            trace_enabled=True,
+        )
+        self.assertTrue(page.init_scripts)
+        script = page.init_scripts[-1]
+        root_idx = script.find("const root = document.documentElement")
+        flag_idx = script.find("window.__bridgeOverlayInstalled = true")
+        self.assertNotEqual(root_idx, -1)
+        self.assertNotEqual(flag_idx, -1)
+        self.assertGreater(flag_idx, root_idx)
+        self.assertIn("window.__bridgeEnsureOverlay = () => installOverlay()", script)
 
 
 if __name__ == "__main__":
