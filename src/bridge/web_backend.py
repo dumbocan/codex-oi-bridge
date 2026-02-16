@@ -5,6 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import socket
+import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -93,6 +97,8 @@ def run_web_task(
     url = _normalize_url(url_match.group(0))
     if not _is_valid_url(url):
         raise SystemExit(f"Web mode received invalid URL token: {url_match.group(0)}")
+    _preflight_target_reachable(url)
+    _preflight_stack_prereqs()
     steps = _parse_steps(task)
 
     if not _playwright_available():
@@ -119,6 +125,62 @@ def run_web_task(
         session=session,
         keep_open=keep_open,
     )
+
+
+def _preflight_target_reachable(url: str, timeout_seconds: float = 1.2) -> None:
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    if not host or port <= 0:
+        raise SystemExit(f"Web target not reachable: {url}")
+
+    # Many dev servers bind IPv4 only; prefer 127.0.0.1 first for localhost.
+    candidates: list[str] = [host]
+    if host in {"localhost", "0.0.0.0"}:
+        candidates = ["127.0.0.1", "localhost", "::1"]
+
+    last_exc: Exception | None = None
+    for cand in candidates:
+        try:
+            with socket.create_connection((cand, int(port)), timeout=timeout_seconds):
+                return
+        except Exception as exc:  # pragma: no cover (covered via raised SystemExit)
+            last_exc = exc
+            continue
+    raise SystemExit(f"Web target not reachable: {url}") from last_exc
+
+
+def _http_quick_check(url: str, timeout_seconds: float = 1.2) -> None:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        if int(resp.status) < 200 or int(resp.status) >= 400:
+            raise SystemExit(f"Start your stack first: {url} returned {resp.status}")
+
+
+def _preflight_stack_prereqs() -> None:
+    # Optional project-specific stack preflight. Enabled via env to avoid hardcoding.
+    # Example:
+    #   export BRIDGE_WEB_PREFLIGHT_STACK=1
+    #   export BRIDGE_WEB_PREFLIGHT_BACKEND_HEALTH_URL=http://127.0.0.1:8010/health
+    #   export BRIDGE_WEB_PREFLIGHT_FRONTEND_URL=http://127.0.0.1:5181/
+    stack_enabled = os.getenv("BRIDGE_WEB_PREFLIGHT_STACK", "0").strip() == "1"
+    backend = os.getenv("BRIDGE_WEB_PREFLIGHT_BACKEND_HEALTH_URL", "").strip()
+    frontend = os.getenv("BRIDGE_WEB_PREFLIGHT_FRONTEND_URL", "").strip()
+    if stack_enabled and not backend:
+        backend = "http://127.0.0.1:8010/health"
+    if stack_enabled and not frontend:
+        frontend = "http://127.0.0.1:5181/"
+    if not backend and not frontend:
+        return
+    try:
+        if backend:
+            _http_quick_check(backend)
+        if frontend:
+            _http_quick_check(frontend)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise SystemExit("Start your stack first") from exc
 
 
 def release_session_control_overlay(session: WebSession) -> None:
@@ -266,14 +328,14 @@ def _playwright_available() -> bool:
     return importlib.util.find_spec("playwright") is not None
 
 
-
-
 def _safe_page_title(page: object) -> str:
     try:
         # Playwright can throw if execution context is destroyed during navigation/HMR.
-        return str(getattr(page, 'title')())
+        return str(getattr(page, "title")())
     except Exception:
         return ""
+
+
 def _execute_playwright(
     url: str,
     steps: list[WebStep],
@@ -463,13 +525,15 @@ def _apply_interactive_step(
     if step.kind == "click_selector":
         actions.append(f"cmd: playwright click selector:{step.target}")
         locator = page.locator(step.target).first
+        target = _highlight_target(
+            page,
+            locator,
+            f"step {step_num}",
+            click_pulse_enabled=click_pulse_enabled and visual,
+        )
+        if target is None:
+            raise SystemExit(f"Target occluded or not visible: selector {step.target}")
         if visual:
-            target = _highlight_target(
-                page,
-                locator,
-                f"step {step_num}",
-                click_pulse_enabled=click_pulse_enabled,
-            )
             if visual_human_mouse and target:
                 _human_mouse_click(
                     page,
@@ -490,13 +554,15 @@ def _apply_interactive_step(
         actions.append(f"cmd: playwright click text:{step.target}")
         locator = page.get_by_text(step.target, exact=False).first
         try:
+            target = _highlight_target(
+                page,
+                locator,
+                f"step {step_num}",
+                click_pulse_enabled=click_pulse_enabled and visual,
+            )
+            if target is None:
+                raise SystemExit(f"Target occluded or not visible: text {step.target}")
             if visual:
-                target = _highlight_target(
-                    page,
-                    locator,
-                    f"step {step_num}",
-                    click_pulse_enabled=click_pulse_enabled,
-                )
                 if visual_human_mouse and target:
                     _human_mouse_click(
                         page,
@@ -528,13 +594,15 @@ def _apply_interactive_step(
     if step.kind == "select_label":
         actions.append(f"cmd: playwright select selector:{step.target} label:{step.value}")
         locator = page.locator(step.target).first
+        target = _highlight_target(
+            page,
+            locator,
+            f"step {step_num}",
+            click_pulse_enabled=click_pulse_enabled and visual,
+        )
+        if target is None:
+            raise SystemExit(f"Target occluded or not visible: selector {step.target}")
         if visual:
-            target = _highlight_target(
-                page,
-                locator,
-                f"step {step_num}",
-                click_pulse_enabled=click_pulse_enabled,
-            )
             if visual_human_mouse and target:
                 _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
         locator.select_option(label=step.value)
@@ -547,13 +615,15 @@ def _apply_interactive_step(
     if step.kind == "select_value":
         actions.append(f"cmd: playwright select selector:{step.target} value:{step.value}")
         locator = page.locator(step.target).first
+        target = _highlight_target(
+            page,
+            locator,
+            f"step {step_num}",
+            click_pulse_enabled=click_pulse_enabled and visual,
+        )
+        if target is None:
+            raise SystemExit(f"Target occluded or not visible: selector {step.target}")
         if visual:
-            target = _highlight_target(
-                page,
-                locator,
-                f"step {step_num}",
-                click_pulse_enabled=click_pulse_enabled,
-            )
             if visual_human_mouse and target:
                 _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
         locator.select_option(value=step.value)
@@ -1225,23 +1295,62 @@ def _highlight_target(
     *,
     click_pulse_enabled: bool,
 ) -> tuple[float, float] | None:
-    try:
+    last_exc: Exception | None = None
+    for _ in range(4):
         try:
-            locator.scroll_into_view_if_needed()
-        except Exception:
-            pass
-        box = locator.bounding_box()
-        if not box:
-            return None
-        x = float(box.get("x", 0.0)) + float(box.get("width", 0.0)) / 2.0
-        y = float(box.get("y", 0.0)) + float(box.get("height", 0.0)) / 2.0
-        page.evaluate("([x, y, label]) => window.__bridgeShowClick?.(x, y, label)", [x, y, label])
-        if click_pulse_enabled:
-            page.evaluate("([x, y]) => window.__bridgePulseAt?.(x, y)", [x, y])
-        page.wait_for_timeout(120)
-        return (x, y)
-    except Exception:
+            try:
+                locator.scroll_into_view_if_needed()
+            except Exception:
+                pass
+            try:
+                locator.evaluate("el => el.scrollIntoView({block:'center', inline:'center'})")
+            except Exception:
+                pass
+
+            info = locator.evaluate(
+                """
+                (el) => {
+                  const r = el.getBoundingClientRect();
+                  const x = r.left + (r.width / 2);
+                  const y = r.top + (r.height / 2);
+                  const inViewport = (
+                    x >= 0 && y >= 0 &&
+                    x <= window.innerWidth && y <= window.innerHeight &&
+                    r.width > 0 && r.height > 0
+                  );
+                  const top = inViewport ? document.elementFromPoint(x, y) : null;
+                  const ok = !!top && (top === el || (el.contains && el.contains(top)));
+                  return { x, y, ok };
+                }
+                """
+            )
+            if isinstance(info, dict) and bool(info.get("ok", False)):
+                x = float(info.get("x", 0.0))
+                y = float(info.get("y", 0.0))
+                page.evaluate(
+                    "([x, y, label]) => window.__bridgeShowClick?.(x, y, label)",
+                    [x, y, label],
+                )
+                if click_pulse_enabled:
+                    page.evaluate("([x, y]) => window.__bridgePulseAt?.(x, y)", [x, y])
+                page.wait_for_timeout(120)
+                return (x, y)
+
+            # Likely occluded by fixed UI (e.g., dock). Scroll up a bit and retry.
+            try:
+                page.evaluate("() => window.scrollBy(0, -220)")
+            except Exception:
+                pass
+            try:
+                page.wait_for_timeout(80)
+            except Exception:
+                pass
+        except Exception as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
         return None
+    return None
 
 
 def _ensure_visual_overlay_installed(page: Any) -> None:

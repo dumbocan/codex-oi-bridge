@@ -72,6 +72,16 @@ class _FakeNode:
     def bounding_box(self) -> dict[str, float]:
         return {"x": 120.0, "y": 80.0, "width": 20.0, "height": 20.0}
 
+    def scroll_into_view_if_needed(self) -> None:
+        return
+
+    def evaluate(self, script: str):
+        if "scrollIntoView" in script:
+            return None
+        if "elementFromPoint" in script:
+            return {"x": 130.0, "y": 90.0, "ok": True}
+        return None
+
 
 class _FakeMouse:
     def __init__(self, page):
@@ -338,7 +348,9 @@ class WebModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=".") as tmp:
             run_dir = Path(tmp) / "runs" / "r1"
             run_dir.mkdir(parents=True)
-            with patch("bridge.web_backend._playwright_available", return_value=False):
+            with patch("bridge.web_backend._preflight_target_reachable"), patch(
+                "bridge.web_backend._playwright_available", return_value=False
+            ):
                 with self.assertRaises(SystemExit) as ctx:
                     run_web_task(
                         "abre http://localhost:5173, y verifica",

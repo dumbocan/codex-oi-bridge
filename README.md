@@ -103,6 +103,9 @@ Pasos web soportados (nativos):
 - `wait selector:"..."`.
 - `wait text:"..."`.
 
+Nota sobre `wait text`:
+- Si hay colisiones con texto oculto (por ejemplo `<option>` en un `<select>`), preferir `wait selector:"..."` con un selector único.
+
 ## Persistent Web Session + Control Handoff
 
 - `bridge web-open --url "http://127.0.0.1:5180"`: abre/reusa sesión persistente y devuelve `session_id`.
