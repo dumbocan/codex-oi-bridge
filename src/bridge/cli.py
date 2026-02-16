@@ -22,6 +22,7 @@ from bridge.constants import (
     SHELL_ALLOWED_COMMAND_PREFIXES,
     WEB_ALLOWED_COMMAND_PREFIXES,
 )
+from bridge.live import live_command
 from bridge.guardrails import (
     evaluate_command,
     require_sensitive_confirmation,
@@ -226,6 +227,14 @@ def main() -> None:
             notify=args.notify,
         )
         return
+    if args.command == "live":
+        live_command(
+            attach=args.attach,
+            interval_ms=args.interval_ms,
+            tail=args.tail,
+            json_mode=args.json,
+        )
+        return
 
     parser.print_help()
 
@@ -372,6 +381,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default="info",
     )
     watch_parser.add_argument("--notify", action="store_true")
+
+    live_parser = subparsers.add_parser(
+        "live",
+        help="Unified live view: status + observer events + logs",
+    )
+    live_parser.add_argument(
+        "--attach",
+        type=str,
+        required=True,
+        help="Session id to follow, or 'last' for last session.",
+    )
+    live_parser.add_argument("--interval-ms", type=int, default=800)
+    live_parser.add_argument("--tail", type=int, default=40)
+    live_parser.add_argument("--json", action="store_true")
     return parser
 
 

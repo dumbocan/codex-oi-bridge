@@ -1,0 +1,3 @@
+profile: audio3
+version: 2026-02-16
+source_docs: AUDIO3_UI_MAP.md,AUDIO3_STATE_MACHINE.md,AUDIO3_TEST_PLAYBOOK.md

@@ -402,6 +402,13 @@ class CLITests(unittest.TestCase):
             )
             self.assertEqual(len(safe), 2)
 
+    def test_main_dispatches_live_command(self) -> None:
+        with patch("sys.argv", ["bridge", "live", "--attach", "last"]), patch(
+            "bridge.cli.live_command"
+        ) as live_mock:
+            main()
+        live_mock.assert_called_once()
+
     def test_web_open_release_close_lifecycle(self) -> None:
         session = WebSession(
             session_id="s1",

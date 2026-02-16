@@ -167,6 +167,26 @@ Estas operaciones generan evidencia por paso:
 - screenshot before/after
 - `step_<N>_window.txt`
 
+## Live Terminal (nuevo)
+
+Para ver en **un solo terminal** lo que decide/hace OI:
+
+```bash
+cd /home/micasa/codex-oi-bridge
+./bridge-safe live --attach last --interval-ms 600 --tail 40
+```
+
+Opcional JSON streaming:
+
+```bash
+./bridge-safe live --attach last --json
+```
+
+`live` combina:
+- estado/progreso del run,
+- eventos del observer (click/error/warn),
+- nuevas líneas de `bridge.log`, `oi_stdout.log`, `oi_stderr.log`.
+
 ## Logs y artefactos
 
 Cada ejecución guarda artefactos en `runs/<run_id>/`:
@@ -288,3 +308,52 @@ Ver handoff completo en `docs/CODEX_HANDOFF.md`.
 - Los pasos interactivos fallan rápido por timeout, no se quedan colgados indefinidamente.
 - La sesión attach se mantiene reutilizable y liberable (`web-release`) sin cerrar ventana.
 - La validación de evidencia ya no penaliza clicks no ejecutados por timeout.
+
+## Modelo mental: OI + Bridge + App
+
+### Qué es Open Interpreter (OI)
+
+- OI es un agente local con capacidad de ejecutar acciones en el equipo.
+- Puede, según configuración/permisos/herramientas disponibles:
+  - ejecutar comandos de terminal,
+  - leer/escribir archivos,
+  - lanzar procesos,
+  - automatizar navegador o GUI.
+- OI no es “inteligente por sí mismo”: la planificación la aporta el modelo LLM configurado.
+
+### Rol de la API key de OpenAI
+
+- `OPENAI_API_KEY` conecta OI con el modelo de OpenAI (capa de razonamiento).
+- Sin modelo/API válida, OI pierde capacidad de decisión y ejecución guiada.
+
+### Quién manda en esta arquitectura
+
+- `audio3`: producto (backend/frontend), no controla OI.
+- `codex-oi-bridge`: orquestador y capa de seguridad/validación.
+- OI: ejecutor de acciones locales.
+- Modelo OpenAI: razonamiento para decidir pasos.
+
+### Seguridad y control real (por qué no es OI “libre”)
+
+- En este proyecto OI está acotado por guardrails del bridge:
+  - allowlist de comandos,
+  - bloqueo de comandos destructivos,
+  - validación de evidencias,
+  - validación de `actions[]` en formato `cmd:`,
+  - control/release explícito de sesión web.
+
+### ¿OI “ve” la pantalla y debería navegar solo?
+
+- Sí, puede navegar por la ventana cuando el backend/mode expone señales suficientes (DOM/selectores, eventos, estado de sesión, evidencias).
+- No siempre basta “ver la pantalla”: para robustez necesita también anclas deterministas (selectores, texto estable, estado).
+- Por eso el diseño actual combina:
+  - observación visual,
+  - pasos guiados por prompt,
+  - validación de resultado,
+  - timeouts y fallos rápidos en vez de cuelgues.
+
+### Regla operativa recomendada
+
+- La inteligencia decide, pero el bridge verifica.
+- Si una acción no es verificable, se degrada o falla explícitamente.
+- Mejor un `failed` rápido y trazable que un run colgado sin diagnóstico.
