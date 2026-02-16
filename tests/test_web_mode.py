@@ -445,6 +445,46 @@ class WebModeTests(unittest.TestCase):
         self.assertGreater(page.mouse.down_count, 0)
         self.assertGreater(page.mouse.up_count, 0)
 
+    def test_visual_mode_does_not_abort_when_overlay_is_not_visible(self) -> None:
+        page = _FakePage()
+        page.overlay_visible_after = 999
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_selector", "#go")],
+                    run_dir,
+                    30,
+                    verified=True,
+                    visual=True,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertIn("cmd: playwright visual on", report.actions)
+        self.assertTrue(
+            any("visual overlay degraded" in item.lower() for item in report.ui_findings)
+        )
+        self.assertIn(report.result, ("success", "partial"))
+
     def test_headless_mode_does_not_enable_overlay_action(self) -> None:
         page = _FakePage()
         fake_sync_module = types.ModuleType("playwright.sync_api")

@@ -388,16 +388,28 @@ def _execute_playwright(
             page = browser.new_page()
         page.set_default_timeout(min(timeout_seconds * 1000, 120000))
         if visual:
-            _install_visual_overlay(
-                page,
-                cursor_enabled=visual_cursor,
-                click_pulse_enabled=visual_click_pulse,
-                scale=visual_scale,
-                color=visual_color,
-                trace_enabled=True,
-                session_state=_session_state_payload(session),
-            )
-            page.bring_to_front()
+            try:
+                _install_visual_overlay(
+                    page,
+                    cursor_enabled=visual_cursor,
+                    click_pulse_enabled=visual_click_pulse,
+                    scale=visual_scale,
+                    color=visual_color,
+                    trace_enabled=True,
+                    session_state=_session_state_payload(session),
+                )
+                page.bring_to_front()
+            except Exception as exc:
+                ui_findings.append(f"visual overlay install failed; degraded mode: {exc}")
+
+            if attached:
+                _ensure_visual_overlay_ready_best_effort(
+                    page,
+                    ui_findings,
+                    cursor_expected=visual_cursor,
+                    retries=3,
+                    delay_ms=140,
+                )
 
         def on_console(msg: Any) -> None:
             if msg.type == "error":
@@ -433,6 +445,14 @@ def _execute_playwright(
                 actions.append(f"cmd: playwright goto {url}")
                 page.goto(url, wait_until="domcontentloaded")
                 observations.append(f"Opened URL: {url}")
+                if visual:
+                    _ensure_visual_overlay_ready_best_effort(
+                        page,
+                        ui_findings,
+                        cursor_expected=visual_cursor,
+                        retries=3,
+                        delay_ms=140,
+                    )
 
             if visual:
                 _ensure_visual_overlay_ready_best_effort(
@@ -513,6 +533,14 @@ def _execute_playwright(
                     page.wait_for_timeout(1000)
                     page.screenshot(path=str(after), full_page=True)
                     evidence_paths.append(_to_repo_rel(after))
+                    if visual:
+                        _ensure_visual_overlay_ready_best_effort(
+                            page,
+                            ui_findings,
+                            cursor_expected=visual_cursor,
+                            retries=3,
+                            delay_ms=120,
+                        )
                     continue
 
                 try:
@@ -540,6 +568,14 @@ def _execute_playwright(
                         result = "failed"
                         break
                     raise
+                if visual:
+                    _ensure_visual_overlay_ready_best_effort(
+                        page,
+                        ui_findings,
+                        cursor_expected=visual_cursor,
+                        retries=3,
+                        delay_ms=120,
+                    )
         finally:
             if visual and control_enabled:
                 _set_assistant_control_overlay(page, False)
@@ -646,6 +682,33 @@ def _apply_interactive_step(
             )
             return
         except Exception:
+            if str(step.target).strip().lower() == "reproducir":
+                fallback = page.locator('.track-card:has-text("Stan") button:has-text("Reproducir")').first
+                target = _highlight_target(
+                    page,
+                    fallback,
+                    f"step {step_num} fallback",
+                    click_pulse_enabled=click_pulse_enabled and visual,
+                )
+                if target is not None:
+                    if visual and visual_human_mouse and target:
+                        _human_mouse_click(
+                            page,
+                            target[0],
+                            target[1],
+                            speed=visual_mouse_speed,
+                            hold_ms=visual_click_hold_ms,
+                        )
+                    else:
+                        fallback.click()
+                    observations.append(
+                        f"Clicked fallback selector in step {step_num}: .track-card:has-text('Stan') "
+                        "button:has-text('Reproducir')"
+                    )
+                    ui_findings.append(
+                        f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
+                    )
+                    return
             if _is_login_target(step.target) and _looks_authenticated(page):
                 observations.append(
                     f"Step {step_num}: target '{step.target}' not found; authenticated state detected."
@@ -1481,7 +1544,7 @@ def _verify_visual_overlay_visible(page: Any) -> None:
     except Exception:
         ok = False
     if not ok:
-        raise SystemExit(
+        raise RuntimeError(
             "Visual overlay not visible: missing #__bridge_cursor_overlay or display is none."
         )
 
@@ -1500,8 +1563,8 @@ def _ensure_visual_overlay_ready(page: Any, retries: int = 12, delay_ms: int = 1
             except Exception:
                 pass
     if isinstance(last_error, BaseException):
-        raise last_error
-    raise SystemExit("Visual overlay not visible after retries.")
+        raise RuntimeError(str(last_error))
+    raise RuntimeError("Visual overlay not visible after retries.")
 
 
 def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
@@ -1565,7 +1628,7 @@ def _ensure_visual_overlay_ready_best_effort(
     delay_ms: int,
 ) -> bool:
     # Force re-injection / re-enable in attach flows and after navigations.
-    last_error: Exception | None = None
+    last_error: BaseException | None = None
     for attempt in range(1, max(1, retries) + 1):
         try:
             _ensure_visual_overlay_installed(page)
@@ -1573,11 +1636,11 @@ def _ensure_visual_overlay_ready_best_effort(
                 try:
                     _verify_visual_overlay_visible(page)
                     return True
-                except Exception as exc:
+                except BaseException as exc:
                     last_error = exc
             else:
                 return True
-        except Exception as exc:
+        except BaseException as exc:
             last_error = exc
         try:
             page.wait_for_timeout(delay_ms)
