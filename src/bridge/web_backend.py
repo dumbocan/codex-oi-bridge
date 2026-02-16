@@ -437,6 +437,8 @@ def _execute_playwright(
         control_enabled = False
         wait_timeout_ms = int(float(os.getenv("BRIDGE_WEB_WAIT_TIMEOUT_SECONDS", "12")) * 1000)
         wait_timeout_ms = max(1000, min(60000, wait_timeout_ms))
+        interactive_timeout_ms = int(float(os.getenv("BRIDGE_WEB_INTERACTIVE_TIMEOUT_SECONDS", "8")) * 1000)
+        interactive_timeout_ms = max(1000, min(60000, interactive_timeout_ms))
         try:
             initial_url = page.url
             initial_title = _safe_page_title(page)
@@ -499,9 +501,14 @@ def _execute_playwright(
 
             # Conditional login: if demo button exists+visible+enabled, click; otherwise continue as already authed.
             if _demo_login_button_available(page):
-                observations.append("Login state detected: Entrar demo present and enabled")
-                # Insert a native optional step at the front (keeps evidence before/after machinery).
-                steps = [WebStep("maybe_click_text", "Entrar demo")] + steps
+                if _task_already_requests_demo_click(steps):
+                    observations.append(
+                        "Login step already requested by task; skipping auto demo click insertion"
+                    )
+                else:
+                    observations.append("Login state detected: Entrar demo present and enabled")
+                    # Insert a native optional step at the front (keeps evidence before/after machinery).
+                    steps = [WebStep("maybe_click_text", "Entrar demo")] + steps
             else:
                 observations.append("demo not present; already authed")
                 ui_findings.append("demo not present; already authed")
@@ -534,19 +541,39 @@ def _execute_playwright(
                     after = evidence_dir / f"step_{interactive_step}_after.png"
                     page.screenshot(path=str(before), full_page=True)
                     evidence_paths.append(_to_repo_rel(before))
-                    _apply_interactive_step(
-                        page,
-                        step,
-                        interactive_step,
-                        actions,
-                        observations,
-                        ui_findings,
-                        visual=visual,
-                        click_pulse_enabled=visual_click_pulse,
-                        visual_human_mouse=visual_human_mouse,
-                        visual_mouse_speed=visual_mouse_speed,
-                        visual_click_hold_ms=visual_click_hold_ms,
-                    )
+                    try:
+                        _apply_interactive_step(
+                            page,
+                            step,
+                            interactive_step,
+                            actions,
+                            observations,
+                            ui_findings,
+                            visual=visual,
+                            click_pulse_enabled=visual_click_pulse,
+                            visual_human_mouse=visual_human_mouse,
+                            visual_mouse_speed=visual_mouse_speed,
+                            visual_click_hold_ms=visual_click_hold_ms,
+                            timeout_ms=interactive_timeout_ms,
+                        )
+                    except Exception as exc:
+                        if _is_timeout_error(exc):
+                            timeout_path = evidence_dir / f"step_{interactive_step}_timeout.png"
+                            try:
+                                page.screenshot(path=str(timeout_path), full_page=True)
+                                evidence_paths.append(_to_repo_rel(timeout_path))
+                            except Exception:
+                                pass
+                            console_errors.append(
+                                f"Timeout on interactive step {interactive_step}: {step.kind} {step.target}"
+                            )
+                            ui_findings.append(
+                                f"step {interactive_step} timeout on {step.kind}:{step.target} "
+                                f"(timeout_ms={interactive_timeout_ms})"
+                            )
+                            result = "failed"
+                            break
+                        raise
                     page.wait_for_timeout(1000)
                     page.screenshot(path=str(after), full_page=True)
                     evidence_paths.append(_to_repo_rel(after))
@@ -643,10 +670,11 @@ def _apply_interactive_step(
     visual_human_mouse: bool = True,
     visual_mouse_speed: float = 1.0,
     visual_click_hold_ms: int = 180,
+    timeout_ms: int = 8000,
 ) -> None:
     if step.kind == "click_selector":
-        actions.append(f"cmd: playwright click selector:{step.target}")
         locator = page.locator(step.target).first
+        locator.wait_for(state="visible", timeout=timeout_ms)
         target = _highlight_target(
             page,
             locator,
@@ -665,17 +693,18 @@ def _apply_interactive_step(
                     hold_ms=visual_click_hold_ms,
                 )
             else:
-                locator.click()
+                locator.click(timeout=timeout_ms)
         else:
-            locator.click()
+            locator.click(timeout=timeout_ms)
+        actions.append(f"cmd: playwright click selector:{step.target}")
         observations.append(f"Clicked selector in step {step_num}: {step.target}")
         ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
         return
 
     if step.kind == "click_text":
-        actions.append(f"cmd: playwright click text:{step.target}")
         locator = page.get_by_text(step.target, exact=False).first
         try:
+            locator.wait_for(state="visible", timeout=timeout_ms)
             target = _highlight_target(
                 page,
                 locator,
@@ -694,17 +723,21 @@ def _apply_interactive_step(
                         hold_ms=visual_click_hold_ms,
                     )
                 else:
-                    locator.click()
+                    locator.click(timeout=timeout_ms)
             else:
-                locator.click()
+                locator.click(timeout=timeout_ms)
+            actions.append(f"cmd: playwright click text:{step.target}")
             observations.append(f"Clicked text in step {step_num}: {step.target}")
             ui_findings.append(
                 f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
             )
             return
-        except Exception:
+        except Exception as exc:
+            if _is_timeout_error(exc):
+                raise
             if str(step.target).strip().lower() == "reproducir":
                 fallback = page.locator('.track-card:has-text("Stan") button:has-text("Reproducir")').first
+                fallback.wait_for(state="visible", timeout=timeout_ms)
                 target = _highlight_target(
                     page,
                     fallback,
@@ -721,7 +754,11 @@ def _apply_interactive_step(
                             hold_ms=visual_click_hold_ms,
                         )
                     else:
-                        fallback.click()
+                        fallback.click(timeout=timeout_ms)
+                    actions.append(
+                        'cmd: playwright click selector:.track-card:has-text("Stan") '
+                        'button:has-text("Reproducir")'
+                    )
                     observations.append(
                         f"Clicked fallback selector in step {step_num}: .track-card:has-text('Stan') "
                         "button:has-text('Reproducir')"
@@ -741,9 +778,9 @@ def _apply_interactive_step(
             raise
 
     if step.kind == "maybe_click_text":
-        actions.append(f"cmd: playwright maybe click text:{step.target}")
         locator = page.get_by_text(step.target, exact=False).first
         try:
+            locator.wait_for(state="visible", timeout=timeout_ms)
             target = _highlight_target(
                 page,
                 locator,
@@ -763,7 +800,8 @@ def _apply_interactive_step(
                     hold_ms=visual_click_hold_ms,
                 )
             else:
-                locator.click()
+                locator.click(timeout=timeout_ms)
+            actions.append(f"cmd: playwright maybe click text:{step.target}")
             observations.append(f"Maybe clicked text in step {step_num}: {step.target}")
             ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
             return
@@ -773,8 +811,8 @@ def _apply_interactive_step(
             return
 
     if step.kind == "select_label":
-        actions.append(f"cmd: playwright select selector:{step.target} label:{step.value}")
         locator = page.locator(step.target).first
+        locator.wait_for(state="visible", timeout=timeout_ms)
         target = _highlight_target(
             page,
             locator,
@@ -787,6 +825,7 @@ def _apply_interactive_step(
             if visual_human_mouse and target:
                 _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
         locator.select_option(label=step.value)
+        actions.append(f"cmd: playwright select selector:{step.target} label:{step.value}")
         observations.append(
             f"Selected option by label in step {step_num}: selector={step.target}, label={step.value}"
         )
@@ -794,8 +833,8 @@ def _apply_interactive_step(
         return
 
     if step.kind == "select_value":
-        actions.append(f"cmd: playwright select selector:{step.target} value:{step.value}")
         locator = page.locator(step.target).first
+        locator.wait_for(state="visible", timeout=timeout_ms)
         target = _highlight_target(
             page,
             locator,
@@ -808,6 +847,7 @@ def _apply_interactive_step(
             if visual_human_mouse and target:
                 _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
         locator.select_option(value=step.value)
+        actions.append(f"cmd: playwright select selector:{step.target} value:{step.value}")
         observations.append(
             f"Selected option by value in step {step_num}: selector={step.target}, value={step.value}"
         )
@@ -845,6 +885,13 @@ def _apply_wait_step(
 def _is_login_target(text: str) -> bool:
     low = text.lower().strip()
     return low in ("entrar demo", "entrar", "login", "sign in", "iniciar sesión")
+
+
+def _task_already_requests_demo_click(steps: list[WebStep]) -> bool:
+    for step in steps:
+        if step.kind in ("click_text", "maybe_click_text") and _is_login_target(step.target):
+            return True
+    return False
 
 
 def _looks_authenticated(page: Any) -> bool:

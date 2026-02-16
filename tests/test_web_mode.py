@@ -48,7 +48,7 @@ class _FakeNode:
         self._text = text
         self._selector = selector
 
-    def click(self) -> None:
+    def click(self, timeout: int | None = None) -> None:
         if self._text and self._text == self._page.fail_click_text:
             raise RuntimeError("text not found")
         self._page._title = "Demo after click"
@@ -62,9 +62,23 @@ class _FakeNode:
         self._page._title = f"Selected {choice}"
 
     def wait_for(self, state: str = "visible", timeout: int | None = None) -> None:
+        if self._text and self._text == self._page.fail_wait_for_text:
+            raise TimeoutError("Timeout exceeded while waiting for target")
         self._page.waited_text = self._text
 
+    def is_visible(self, timeout: int | None = None) -> bool:
+        if self._text == "Entrar demo":
+            return bool(self._page.demo_button_available)
+        return True
+
+    def is_enabled(self) -> bool:
+        if self._text == "Entrar demo":
+            return bool(self._page.demo_button_available)
+        return True
+
     def count(self) -> int:
+        if self._text == "Entrar demo":
+            return 1 if self._page.demo_button_available else 0
         if self._page.authenticated and self._text in self._page.auth_hints:
             return 1
         return 0
@@ -106,12 +120,21 @@ class _FakeMouse:
 
 
 class _FakePage:
-    def __init__(self, *, authenticated: bool = False, fail_click_text: str = ""):
+    def __init__(
+        self,
+        *,
+        authenticated: bool = False,
+        fail_click_text: str = "",
+        fail_wait_for_text: str = "",
+        demo_button_available: bool = True,
+    ):
         self._handlers = {}
         self.url = "about:blank"
         self._title = "Demo"
         self.authenticated = authenticated
         self.fail_click_text = fail_click_text
+        self.fail_wait_for_text = fail_wait_for_text
+        self.demo_button_available = demo_button_available
         self.waited_selector = ""
         self.waited_text = ""
         self.mouse = _FakeMouse(self)
@@ -157,6 +180,11 @@ class _FakePage:
 
     def get_by_text(self, text: str, exact: bool):
         return _FakeNode(self, text=text)
+
+    def get_by_role(self, role: str, name: str):
+        if role == "button":
+            return _FakeNode(self, text=name)
+        return _FakeNode(self, text="")
 
     def wait_for_selector(self, selector: str, timeout: int | None = None) -> None:
         self.waited_selector = selector
@@ -280,7 +308,7 @@ class WebModeTests(unittest.TestCase):
                 run_web_task("haz click en boton demo", run_dir, 30)
 
     def test_web_open_click_select_wait_and_capture(self) -> None:
-        page = _FakePage()
+        page = _FakePage(demo_button_available=False)
         fake_sync_module = types.ModuleType("playwright.sync_api")
         fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
         fake_playwright = types.ModuleType("playwright")
@@ -376,6 +404,78 @@ class WebModeTests(unittest.TestCase):
                         30,
                     )
             self.assertIn("Playwright Python package is not installed", str(ctx.exception))
+
+    def test_demo_step_is_not_auto_duplicated_when_task_already_requests_it(self) -> None:
+        page = _FakePage(demo_button_available=True)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("maybe_click_text", "Entrar demo")],
+                    run_dir,
+                    30,
+                    verified=False,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertEqual(sum(1 for action in report.actions if "maybe click text:Entrar demo" in action), 1)
+        self.assertTrue(any("skipping auto demo click" in item for item in report.observations))
+
+    def test_interactive_click_timeout_fails_fast(self) -> None:
+        page = _FakePage(fail_wait_for_text="Reproducir", demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_text", "Reproducir")],
+                    run_dir,
+                    30,
+                    verified=False,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertEqual(report.result, "failed")
+        self.assertTrue(any("Timeout on interactive step" in item for item in report.console_errors))
+        self.assertTrue(any("timeout on click_text:Reproducir" in item for item in report.ui_findings))
+        self.assertTrue(any(path.endswith("_timeout.png") for path in report.evidence_paths))
 
     def test_web_actions_and_evidence_validations(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:

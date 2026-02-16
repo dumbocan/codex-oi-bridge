@@ -262,3 +262,29 @@ Resultado esperado:
   - modo headless actual se mantiene como default para runs rápidos
 
 Ver handoff completo en `docs/CODEX_HANDOFF.md`.
+
+## Histórico de fallos y arreglos (sesiones reales)
+
+- 2026-02-16: `web-run --attach` fallaba con `Attached session is not alive` por sesión cerrada/obsoleta.
+  - Arreglo aplicado: flujo operativo con `web-open` nuevo `session_id` + validación de estado antes de attach.
+- 2026-02-16: runs visuales quedaban colgados en `web step 1/4` o `web step 2/5` con `controlled=true` sin avanzar.
+  - Causa: clicks interactivos sin timeout duro y retries no acotados en targets dinámicos.
+  - Arreglo aplicado: `BRIDGE_WEB_INTERACTIVE_TIMEOUT_SECONDS` (default 8s, clamp 1-60s) y manejo de timeout para pasos interactivos en el loop principal.
+- 2026-02-16: doble click de login (`Entrar demo`) cuando ya venía en el prompt.
+  - Causa: inserción automática del paso demo + paso explícito del task.
+  - Arreglo aplicado: deduplicación con `_task_already_requests_demo_click(...)` para no insertar auto-step si el task ya lo incluye.
+- 2026-02-16: guardrail bloqueaba runs con `missing required evidence for click step ...` tras timeout de click.
+  - Causa: `actions[]` registraba click antes de ejecutarlo; al fallar por timeout no existía `step_after` y la validación contaba el click igual.
+  - Arreglo aplicado: acciones interactivas se registran solo después de ejecutar con éxito el click/select.
+- 2026-02-16: overlay/cursor visual no siempre visible en attach.
+  - Causa: estado del overlay no determinista en navegación/attach.
+  - Arreglo aplicado: reinstalación best-effort con reintentos, validación de visibilidad y degradación sin abortar run.
+- 2026-02-16: usuario quedaba con borde azul/verde por control retenido tras run atascado.
+  - Arreglo aplicado: uso de `web-release --attach <session_id>` y endurecimiento del flujo de liberación de control.
+
+## Estado actual tras estos arreglos
+
+- No hay duplicación de `Entrar demo` si el prompt ya lo pide.
+- Los pasos interactivos fallan rápido por timeout, no se quedan colgados indefinidamente.
+- La sesión attach se mantiene reutilizable y liberable (`web-release`) sin cerrar ventana.
+- La validación de evidencia ya no penaliza clicks no ejecutados por timeout.
