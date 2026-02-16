@@ -61,7 +61,7 @@ class _FakeNode:
         choice = label or value or ""
         self._page._title = f"Selected {choice}"
 
-    def wait_for(self, state: str = "visible") -> None:
+    def wait_for(self, state: str = "visible", timeout: int | None = None) -> None:
         self._page.waited_text = self._text
 
     def count(self) -> int:
@@ -158,7 +158,7 @@ class _FakePage:
     def get_by_text(self, text: str, exact: bool):
         return _FakeNode(self, text=text)
 
-    def wait_for_selector(self, selector: str) -> None:
+    def wait_for_selector(self, selector: str, timeout: int | None = None) -> None:
         self.waited_selector = selector
 
     def wait_for_timeout(self, _ms: int) -> None:
@@ -307,7 +307,7 @@ class WebModeTests(unittest.TestCase):
             self.assertTrue(any("step 2 verify visible result" in item for item in report.ui_findings))
             self.assertEqual(page.waited_selector, "#ready")
             self.assertEqual(page.waited_text, "Bienvenido")
-            self.assertEqual(len(report.evidence_paths), 4)
+            self.assertEqual(len(report.evidence_paths), 5)
 
     def test_web_auth_fallback_when_login_button_missing(self) -> None:
         page = _FakePage(authenticated=True, fail_click_text="Entrar demo")

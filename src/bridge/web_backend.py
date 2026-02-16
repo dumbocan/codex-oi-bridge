@@ -420,6 +420,8 @@ def _execute_playwright(
         page.on("requestfailed", on_failed)
 
         control_enabled = False
+        wait_timeout_ms = int(float(os.getenv("BRIDGE_WEB_WAIT_TIMEOUT_SECONDS", "12")) * 1000)
+        wait_timeout_ms = max(1000, min(60000, wait_timeout_ms))
         try:
             initial_url = page.url
             initial_title = _safe_page_title(page)
@@ -433,7 +435,13 @@ def _execute_playwright(
                 observations.append(f"Opened URL: {url}")
 
             if visual:
-                _ensure_visual_overlay_ready(page)
+                _ensure_visual_overlay_ready_best_effort(
+                    page,
+                    ui_findings,
+                    cursor_expected=visual_cursor,
+                    retries=3,
+                    delay_ms=140,
+                )
                 _set_assistant_control_overlay(page, True)
                 control_enabled = True
                 _update_top_bar_state(
@@ -444,13 +452,46 @@ def _execute_playwright(
             if attached and session is not None:
                 mark_controlled(session, True, url=page.url, title=_safe_page_title(page))
 
+            # Preflight UI context evidence (before executing steps).
+            try:
+                context_path = evidence_dir / "step_0_context.png"
+                page.screenshot(path=str(context_path), full_page=True)
+                evidence_paths.append(_to_repo_rel(context_path))
+            except Exception:
+                pass
+            try:
+                body_text = page.evaluate(
+                    "() => (document.body && document.body.innerText ? document.body.innerText.slice(0, 500) : '')"
+                )
+            except Exception:
+                body_text = ""
+            body_snippet = _collapse_ws(str(body_text or ""))[:500]
+            ui_findings.append(
+                f"context title={_safe_page_title(page)} url={page.url} body[:500]={body_snippet}"
+            )
+
+            # Conditional login: if demo button exists+visible+enabled, click; otherwise continue as already authed.
+            if _demo_login_button_available(page):
+                observations.append("Login state detected: Entrar demo present and enabled")
+                # Insert a native optional step at the front (keeps evidence before/after machinery).
+                steps = [WebStep("maybe_click_text", "Entrar demo")] + steps
+            else:
+                observations.append("demo not present; already authed")
+                ui_findings.append("demo not present; already authed")
+
             interactive_step = 0
             total = len(steps)
             for idx, step in enumerate(steps, start=1):
                 if progress_cb:
                     progress_cb(idx, total, f"web step {idx}/{total}: {step.kind}")
 
-                if step.kind in ("click_selector", "click_text", "select_label", "select_value"):
+                if step.kind in (
+                    "click_selector",
+                    "click_text",
+                    "maybe_click_text",
+                    "select_label",
+                    "select_value",
+                ):
                     interactive_step += 1
                     before = evidence_dir / f"step_{interactive_step}_before.png"
                     after = evidence_dir / f"step_{interactive_step}_after.png"
@@ -474,7 +515,31 @@ def _execute_playwright(
                     evidence_paths.append(_to_repo_rel(after))
                     continue
 
-                _apply_wait_step(page, step, idx, actions, observations, ui_findings)
+                try:
+                    _apply_wait_step(
+                        page,
+                        step,
+                        idx,
+                        actions,
+                        observations,
+                        ui_findings,
+                        timeout_ms=wait_timeout_ms,
+                    )
+                except Exception as exc:
+                    if _is_timeout_error(exc):
+                        timeout_path = evidence_dir / f"step_{idx}_timeout.png"
+                        try:
+                            page.screenshot(path=str(timeout_path), full_page=True)
+                            evidence_paths.append(_to_repo_rel(timeout_path))
+                        except Exception:
+                            pass
+                        console_errors.append(f"Timeout on step {idx}: {step.kind} {step.target}")
+                        ui_findings.append(
+                            f"step {idx} timeout waiting for {step.kind}:{step.target} (timeout_ms={wait_timeout_ms})"
+                        )
+                        result = "failed"
+                        break
+                    raise
         finally:
             if visual and control_enabled:
                 _set_assistant_control_overlay(page, False)
@@ -489,8 +554,8 @@ def _execute_playwright(
             if not attached and not keep_open:
                 browser.close()
 
-    result = "success"
-    if console_errors or network_findings:
+    result = locals().get("result", "success")
+    if result != "failed" and (console_errors or network_findings):
         result = "partial"
     if verified and steps and not ui_findings:
         raise SystemExit("Verified web mode requires post-step visible verification findings.")
@@ -591,6 +656,38 @@ def _apply_interactive_step(
                 return
             raise
 
+    if step.kind == "maybe_click_text":
+        actions.append(f"cmd: playwright maybe click text:{step.target}")
+        locator = page.get_by_text(step.target, exact=False).first
+        try:
+            target = _highlight_target(
+                page,
+                locator,
+                f"step {step_num}",
+                click_pulse_enabled=click_pulse_enabled and visual,
+            )
+            if target is None:
+                observations.append(f"Step {step_num}: maybe click target not visible/occluded: {step.target}")
+                ui_findings.append(f"step {step_num} verify optional click skipped: {step.target}")
+                return
+            if visual and visual_human_mouse and target:
+                _human_mouse_click(
+                    page,
+                    target[0],
+                    target[1],
+                    speed=visual_mouse_speed,
+                    hold_ms=visual_click_hold_ms,
+                )
+            else:
+                locator.click()
+            observations.append(f"Maybe clicked text in step {step_num}: {step.target}")
+            ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
+            return
+        except Exception:
+            observations.append(f"Step {step_num}: maybe click not present: {step.target}")
+            ui_findings.append(f"step {step_num} verify optional click skipped: {step.target}")
+            return
+
     if step.kind == "select_label":
         actions.append(f"cmd: playwright select selector:{step.target} label:{step.value}")
         locator = page.locator(step.target).first
@@ -643,16 +740,18 @@ def _apply_wait_step(
     actions: list[str],
     observations: list[str],
     ui_findings: list[str],
+    *,
+    timeout_ms: int,
 ) -> None:
     if step.kind == "wait_selector":
         actions.append(f"cmd: playwright wait selector:{step.target}")
-        page.wait_for_selector(step.target)
+        page.wait_for_selector(step.target, timeout=timeout_ms)
         observations.append(f"Wait selector step {step_num}: {step.target}")
         ui_findings.append(f"step {step_num} verify selector visible: {step.target}")
         return
     if step.kind == "wait_text":
         actions.append(f"cmd: playwright wait text:{step.target}")
-        page.get_by_text(step.target, exact=False).first.wait_for(state="visible")
+        page.get_by_text(step.target, exact=False).first.wait_for(state="visible", timeout=timeout_ms)
         observations.append(f"Wait text step {step_num}: {step.target}")
         ui_findings.append(f"step {step_num} verify text visible: {step.target}")
         return
@@ -665,6 +764,11 @@ def _is_login_target(text: str) -> bool:
 
 
 def _looks_authenticated(page: Any) -> bool:
+    try:
+        if page.locator(".track-card").first.is_visible(timeout=500):
+            return True
+    except Exception:
+        pass
     for hint in _AUTH_HINTS:
         try:
             if page.get_by_text(hint, exact=False).count() > 0:
@@ -682,7 +786,7 @@ def _launch_browser(
 ) -> Any:
     kwargs: dict[str, Any] = {"headless": not visual}
     if visual:
-        slow_mo = int(max(150, min(300, 220 / max(0.25, visual_mouse_speed))))
+        slow_mo = int(max(180, min(500, 260 / max(0.2, visual_mouse_speed))))
         kwargs["slow_mo"] = slow_mo
         kwargs["args"] = [
             "--window-size=1280,860",
@@ -1401,7 +1505,8 @@ def _ensure_visual_overlay_ready(page: Any, retries: int = 12, delay_ms: int = 1
 
 
 def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
-    steps = int(max(20, min(40, round(24 / max(0.5, speed)))))
+    # More visible mouse path in visual mode: 30-60 steps depending on speed factor.
+    steps = int(max(30, min(60, round(40 / max(0.3, speed)))))
     page.mouse.move(x, y, steps=steps)
     try:
         page.evaluate("([x, y]) => window.__bridgeMoveCursor?.(x, y)", [x, y])
@@ -1419,6 +1524,73 @@ def _human_mouse_click(page: Any, x: float, y: float, *, speed: float, hold_ms: 
     if hold_ms > 0:
         page.wait_for_timeout(hold_ms)
     page.mouse.up()
+
+
+def _collapse_ws(text: str) -> str:
+    return " ".join(str(text).replace("\n", " ").replace("\r", " ").split())
+
+
+def _demo_login_button_available(page: Any) -> bool:
+    try:
+        btn = page.get_by_role("button", name="Entrar demo")
+        if btn.count() <= 0:
+            return False
+        try:
+            if not btn.first.is_visible(timeout=800):
+                return False
+        except Exception:
+            return False
+        try:
+            return bool(btn.first.is_enabled())
+        except Exception:
+            return True
+    except Exception:
+        return False
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    name = exc.__class__.__name__.lower()
+    if "timeout" in name:
+        return True
+    msg = str(exc).lower()
+    return "timeout" in msg and "exceeded" in msg
+
+
+def _ensure_visual_overlay_ready_best_effort(
+    page: Any,
+    ui_findings: list[str],
+    *,
+    cursor_expected: bool,
+    retries: int,
+    delay_ms: int,
+) -> bool:
+    # Force re-injection / re-enable in attach flows and after navigations.
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            _ensure_visual_overlay_installed(page)
+            if cursor_expected:
+                try:
+                    _verify_visual_overlay_visible(page)
+                    return True
+                except Exception as exc:
+                    last_error = exc
+            else:
+                return True
+        except Exception as exc:
+            last_error = exc
+        try:
+            page.wait_for_timeout(delay_ms)
+        except Exception:
+            pass
+        ui_findings.append(f"visual overlay retry {attempt}/{retries}")
+
+    ui_findings.append(
+        "visual overlay degraded: cursor overlay not visible; continuing without cursor"
+    )
+    if last_error is not None:
+        ui_findings.append(f"visual overlay error: {last_error}")
+    return False
 
 
 def _set_assistant_control_overlay(page: Any, enabled: bool) -> None:
