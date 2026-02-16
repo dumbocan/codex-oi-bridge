@@ -172,6 +172,24 @@ class _FakePage:
         self.eval_calls.append((_script, payload))
         if "window.__bridgeEnsureOverlay" in _script:
             return True
+        if "getElementById('__bridge_cursor_overlay')" in _script and "pointerEvents" in _script:
+            self._overlay_visible_checks += 1
+            visible = self._overlay_visible_checks > self.overlay_visible_after
+            return {
+                "exists": visible,
+                "parent": "body" if visible else "",
+                "display": "block" if visible else "none",
+                "visibility": "visible" if visible else "hidden",
+                "opacity": "1" if visible else "0",
+                "z_index": 2147483647 if visible else 0,
+                "pointer_events": "none" if visible else "",
+            }
+        if "window.__bridgeOverlayInstalled = false" in _script:
+            self.overlay_installed = False
+            return True
+        if "window.__bridgeEnsureOverlay?.()" in _script:
+            self.overlay_installed = True
+            return True
         if "getElementById('__bridge_cursor_overlay')" in _script:
             self._overlay_visible_checks += 1
             return self._overlay_visible_checks > self.overlay_visible_after
@@ -484,6 +502,59 @@ class WebModeTests(unittest.TestCase):
             any("visual overlay degraded" in item.lower() for item in report.ui_findings)
         )
         self.assertIn(report.result, ("success", "partial"))
+
+    def test_visual_attach_renders_overlay_visible(self) -> None:
+        page = _FakePage()
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-attach",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=False,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("wait_text", "Audio3")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        session=session,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertFalse(any("visual overlay degraded" in item for item in report.ui_findings))
+        self.assertTrue(any("window.__bridgeOverlayInstalled = false" in s for s, _ in page.eval_calls))
 
     def test_headless_mode_does_not_enable_overlay_action(self) -> None:
         page = _FakePage()

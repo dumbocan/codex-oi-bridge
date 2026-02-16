@@ -388,6 +388,7 @@ def _execute_playwright(
             page = browser.new_page()
         page.set_default_timeout(min(timeout_seconds * 1000, 120000))
         if visual:
+            overlay_debug_path = evidence_dir / "step_overlay_debug.png"
             try:
                 _install_visual_overlay(
                     page,
@@ -409,6 +410,8 @@ def _execute_playwright(
                     cursor_expected=visual_cursor,
                     retries=3,
                     delay_ms=140,
+                    debug_screenshot_path=overlay_debug_path,
+                    force_reinit=True,
                 )
 
         def on_console(msg: Any) -> None:
@@ -452,6 +455,8 @@ def _execute_playwright(
                         cursor_expected=visual_cursor,
                         retries=3,
                         delay_ms=140,
+                        debug_screenshot_path=overlay_debug_path,
+                        force_reinit=True,
                     )
 
             if visual:
@@ -461,6 +466,8 @@ def _execute_playwright(
                     cursor_expected=visual_cursor,
                     retries=3,
                     delay_ms=140,
+                    debug_screenshot_path=overlay_debug_path,
+                    force_reinit=True,
                 )
                 _set_assistant_control_overlay(page, True)
                 control_enabled = True
@@ -504,6 +511,16 @@ def _execute_playwright(
             for idx, step in enumerate(steps, start=1):
                 if progress_cb:
                     progress_cb(idx, total, f"web step {idx}/{total}: {step.kind}")
+                if visual:
+                    _ensure_visual_overlay_ready_best_effort(
+                        page,
+                        ui_findings,
+                        cursor_expected=visual_cursor,
+                        retries=3,
+                        delay_ms=120,
+                        debug_screenshot_path=overlay_debug_path,
+                        force_reinit=True,
+                    )
 
                 if step.kind in (
                     "click_selector",
@@ -540,6 +557,8 @@ def _execute_playwright(
                             cursor_expected=visual_cursor,
                             retries=3,
                             delay_ms=120,
+                            debug_screenshot_path=overlay_debug_path,
+                            force_reinit=True,
                         )
                     continue
 
@@ -575,6 +594,8 @@ def _execute_playwright(
                         cursor_expected=visual_cursor,
                         retries=3,
                         delay_ms=120,
+                        debug_screenshot_path=overlay_debug_path,
+                        force_reinit=True,
                     )
         finally:
             if visual and control_enabled:
@@ -886,7 +907,8 @@ def _install_visual_overlay(
       const installOverlay = () => {
         if (window.__bridgeOverlayInstalled) return true;
         const root = document.documentElement;
-        if (!root) {
+        const body = document.body;
+        if (!root || !body) {
           if (!window.__bridgeOverlayRetryAttached) {
             window.__bridgeOverlayRetryAttached = true;
             document.addEventListener('DOMContentLoaded', () => {
@@ -895,6 +917,7 @@ def _install_visual_overlay(
           }
           return false;
         }
+        const overlayHost = body;
         const cursor = document.createElement('div');
         cursor.id = '__bridge_cursor_overlay';
         cursor.style.position = 'fixed';
@@ -908,14 +931,14 @@ def _install_visual_overlay(
         cursor.style.background = 'rgba(59,167,255,0.15)';
         cursor.style.display = cfg.cursorEnabled ? 'block' : 'none';
         cursor.style.transition = 'width 120ms ease, height 120ms ease, left 80ms linear, top 80ms linear';
-        root.appendChild(cursor);
+        overlayHost.appendChild(cursor);
         const trailLayer = document.createElement('div');
         trailLayer.id = '__bridge_trail_layer';
         trailLayer.style.position = 'fixed';
         trailLayer.style.inset = '0';
         trailLayer.style.pointerEvents = 'none';
         trailLayer.style.zIndex = '2147483646';
-        root.appendChild(trailLayer);
+        overlayHost.appendChild(trailLayer);
 
         const stateBorder = document.createElement('div');
         stateBorder.id = '__bridge_state_border';
@@ -930,7 +953,7 @@ def _install_visual_overlay(
         stateBorder.style.transition =
           'border-color 180ms ease-out, box-shadow 180ms ease-out, ' +
           'border-width 180ms ease-out';
-        root.appendChild(stateBorder);
+        overlayHost.appendChild(stateBorder);
 
         window.__bridgeSetStateBorder = (state) => {
           const s = state || {};
@@ -1321,9 +1344,9 @@ def _install_visual_overlay(
             toggle.addEventListener('click', () => {
               window.__bridgeSetTopBarVisible(bar.dataset.visible !== '1');
             });
-            root.appendChild(hot);
-            root.appendChild(toggle);
-            root.appendChild(bar);
+            overlayHost.appendChild(hot);
+            overlayHost.appendChild(toggle);
+            overlayHost.appendChild(bar);
           }
           window.__bridgeUpdateTopBarState(state);
         };
@@ -1528,25 +1551,76 @@ def _ensure_visual_overlay_installed(page: Any) -> None:
 
 
 def _verify_visual_overlay_visible(page: Any) -> None:
+    snapshot = _read_visual_overlay_snapshot(page)
     try:
-        ok = bool(
-            page.evaluate(
-                """
-                () => {
-                  const el = document.getElementById('__bridge_cursor_overlay');
-                  if (!el) return false;
-                  const style = window.getComputedStyle(el);
-                  return style.display !== 'none' && style.visibility !== 'hidden';
-                }
-                """
-            )
-        )
+        opacity = float(str(snapshot.get("opacity", "0") or "0"))
     except Exception:
-        ok = False
+        opacity = 0.0
+    z_index = int(snapshot.get("z_index", 0) or 0)
+    ok = bool(
+        snapshot.get("exists")
+        and snapshot.get("parent") == "body"
+        and snapshot.get("display") != "none"
+        and snapshot.get("visibility") != "hidden"
+        and opacity > 0
+        and z_index >= 2147483647
+        and snapshot.get("pointer_events") == "none"
+    )
     if not ok:
         raise RuntimeError(
-            "Visual overlay not visible: missing #__bridge_cursor_overlay or display is none."
+            "Visual overlay not visible: missing #__bridge_cursor_overlay or invalid style."
         )
+
+
+def _read_visual_overlay_snapshot(page: Any) -> dict[str, Any]:
+    try:
+        raw = page.evaluate(
+            """
+            () => {
+              const el = document.getElementById('__bridge_cursor_overlay');
+              if (!el) return { exists: false };
+              const style = window.getComputedStyle(el);
+              const parent = el.parentElement && el.parentElement.tagName
+                ? el.parentElement.tagName.toLowerCase()
+                : '';
+              const z = Number.parseInt(style.zIndex || '0', 10);
+              return {
+                exists: true,
+                parent,
+                display: style.display || '',
+                visibility: style.visibility || '',
+                opacity: style.opacity || '0',
+                z_index: Number.isNaN(z) ? 0 : z,
+                pointer_events: style.pointerEvents || '',
+              };
+            }
+            """
+        )
+    except Exception as exc:
+        return {"exists": False, "error": str(exc)}
+    if isinstance(raw, dict):
+        return raw
+    return {"exists": False, "error": "overlay snapshot is not a dict"}
+
+
+def _force_visual_overlay_reinstall(page: Any) -> None:
+    page.evaluate(
+        """
+        () => {
+          const ids = [
+            '__bridge_cursor_overlay',
+            '__bridge_trail_layer',
+            '__bridge_state_border',
+            '__bridge_step_badge',
+          ];
+          ids.forEach((id) => document.getElementById(id)?.remove());
+          window.__bridgeOverlayInstalled = false;
+          if (typeof window.__bridgeEnsureOverlay === 'function') {
+            window.__bridgeEnsureOverlay();
+          }
+        }
+        """
+    )
 
 
 def _ensure_visual_overlay_ready(page: Any, retries: int = 12, delay_ms: int = 120) -> None:
@@ -1626,11 +1700,18 @@ def _ensure_visual_overlay_ready_best_effort(
     cursor_expected: bool,
     retries: int,
     delay_ms: int,
+    debug_screenshot_path: Path | None = None,
+    force_reinit: bool = False,
 ) -> bool:
     # Force re-injection / re-enable in attach flows and after navigations.
     last_error: BaseException | None = None
     for attempt in range(1, max(1, retries) + 1):
         try:
+            if force_reinit:
+                try:
+                    _force_visual_overlay_reinstall(page)
+                except BaseException as reinstall_exc:
+                    last_error = reinstall_exc
             _ensure_visual_overlay_installed(page)
             if cursor_expected:
                 try:
@@ -1638,6 +1719,10 @@ def _ensure_visual_overlay_ready_best_effort(
                     return True
                 except BaseException as exc:
                     last_error = exc
+                    try:
+                        _force_visual_overlay_reinstall(page)
+                    except BaseException as reinstall_exc:
+                        last_error = reinstall_exc
             else:
                 return True
         except BaseException as exc:
@@ -1648,6 +1733,14 @@ def _ensure_visual_overlay_ready_best_effort(
             pass
         ui_findings.append(f"visual overlay retry {attempt}/{retries}")
 
+    snapshot = _read_visual_overlay_snapshot(page)
+    ui_findings.append(f"visual overlay snapshot: {snapshot}")
+    if debug_screenshot_path is not None:
+        try:
+            page.screenshot(path=str(debug_screenshot_path), full_page=True)
+            ui_findings.append(f"visual overlay debug screenshot: {_to_repo_rel(debug_screenshot_path)}")
+        except Exception as screenshot_exc:
+            ui_findings.append(f"visual overlay debug screenshot failed: {screenshot_exc}")
     ui_findings.append(
         "visual overlay degraded: cursor overlay not visible; continuing without cursor"
     )
