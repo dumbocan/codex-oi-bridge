@@ -189,6 +189,54 @@ class WatchTests(unittest.TestCase):
         self.assertNotIn("click", text.lower())
         self.assertNotIn("WARN", text)
 
+    def test_formats_mousemove_and_scroll_events(self) -> None:
+        states = [
+            {
+                "incident_open": False,
+                "ack_count": 0,
+                "last_event_at": "",
+                "recent_events": [
+                    {
+                        "type": "mousemove",
+                        "severity": "info",
+                        "message": "mousemove 10,20",
+                        "x": 10,
+                        "y": 20,
+                        "created_at": "2026-02-15T10:00:00+00:00",
+                    },
+                    {
+                        "type": "scroll",
+                        "severity": "info",
+                        "message": "scroll y=400",
+                        "scroll_y": 400,
+                        "created_at": "2026-02-15T10:00:01+00:00",
+                    },
+                ],
+            }
+        ]
+
+        def fetch_state():
+            return states[0]
+
+        def sleep_fn(_seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            _watch_loop(
+                fetch_state=fetch_state,
+                sleep_fn=sleep_fn,
+                interval_ms=50,
+                since_last=False,
+                json_mode=False,
+                print_events=2,
+                only="info",
+                notify=False,
+            )
+        text = out.getvalue()
+        self.assertIn("mousemove x=10 y=20", text)
+        self.assertIn("scroll y=400", text)
+
 
 if __name__ == "__main__":
     unittest.main()

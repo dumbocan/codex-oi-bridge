@@ -20,7 +20,7 @@ bajo control de Codex.
   - Flags: `--visual-cursor on|off`, `--visual-click-pulse on|off`,
     `--visual-scale <float>`, `--visual-color "#3BA7FF"`,
     `--visual-human-mouse on|off`, `--visual-mouse-speed <float>`,
-    `--visual-click-hold-ms <int>`
+    `--visual-click-hold-ms <int>`, `--teaching`
 
 ## Runtime recomendado (obligatorio)
 
@@ -103,6 +103,15 @@ Pasos web soportados (nativos):
 - `wait selector:"..."`.
 - `wait text:"..."`.
 
+Modo enseñanza (`--teaching`):
+- Si falla un target interactivo, intenta selector estable + scroll (contenedor principal y página) con hasta 2 reintentos.
+- Si sigue fallando, muestra aviso en la UI y cede control automático (`release`) manteniendo la ventana abierta.
+- Si detecta atasco (paso interactivo sin avance / sin eventos útiles), hace handoff proactivo con aviso:
+  `Me he atascado en: <paso>. Te cedo el control para que me ayudes.`
+- Observa clicks manuales del usuario, guarda artefacto local en `runs/<run_id>/learning/` y prioriza selectores aprendidos en ejecuciones futuras para el mismo estado.
+- Ventana de aprendizaje configurable con `BRIDGE_LEARNING_WINDOW_SECONDS` (default `25`).
+- Verbosidad del observer configurable con `BRIDGE_OBSERVER_NOISE_MODE=minimal|debug` (default `minimal`).
+
 Nota sobre `wait text`:
 - Si hay colisiones con texto oculto (por ejemplo `<option>` en un `<select>`), preferir `wait selector:"..."` con un selector único.
 
@@ -126,10 +135,11 @@ Session Observer (Fase 2):
 - La barra hace polling de estado (`GET /state`) y publica eventos (`POST /event`) al agente.
 - `web-open` inyecta automáticamente la top bar en la página actual (sin necesitar `web-run --visual`).
 - Colores:
-  - Verde: `READY FOR MANUAL TEST` (`open`, `controlled=false`, `agent_online=true`, `incident_open=false`).
   - Azul: control asistente (`controlled=true`).
+  - Naranja: aprendizaje/handoff (`learning_active=true`).
+  - Verde: control usuario (`controlled=false`, `learning_active=false`).
   - Rojo: incidente abierto (`incident_open=true`).
-  - Gris: sesión abierta en control usuario.
+  - Gris: sesión abierta pero sin canal de control/manual listo.
 - Acción `Clear incident` (ack):
   - envía `POST /action` con `action=ack`,
   - apaga estado rojo sin cerrar la sesión,
@@ -139,7 +149,8 @@ Indicador verde (badge):
 - Muestra un badge verde sólido con `● READY FOR MANUAL TEST` (alto contraste).
 
 Notas operativas:
-- Interacción manual (click/move/resize) está soportada durante sesiones persistentes.
+- En `BRIDGE_OBSERVER_NOISE_MODE=minimal`, en `USER CONTROL` normal no se registran `mousemove/scroll/click` triviales; sí se registran errores (`console_error`, `page_error`, `network_error` relevante).
+- En `BRIDGE_OBSERVER_NOISE_MODE=debug`, se habilita traza extensa para diagnóstico puntual.
 - La sesión solo debe cerrarse con `bridge web-close --attach <session_id>`.
 - Si una sesión muere, `bridge status` lo reflejará como `closed`; recuperación: ejecutar `bridge web-open` de nuevo.
 - Si la barra muestra `agent offline`, recrear la sesión con `bridge web-open` o cerrar con `bridge web-close --attach <id>`.
@@ -308,6 +319,30 @@ Ver handoff completo en `docs/CODEX_HANDOFF.md`.
 - Los pasos interactivos fallan rápido por timeout, no se quedan colgados indefinidamente.
 - La sesión attach se mantiene reutilizable y liberable (`web-release`) sin cerrar ventana.
 - La validación de evidencia ya no penaliza clicks no ejecutados por timeout.
+
+## Progreso reciente (teaching mode)
+
+- `--teaching` en `web-run`/`run --mode web` con reintentos guiados (selector estable + scroll + evidencia retry).
+- Handoff automático por atasco real (watchdog global de step/progreso), incluso sin excepción en el paso.
+- Handoff unificado: aviso visible, estado `LEARNING/HANDOFF` naranja, `release` automático, `keep-open` efectivo.
+- Registro explícito en `ui_findings` cuando hay atasco:
+  - `what_failed=stuck`
+  - `where=<step>`
+  - `attempted=<...>`
+  - `next_best_action=human_assist`
+- Aprendizaje post-handoff:
+  - captura de acción manual y artefactos en `runs/<run_id>/learning/teaching_*.json|md`
+  - persistencia global en `runs/learning/web_teaching_selectors.json`
+  - reutilización del selector aprendido en runs siguientes del mismo contexto.
+- UX de ayuda humana:
+  - pulso/cursor visible al click manual (`manual click captured`),
+  - filtro de clicks irrelevantes (evita aprender botones del topbar),
+  - aviso de click incorrecto con sugerencia de selector objetivo,
+  - mensaje de confirmación: `Gracias, ya he aprendido... Ya continúo yo.`,
+  - intento de auto-resume tras aprender (`learning-resume`).
+- Antiruido de observabilidad:
+  - `minimal` evita ruido en `USER CONTROL` libre y no cuenta `mousemove/scroll` triviales como progreso útil,
+  - `debug` habilita telemetría amplia para debugging.
 
 ## Modelo mental: OI + Bridge + App
 

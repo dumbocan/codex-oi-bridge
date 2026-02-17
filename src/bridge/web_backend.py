@@ -7,15 +7,17 @@ import json
 import re
 import socket
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from bridge.models import OIReport
-from bridge.web_session import WebSession, mark_controlled
+from bridge.web_session import WebSession, mark_controlled, request_session_state
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
@@ -66,6 +68,14 @@ _AUTH_HINTS = (
     "perfil",
 )
 
+_LEARNING_DIR = Path("runs") / "learning"
+_LEARNING_JSON = _LEARNING_DIR / "web_teaching_selectors.json"
+
+
+def _observer_noise_mode() -> str:
+    raw = str(os.getenv("BRIDGE_OBSERVER_NOISE_MODE", "minimal")).strip().lower()
+    return "debug" if raw == "debug" else "minimal"
+
 
 @dataclass(frozen=True)
 class WebStep:
@@ -90,6 +100,7 @@ def run_web_task(
     visual_click_hold_ms: int = 180,
     session: WebSession | None = None,
     keep_open: bool = False,
+    teaching_mode: bool = False,
 ) -> OIReport:
     url_match = _URL_RE.search(task)
     if not url_match:
@@ -124,6 +135,7 @@ def run_web_task(
         visual_click_hold_ms=visual_click_hold_ms,
         session=session,
         keep_open=keep_open,
+        teaching_mode=teaching_mode,
     )
 
 
@@ -354,6 +366,7 @@ def _execute_playwright(
     visual_click_hold_ms: int = 180,
     session: WebSession | None = None,
     keep_open: bool = False,
+    teaching_mode: bool = False,
 ) -> OIReport:
     from playwright.sync_api import sync_playwright
 
@@ -368,6 +381,22 @@ def _execute_playwright(
     network_findings: list[str] = []
     ui_findings: list[str] = []
     evidence_paths: list[str] = []
+    learning_notes: list[str] = []
+    learning_context: dict[str, str] = {}
+    force_keep_open = False
+    release_for_handoff = False
+    wait_for_human_learning = False
+    handoff_reason = ""
+    handoff_where = ""
+    handoff_attempted = ""
+    failed_target_for_teaching = ""
+    page = None
+    interactive_timeout_ms = 8000
+    learned_selector_map = _load_learned_selectors()
+    current_step_signature = ""
+    last_step_change_ts = time.monotonic()
+    last_progress_event_ts = last_step_change_ts
+    last_useful_events = 0
 
     with sync_playwright() as p:
         browser = None
@@ -439,9 +468,14 @@ def _execute_playwright(
         wait_timeout_ms = max(1000, min(60000, wait_timeout_ms))
         interactive_timeout_ms = int(float(os.getenv("BRIDGE_WEB_INTERACTIVE_TIMEOUT_SECONDS", "8")) * 1000)
         interactive_timeout_ms = max(1000, min(60000, interactive_timeout_ms))
+        stuck_interactive_seconds = float(os.getenv("BRIDGE_WEB_STUCK_INTERACTIVE_SECONDS", "12"))
+        stuck_step_seconds = float(os.getenv("BRIDGE_WEB_STUCK_STEP_SECONDS", "20"))
+        last_useful_events = _observer_useful_event_count(session)
         try:
+            learning_context = _learning_context(url, "")
             initial_url = page.url
             initial_title = _safe_page_title(page)
+            learning_context = _learning_context(url, initial_title)
             observations.append(f"Initial url/title: {initial_url} | {initial_title}")
             target_matches = _same_origin_path(initial_url, url)
             if target_matches:
@@ -513,9 +547,61 @@ def _execute_playwright(
                 observations.append("demo not present; already authed")
                 ui_findings.append("demo not present; already authed")
 
+            def _poll_watchdog_progress() -> None:
+                nonlocal last_useful_events, last_progress_event_ts
+                useful = _observer_useful_event_count(session)
+                if useful > last_useful_events:
+                    last_useful_events = useful
+                    last_progress_event_ts = time.monotonic()
+
+            def _watchdog_stuck_attempt(attempted: str) -> bool:
+                nonlocal handoff_reason, handoff_where, handoff_attempted
+                nonlocal force_keep_open, wait_for_human_learning, failed_target_for_teaching
+                nonlocal control_enabled, result, release_for_handoff
+                _poll_watchdog_progress()
+                now = time.monotonic()
+                if (
+                    current_step_signature
+                    and (now - last_step_change_ts) > max(0.1, stuck_step_seconds)
+                ) or (
+                    current_step_signature
+                    and (now - last_progress_event_ts) > max(0.1, stuck_interactive_seconds)
+                ):
+                    handoff_reason = "stuck"
+                    handoff_where = current_step_signature
+                    handoff_attempted = attempted
+                    failed_target_for_teaching = current_step_signature
+                    force_keep_open = True
+                    wait_for_human_learning = True
+                    release_for_handoff = False
+                    control_enabled = _trigger_stuck_handoff(
+                        page=page,
+                        session=session,
+                        visual=visual,
+                        control_enabled=control_enabled,
+                        where=handoff_where,
+                        attempted=attempted,
+                        learning_window_seconds=int(
+                            float(os.getenv("BRIDGE_LEARNING_WINDOW_SECONDS", "25"))
+                        ),
+                        actions=actions,
+                        ui_findings=ui_findings,
+                    )
+                    result = "partial"
+                    return True
+                return False
+
             interactive_step = 0
             total = len(steps)
             for idx, step in enumerate(steps, start=1):
+                attempted_hint = ""
+                step_sig = f"step {idx}/{total} {step.kind}:{step.target}"
+                if step_sig != current_step_signature:
+                    current_step_signature = step_sig
+                    last_step_change_ts = time.monotonic()
+                    last_progress_event_ts = last_step_change_ts
+                if teaching_mode and _watchdog_stuck_attempt("watchdog:loop"):
+                    break
                 if progress_cb:
                     progress_cb(idx, total, f"web step {idx}/{total}: {step.kind}")
                 if visual:
@@ -541,22 +627,109 @@ def _execute_playwright(
                     after = evidence_dir / f"step_{interactive_step}_after.png"
                     page.screenshot(path=str(before), full_page=True)
                     evidence_paths.append(_to_repo_rel(before))
+                    prev_action_len = len(actions)
+                    attempted_hint = ""
                     try:
-                        _apply_interactive_step(
-                            page,
-                            step,
-                            interactive_step,
-                            actions,
-                            observations,
-                            ui_findings,
-                            visual=visual,
-                            click_pulse_enabled=visual_click_pulse,
-                            visual_human_mouse=visual_human_mouse,
-                            visual_mouse_speed=visual_mouse_speed,
-                            visual_click_hold_ms=visual_click_hold_ms,
-                            timeout_ms=interactive_timeout_ms,
-                        )
+                        if teaching_mode:
+                            retry_result = _apply_interactive_step_with_retries(
+                                page,
+                                step,
+                                interactive_step,
+                                evidence_dir,
+                                actions,
+                                observations,
+                                ui_findings,
+                                evidence_paths,
+                                visual=visual,
+                                click_pulse_enabled=visual_click_pulse,
+                                visual_human_mouse=visual_human_mouse,
+                                visual_mouse_speed=visual_mouse_speed,
+                                visual_click_hold_ms=visual_click_hold_ms,
+                                timeout_ms=interactive_timeout_ms,
+                                max_retries=2,
+                                learning_selectors=_learned_selectors_for_step(
+                                    step, learned_selector_map, learning_context
+                                ),
+                                session=session,
+                                step_label=f"web step {idx}/{total}: {step.kind}:{step.target}",
+                                stuck_interactive_seconds=float(
+                                    os.getenv("BRIDGE_WEB_STUCK_INTERACTIVE_SECONDS", "12")
+                                ),
+                                stuck_step_seconds=float(os.getenv("BRIDGE_WEB_STUCK_STEP_SECONDS", "20")),
+                            )
+                            if retry_result.stuck:
+                                force_keep_open = True
+                                wait_for_human_learning = True
+                                handoff_reason = "stuck"
+                                handoff_where = current_step_signature
+                                handoff_attempted = retry_result.attempted
+                                failed_target_for_teaching = step.target
+                                release_for_handoff = False
+                                control_enabled = _trigger_stuck_handoff(
+                                    page=page,
+                                    session=session,
+                                    visual=visual,
+                                    control_enabled=control_enabled,
+                                    where=handoff_where,
+                                    attempted=handoff_attempted,
+                                    learning_window_seconds=int(
+                                        float(os.getenv("BRIDGE_LEARNING_WINDOW_SECONDS", "25"))
+                                    ),
+                                    actions=actions,
+                                    ui_findings=ui_findings,
+                                )
+                                result = "partial"
+                                break
+                            attempted_hint = retry_result.attempted
+                            if retry_result.selector_used:
+                                learning_notes.append(
+                                    f"selector used for target '{step.target}': {retry_result.selector_used}"
+                                )
+                                _store_learned_selector(
+                                    target=step.target,
+                                    selector=retry_result.selector_used,
+                                    context=learning_context,
+                                    source="auto_retry",
+                                )
+                        else:
+                            _apply_interactive_step(
+                                page,
+                                step,
+                                interactive_step,
+                                actions,
+                                observations,
+                                ui_findings,
+                                visual=visual,
+                                click_pulse_enabled=visual_click_pulse,
+                                visual_human_mouse=visual_human_mouse,
+                                visual_mouse_speed=visual_mouse_speed,
+                                visual_click_hold_ms=visual_click_hold_ms,
+                                timeout_ms=interactive_timeout_ms,
+                            )
                     except Exception as exc:
+                        if teaching_mode and step.kind in ("click_text", "click_selector"):
+                            force_keep_open = True
+                            release_for_handoff = True
+                            wait_for_human_learning = True
+                            failed_target_for_teaching = step.target
+                            learning_notes.append(f"failed target: {step.target}")
+                            ui_findings.append(
+                                f"No encuentro el botón: {step.target}. Te cedo el control."
+                            )
+                            ui_findings.append("what_failed=target_not_found")
+                            ui_findings.append(
+                                f"where=step {interactive_step}:{step.kind}:{step.target}"
+                            )
+                            ui_findings.append(
+                                "why_likely=target text/selector changed, hidden, or not yet rendered"
+                            )
+                            ui_findings.append(
+                                "attempted=stable selector candidates + container/page scroll retries"
+                            )
+                            ui_findings.append("next_best_action=human_assist")
+                            _show_teaching_handoff_notice(page, step.target)
+                            result = "partial"
+                            break
                         if _is_timeout_error(exc):
                             timeout_path = evidence_dir / f"step_{interactive_step}_timeout.png"
                             try:
@@ -571,9 +744,20 @@ def _execute_playwright(
                                 f"step {interactive_step} timeout on {step.kind}:{step.target} "
                                 f"(timeout_ms={interactive_timeout_ms})"
                             )
+                            ui_findings.append("what_failed=interactive_timeout")
+                            ui_findings.append(f"where=step {interactive_step}:{step.kind}:{step.target}")
+                            ui_findings.append(
+                                "why_likely=target unavailable/occluded or app did not become interactive in time"
+                            )
+                            ui_findings.append("attempted=interactive timeout path")
+                            ui_findings.append("next_best_action=inspect target visibility or use teaching handoff")
                             result = "failed"
                             break
                         raise
+                    if handoff_reason == "stuck":
+                        break
+                    if len(actions) > prev_action_len:
+                        last_progress_event_ts = time.monotonic()
                     page.wait_for_timeout(1000)
                     page.screenshot(path=str(after), full_page=True)
                     evidence_paths.append(_to_repo_rel(after))
@@ -611,6 +795,13 @@ def _execute_playwright(
                         ui_findings.append(
                             f"step {idx} timeout waiting for {step.kind}:{step.target} (timeout_ms={wait_timeout_ms})"
                         )
+                        ui_findings.append("what_failed=wait_timeout")
+                        ui_findings.append(f"where=step {idx}:{step.kind}:{step.target}")
+                        ui_findings.append(
+                            "why_likely=expected selector/text did not appear within timeout window"
+                        )
+                        ui_findings.append("attempted=wait timeout path")
+                        ui_findings.append("next_best_action=verify app state or retry with stable selector")
                         result = "failed"
                         break
                     raise
@@ -624,21 +815,114 @@ def _execute_playwright(
                         debug_screenshot_path=overlay_debug_path,
                         force_reinit=True,
                     )
+                last_progress_event_ts = time.monotonic()
+                if teaching_mode and _watchdog_stuck_attempt(
+                    attempted_hint or f"watchdog:post-step:{step.kind}"
+                ):
+                    break
+            if release_for_handoff and handoff_reason != "stuck" and session is not None:
+                mark_controlled(session, False, url=page.url, title=_safe_page_title(page))
+                if wait_for_human_learning:
+                    _notify_learning_state(
+                        session,
+                        active=True,
+                        window_seconds=int(float(os.getenv("BRIDGE_LEARNING_WINDOW_SECONDS", "25"))),
+                    )
+                if visual and control_enabled:
+                    _set_assistant_control_overlay(page, False)
+                    if wait_for_human_learning:
+                        _set_learning_handoff_overlay(page, True)
+                    _update_top_bar_state(
+                        page,
+                        _session_state_payload(
+                            session,
+                            override_controlled=False,
+                            learning_active=bool(wait_for_human_learning),
+                        ),
+                    )
+                    control_enabled = False
+                actions.append("cmd: playwright release control (teaching handoff)")
+                if "control released" not in ui_findings:
+                    ui_findings.append("control released")
+            if wait_for_human_learning:
+                learn = None
+                if session is not None:
+                    learn = _capture_manual_learning(
+                        page=page,
+                        session=session,
+                        failed_target=failed_target_for_teaching,
+                        context=learning_context,
+                        wait_seconds=int(float(os.getenv("BRIDGE_LEARNING_WINDOW_SECONDS", "25"))),
+                    )
+                if learn:
+                    selector_used = str(learn.get("selector", "")).strip()
+                    if not selector_used:
+                        target_hint = str(learn.get("target", "")).strip()
+                        stable = _stable_selectors_for_target(target_hint)
+                        selector_used = stable[0] if stable else ""
+                    if selector_used:
+                        _store_learned_selector(
+                            target=str(learn.get("failed_target", "")).strip(),
+                            selector=selector_used,
+                            context=learning_context,
+                            source="manual",
+                        )
+                    artifact_paths = _write_teaching_artifacts(run_dir, learn)
+                    evidence_paths.extend(artifact_paths)
+                    _show_learning_thanks_notice(page, str(learn.get("failed_target", "")).strip())
+                    observations.append(
+                        "Teaching mode learned selector from manual action: "
+                        f"{selector_used or learn.get('target', '')}"
+                    )
+                    ui_findings.append(
+                        "Gracias, ya he aprendido dónde está el botón "
+                        f"{str(learn.get('failed_target', '')).strip()}. Ya continúo yo."
+                    )
+                    resumed = _resume_after_learning(
+                        page=page,
+                        selector=selector_used,
+                        target=str(learn.get("failed_target", "")).strip(),
+                        actions=actions,
+                        observations=observations,
+                        ui_findings=ui_findings,
+                    )
+                    if resumed:
+                        observations.append("teaching resume: action replayed after learning")
+                    else:
+                        ui_findings.append("learning_resume=failed")
+                else:
+                    ui_findings.append("learning_capture=none")
+                _set_learning_handoff_overlay(page, False)
+                if session is not None:
+                    _notify_learning_state(session, active=False, window_seconds=1)
+                    try:
+                        _update_top_bar_state(
+                            page,
+                            _session_state_payload(session, override_controlled=False, learning_active=False),
+                        )
+                    except Exception:
+                        pass
         finally:
+            try:
+                _set_learning_handoff_overlay(page, False)
+            except Exception:
+                pass
             if visual and control_enabled:
                 _set_assistant_control_overlay(page, False)
                 if session is not None:
                     _update_top_bar_state(
                         page,
-                        _session_state_payload(session, override_controlled=False),
+                        _session_state_payload(session, override_controlled=False, learning_active=False),
                     )
                 ui_findings.append("control released")
             if attached and session is not None:
                 mark_controlled(session, False, url=page.url, title=_safe_page_title(page))
-            if not attached and not keep_open:
+            if not attached and not keep_open and not force_keep_open:
                 browser.close()
 
     result = locals().get("result", "success")
+    if force_keep_open:
+        ui_findings.append("teaching handoff: browser kept open for manual control")
     if result != "failed" and (console_errors or network_findings):
         result = "partial"
     if verified and steps and not ui_findings:
@@ -655,6 +939,615 @@ def _execute_playwright(
         result=result,
         evidence_paths=evidence_paths,
     )
+
+
+@dataclass(frozen=True)
+class _RetryResult:
+    selector_used: str = ""
+    stuck: bool = False
+    attempted: str = ""
+
+
+def _apply_interactive_step_with_retries(
+    page: Any,
+    step: WebStep,
+    step_num: int,
+    evidence_dir: Path,
+    actions: list[str],
+    observations: list[str],
+    ui_findings: list[str],
+    evidence_paths: list[str],
+    *,
+    visual: bool,
+    click_pulse_enabled: bool,
+    visual_human_mouse: bool,
+    visual_mouse_speed: float,
+    visual_click_hold_ms: int,
+    timeout_ms: int,
+    max_retries: int,
+    learning_selectors: list[str],
+    session: WebSession | None,
+    step_label: str,
+    stuck_interactive_seconds: float,
+    stuck_step_seconds: float,
+) -> _RetryResult:
+    candidates: list[WebStep] = [step]
+    if step.kind == "click_text":
+        for selector in _stable_selectors_for_target(step.target):
+            candidates.append(WebStep("click_selector", selector))
+        for selector in learning_selectors:
+            candidates.insert(1, WebStep("click_selector", selector))
+    elif step.kind == "click_selector":
+        for selector in learning_selectors:
+            candidates.insert(0, WebStep("click_selector", selector))
+
+    last_exc: Exception | None = None
+    total_attempts = max(1, int(max_retries) + 1)
+    started_at = time.monotonic()
+    baseline_events = _observer_useful_event_count(session)
+    attempted_parts: list[str] = []
+    for attempt in range(1, total_attempts + 1):
+        attempted_parts.append(f"retry={attempt - 1}")
+        if attempt > 1:
+            _retry_scroll(page)
+            attempted_parts.append("scroll=main+page")
+            ui_findings.append(f"step {step_num} retry {attempt - 1}/{max_retries}: scrolled and re-attempting")
+        before_retry = evidence_dir / f"step_{step_num}_retry_{attempt}_before.png"
+        after_retry = evidence_dir / f"step_{step_num}_retry_{attempt}_after.png"
+        try:
+            page.screenshot(path=str(before_retry), full_page=True)
+            evidence_paths.append(_to_repo_rel(before_retry))
+        except Exception:
+            pass
+        for candidate in candidates:
+            try:
+                if candidate.kind == "click_selector":
+                    attempted_parts.append(f"selector={candidate.target}")
+                _apply_interactive_step(
+                    page,
+                    candidate,
+                    step_num,
+                    actions,
+                    observations,
+                    ui_findings,
+                    visual=visual,
+                    click_pulse_enabled=click_pulse_enabled,
+                    visual_human_mouse=visual_human_mouse,
+                    visual_mouse_speed=visual_mouse_speed,
+                    visual_click_hold_ms=visual_click_hold_ms,
+                    timeout_ms=timeout_ms,
+                )
+                try:
+                    page.screenshot(path=str(after_retry), full_page=True)
+                    evidence_paths.append(_to_repo_rel(after_retry))
+                except Exception:
+                    pass
+                if candidate.kind == "click_selector" and candidate.target != step.target:
+                    observations.append(
+                        f"step {step_num} used stable selector fallback: {candidate.target}"
+                    )
+                    return _RetryResult(selector_used=candidate.target)
+                return _RetryResult(selector_used="")
+            except Exception as exc:
+                last_exc = exc
+                if _should_mark_stuck(
+                    started_at=started_at,
+                    session=session,
+                    baseline_useful_events=baseline_events,
+                    stuck_interactive_seconds=stuck_interactive_seconds,
+                    stuck_step_seconds=stuck_step_seconds,
+                ):
+                    attempted = ", ".join(attempted_parts[-18:])
+                    ui_findings.append(
+                        f"stuck detected on {step_label}: elapsed>{stuck_interactive_seconds}s "
+                        "and no useful observer events"
+                    )
+                    return _RetryResult(selector_used="", stuck=True, attempted=attempted)
+                continue
+        try:
+            page.screenshot(path=str(after_retry), full_page=True)
+            evidence_paths.append(_to_repo_rel(after_retry))
+        except Exception:
+            pass
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Failed interactive step after retries: {step.kind} {step.target}")
+
+
+def _should_mark_stuck(
+    *,
+    started_at: float,
+    session: WebSession | None,
+    baseline_useful_events: int,
+    stuck_interactive_seconds: float,
+    stuck_step_seconds: float,
+) -> bool:
+    elapsed = max(0.0, time.monotonic() - started_at)
+    no_useful_events = True
+    current_useful = _observer_useful_event_count(session)
+    if current_useful > baseline_useful_events:
+        no_useful_events = False
+
+    if elapsed > max(0.1, float(stuck_step_seconds)):
+        return True
+    if elapsed > max(0.1, float(stuck_interactive_seconds)) and no_useful_events:
+        return True
+    return False
+
+
+def _observer_useful_event_count(session: WebSession | None) -> int:
+    if session is None:
+        return 0
+    try:
+        state = request_session_state(session)
+    except BaseException:
+        return 0
+    events = list(state.get("recent_events", []) or [])
+    noise_mode = str(state.get("observer_noise_mode", _observer_noise_mode())).strip().lower()
+    useful_types = {"click", "network_warn", "network_error", "console_error", "page_error"}
+    if noise_mode == "debug":
+        useful_types.update({"scroll", "mousemove"})
+    count = 0
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        etype = str(evt.get("type", "")).strip().lower()
+        if etype in useful_types:
+            count += 1
+    return count
+
+
+def _retry_scroll(page: Any) -> None:
+    try:
+        page.evaluate(
+            """
+            () => {
+              const main = document.querySelector('main,[role="main"],#main,.main,#__next,.app,[data-testid="main"]');
+              if (main && typeof main.scrollBy === 'function') {
+                main.scrollBy(0, Math.max(280, Math.floor(window.innerHeight * 0.45)));
+              }
+              window.scrollBy(0, Math.max(320, Math.floor(window.innerHeight * 0.55)));
+            }
+            """
+        )
+    except Exception:
+        try:
+            page.evaluate("() => window.scrollBy(0, 320)")
+        except Exception:
+            pass
+    try:
+        page.wait_for_timeout(220)
+    except Exception:
+        pass
+
+
+def _stable_selectors_for_target(target: str) -> list[str]:
+    clean = str(target).strip()
+    if not clean:
+        return []
+    escaped = clean.replace('"', '\\"')
+    return [
+        f'button:has-text("{escaped}")',
+        f'[role="button"]:has-text("{escaped}")',
+        f'a:has-text("{escaped}")',
+        f'[aria-label*="{escaped}" i]',
+        f'[title*="{escaped}" i]',
+    ]
+
+
+def _learning_context(url: str, title: str) -> dict[str, str]:
+    parsed = urlparse(str(url))
+    hostname = str(parsed.netloc or "").lower()
+    path = str(parsed.path or "/")
+    title_norm = _collapse_ws(title).lower()[:80]
+    return {
+        "hostname": hostname,
+        "path": path,
+        "title_hint": title_norm,
+        "state_key": f"{hostname}{path}|{title_norm}",
+    }
+
+
+def _load_learned_selectors() -> dict[str, dict[str, list[str]]]:
+    try:
+        if not _LEARNING_JSON.exists():
+            return {}
+        payload = json.loads(_LEARNING_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, dict[str, list[str]]] = {}
+    for key, value in payload.items():
+        if not isinstance(value, dict):
+            continue
+        entry: dict[str, list[str]] = {}
+        for tgt, selectors in value.items():
+            if isinstance(tgt, str) and isinstance(selectors, list):
+                entry[tgt] = [str(s).strip() for s in selectors if str(s).strip()]
+        if entry:
+            out[str(key)] = entry
+    return out
+
+
+def _store_learned_selector(
+    *,
+    target: str,
+    selector: str,
+    context: dict[str, str],
+    source: str,
+) -> None:
+    target_norm = str(target).strip().lower()
+    selector_norm = str(selector).strip()
+    if not target_norm or not selector_norm:
+        return
+    all_map = _load_learned_selectors()
+    state_key = str(context.get("state_key", "")).strip()
+    if not state_key:
+        return
+    state_bucket = all_map.setdefault(state_key, {})
+    selectors = state_bucket.setdefault(target_norm, [])
+    if selector_norm in selectors:
+        return
+    selectors.insert(0, selector_norm)
+    state_bucket[target_norm] = selectors[:6]
+    _LEARNING_DIR.mkdir(parents=True, exist_ok=True)
+    _LEARNING_JSON.write_text(json.dumps(all_map, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_learning_audit(target_norm, selector_norm, context, source)
+
+
+def _write_learning_audit(target: str, selector: str, context: dict[str, str], source: str) -> None:
+    audit = _LEARNING_DIR / "web_teaching_audit.md"
+    now = datetime.now(timezone.utc).isoformat()
+    lines = [
+        f"- {now} target=`{target}` selector=`{selector}` source=`{source}`",
+        f"  - context: {context.get('state_key', '')}",
+    ]
+    with audit.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def _learned_selectors_for_step(
+    step: WebStep,
+    selector_map: dict[str, dict[str, list[str]]],
+    context: dict[str, str],
+) -> list[str]:
+    if step.kind not in {"click_text", "click_selector"}:
+        return []
+    state_key = str(context.get("state_key", "")).strip()
+    if not state_key:
+        return []
+    bucket = selector_map.get(state_key, {})
+    return list(bucket.get(str(step.target).strip().lower(), []))
+
+
+def _prioritize_steps_with_learned_selectors(
+    steps: list[WebStep],
+    selector_map: dict[str, dict[str, list[str]]],
+    context: dict[str, str],
+) -> list[WebStep]:
+    if not steps:
+        return steps
+    out: list[WebStep] = []
+    for step in steps:
+        out.append(step)
+        learned = _learned_selectors_for_step(step, selector_map, context)
+        if step.kind == "click_text" and learned:
+            out.pop()
+            for selector in learned:
+                out.append(WebStep("click_selector", selector))
+            out.append(step)
+    return out
+
+
+def _show_teaching_handoff_notice(page: Any, target: str) -> None:
+    msg = f"No encuentro el botón: {target}. Te cedo el control."
+    try:
+        page.evaluate(
+            """
+            ([message]) => {
+              const id = '__bridge_teaching_handoff_notice';
+              let el = document.getElementById(id);
+              if (!el) {
+                el = document.createElement('div');
+                el.id = id;
+                el.style.position = 'fixed';
+                el.style.left = '50%';
+                el.style.bottom = '18px';
+                el.style.transform = 'translateX(-50%)';
+                el.style.padding = '10px 14px';
+                el.style.borderRadius = '10px';
+                el.style.background = 'rgba(245,158,11,0.95)';
+                el.style.color = '#fff';
+                el.style.font = '13px/1.3 monospace';
+                el.style.zIndex = '2147483647';
+                el.style.boxShadow = '0 8px 18px rgba(0,0,0,0.3)';
+                document.documentElement.appendChild(el);
+              }
+              el.textContent = String(message || '');
+            }
+            """,
+            [msg],
+        )
+    except Exception:
+        return
+
+
+def _show_stuck_handoff_notice(page: Any, step_text: str) -> None:
+    msg = f"Me he atascado en: {step_text}. Te cedo el control para que me ayudes."
+    try:
+        page.evaluate(
+            """
+            ([message]) => {
+              const id = '__bridge_teaching_handoff_notice';
+              let el = document.getElementById(id);
+              if (!el) {
+                el = document.createElement('div');
+                el.id = id;
+                el.style.position = 'fixed';
+                el.style.left = '50%';
+                el.style.bottom = '18px';
+                el.style.transform = 'translateX(-50%)';
+                el.style.padding = '10px 14px';
+                el.style.borderRadius = '10px';
+                el.style.background = 'rgba(245,158,11,0.95)';
+                el.style.color = '#fff';
+                el.style.font = '13px/1.3 monospace';
+                el.style.zIndex = '2147483647';
+                el.style.boxShadow = '0 8px 18px rgba(0,0,0,0.3)';
+                document.documentElement.appendChild(el);
+              }
+              el.textContent = String(message || '');
+            }
+            """,
+            [msg],
+        )
+    except Exception:
+        return
+
+
+def _trigger_stuck_handoff(
+    *,
+    page: Any,
+    session: WebSession | None,
+    visual: bool,
+    control_enabled: bool,
+    where: str,
+    attempted: str,
+    learning_window_seconds: int,
+    actions: list[str],
+    ui_findings: list[str],
+) -> bool:
+    _show_stuck_handoff_notice(page, where)
+    _set_learning_handoff_overlay(page, True)
+    if visual and control_enabled:
+        _set_assistant_control_overlay(page, False)
+    if session is not None:
+        mark_controlled(session, False, url=getattr(page, "url", ""), title=_safe_page_title(page))
+        _notify_learning_state(session, active=True, window_seconds=learning_window_seconds)
+        try:
+            _update_top_bar_state(
+                page,
+                _session_state_payload(session, override_controlled=False, learning_active=True),
+            )
+        except Exception:
+            pass
+    if "cmd: playwright release control (teaching handoff)" not in actions:
+        actions.append("cmd: playwright release control (teaching handoff)")
+    ui_findings.append(f"Me he atascado en: {where}. Te cedo el control para que me ayudes.")
+    if "control released" not in ui_findings:
+        ui_findings.append("control released")
+    ui_findings.append("what_failed=stuck")
+    ui_findings.append(f"where={where}")
+    ui_findings.append(f"attempted={attempted or 'watchdog'}")
+    ui_findings.append("next_best_action=human_assist")
+    ui_findings.append(
+        "why_likely=step unchanged/no useful progress within stuck thresholds during teaching mode"
+    )
+    return False
+
+
+def _show_learning_thanks_notice(page: Any, target: str) -> None:
+    label = target or "ese control"
+    msg = f"Gracias, ya he aprendido dónde está {label}. Ya continúo yo."
+    try:
+        page.evaluate(
+            """
+            ([message]) => {
+              const id = '__bridge_teaching_handoff_notice';
+              let el = document.getElementById(id);
+              if (!el) {
+                el = document.createElement('div');
+                el.id = id;
+                el.style.position = 'fixed';
+                el.style.left = '50%';
+                el.style.bottom = '18px';
+                el.style.transform = 'translateX(-50%)';
+                el.style.padding = '10px 14px';
+                el.style.borderRadius = '10px';
+                el.style.background = 'rgba(16,185,129,0.96)';
+                el.style.color = '#fff';
+                el.style.font = '13px/1.3 monospace';
+                el.style.zIndex = '2147483647';
+                el.style.boxShadow = '0 8px 18px rgba(0,0,0,0.3)';
+                document.documentElement.appendChild(el);
+              }
+              el.textContent = String(message || '');
+            }
+            """,
+            [msg],
+        )
+    except Exception:
+        return
+
+
+def _normalize_failed_target_label(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    tail = text.split(":")[-1].strip().strip("'\"")
+    return tail
+
+
+def _show_wrong_manual_click_notice(page: Any, failed_target: str) -> None:
+    label = _normalize_failed_target_label(failed_target) or "objetivo esperado"
+    suggestion = _stable_selectors_for_target(label)
+    hint = suggestion[0] if suggestion else label
+    msg = f"Ese click no coincide. El objetivo es '{label}'. Prueba con: {hint}"
+    try:
+        page.evaluate(
+            """
+            ([message]) => {
+              const id = '__bridge_teaching_handoff_notice';
+              let el = document.getElementById(id);
+              if (!el) {
+                el = document.createElement('div');
+                el.id = id;
+                el.style.position = 'fixed';
+                el.style.left = '50%';
+                el.style.bottom = '18px';
+                el.style.transform = 'translateX(-50%)';
+                el.style.padding = '10px 14px';
+                el.style.borderRadius = '10px';
+                el.style.background = 'rgba(239,68,68,0.96)';
+                el.style.color = '#fff';
+                el.style.font = '13px/1.3 monospace';
+                el.style.zIndex = '2147483647';
+                el.style.boxShadow = '0 8px 18px rgba(0,0,0,0.3)';
+                document.documentElement.appendChild(el);
+              }
+              el.textContent = String(message || '');
+            }
+            """,
+            [msg],
+        )
+    except Exception:
+        return
+
+
+def _capture_manual_learning(
+    *,
+    page: Any | None,
+    session: WebSession,
+    failed_target: str,
+    context: dict[str, str],
+    wait_seconds: int,
+) -> dict[str, Any] | None:
+    max_wait = max(4, min(180, int(wait_seconds)))
+    deadline = datetime.now(timezone.utc).timestamp() + max_wait
+    seen: set[str] = set()
+    while datetime.now(timezone.utc).timestamp() < deadline:
+        try:
+            state = request_session_state(session)
+        except BaseException:
+            return None
+        events = list(state.get("recent_events", []) or [])
+        for evt in reversed(events):
+            if not isinstance(evt, dict):
+                continue
+            key = "|".join(
+                [
+                    str(evt.get("created_at", "")),
+                    str(evt.get("type", "")),
+                    str(evt.get("message", "")),
+                ]
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            if str(evt.get("type", "")).strip().lower() != "click":
+                continue
+            if not _is_relevant_manual_learning_event(evt, failed_target):
+                if page is not None:
+                    _show_wrong_manual_click_notice(page, failed_target)
+                continue
+            selector = str(evt.get("selector", "")).strip()
+            target = str(evt.get("target", "")).strip()
+            return {
+                "failed_target": failed_target or target,
+                "selector": selector,
+                "target": target,
+                "timestamp": str(evt.get("created_at", "")),
+                "url": str(evt.get("url", "")),
+                "state_key": context.get("state_key", ""),
+            }
+        try:
+            from time import sleep
+
+            sleep(0.7)
+        except Exception:
+            break
+    return None
+
+
+def _is_relevant_manual_learning_event(evt: dict[str, Any], failed_target: str) -> bool:
+    selector = str(evt.get("selector", "")).strip().lower()
+    target = str(evt.get("target", "")).strip().lower()
+    text = str(evt.get("text", "")).strip().lower()
+    message = str(evt.get("message", "")).strip().lower()
+
+    # Ignore bridge control widgets/buttons.
+    if "__bridge_" in selector:
+        return False
+    if target in {"release", "close", "refresh", "clear incident", "ack"}:
+        return False
+
+    raw = str(failed_target or "").strip().lower()
+    if not raw:
+        return True
+    probe = raw.split(":")[-1].strip().strip("'\"")
+    if not probe:
+        return True
+    token = re.sub(r"[^a-z0-9]+", " ", probe).strip()
+    if not token:
+        return True
+    return token in selector or token in target or token in text or token in message
+
+
+def _write_teaching_artifacts(run_dir: Path, payload: dict[str, Any]) -> list[str]:
+    out_dir = run_dir / "learning"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    base = f"teaching_{stamp}"
+    json_path = out_dir / f"{base}.json"
+    md_path = out_dir / f"{base}.md"
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    md_lines = [
+        "# Teaching Artifact",
+        "",
+        f"- failed_target: `{payload.get('failed_target', '')}`",
+        f"- selector: `{payload.get('selector', '')}`",
+        f"- click_target_text: `{payload.get('target', '')}`",
+        f"- timestamp: `{payload.get('timestamp', '')}`",
+        f"- url: `{payload.get('url', '')}`",
+        f"- state_key: `{payload.get('state_key', '')}`",
+    ]
+    md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    return [_to_repo_rel(json_path), _to_repo_rel(md_path)]
+
+
+def _resume_after_learning(
+    *,
+    page: Any,
+    selector: str,
+    target: str,
+    actions: list[str],
+    observations: list[str],
+    ui_findings: list[str],
+) -> bool:
+    sel = str(selector or "").strip()
+    if not sel:
+        return False
+    try:
+        locator = page.locator(sel).first
+        locator.wait_for(state="visible", timeout=3500)
+        locator.click(timeout=3500)
+        actions.append(f"cmd: playwright click selector:{sel} (learning-resume)")
+        observations.append(f"learning-resume clicked selector: {sel}")
+        ui_findings.append(f"learning_resume=success target={target}")
+        return True
+    except Exception:
+        return False
 
 
 def _apply_interactive_step(
@@ -1007,9 +1900,10 @@ def _install_visual_overlay(
           const controlled = !!s.controlled;
           const open = String(s.state || 'open') === 'open';
           const incidentOpen = !!s.incident_open;
+          const learningActive = !!s.learning_active;
           const controlUrl = window.__bridgeResolveControlUrl ? window.__bridgeResolveControlUrl(s) : null;
           const agentOnline = !!controlUrl && s.agent_online !== false;
-          const readyManual = open && !controlled && agentOnline && !incidentOpen;
+          const readyManual = open && !controlled && agentOnline && !incidentOpen && !learningActive;
 
           let color = 'rgba(210,210,210,0.22)';
           let glow = '0 0 0 1px rgba(0,0,0,0.28) inset';
@@ -1022,6 +1916,9 @@ def _install_visual_overlay(
           } else if (incidentOpen) {
             color = 'rgba(255,82,82,0.95)';
             glow = '0 0 0 2px rgba(255,82,82,0.32) inset, 0 0 26px rgba(255,82,82,0.18)';
+          } else if (learningActive) {
+            color = 'rgba(245,158,11,0.95)';
+            glow = '0 0 0 2px rgba(245,158,11,0.30) inset, 0 0 26px rgba(245,158,11,0.18)';
           } else if (readyManual) {
             color = 'rgba(34,197,94,0.95)';
             glow = '0 0 0 2px rgba(34,197,94,0.32) inset, 0 0 26px rgba(34,197,94,0.18)';
@@ -1203,6 +2100,9 @@ def _install_visual_overlay(
             ...(event || {}),
             session_id: state.session_id || '',
             url: String((event && event.url) || location.href || ''),
+            controlled: !!state.controlled,
+            learning_active: !!state.learning_active,
+            observer_noise_mode: String(state.observer_noise_mode || 'minimal'),
           };
           fetch(`${controlUrl}/event`, {
             method: 'POST',
@@ -1214,21 +2114,111 @@ def _install_visual_overlay(
         window.__bridgeEnsureSessionObserver = () => {
           if (window.__bridgeObserverInstalled) return;
           window.__bridgeObserverInstalled = true;
+          let lastMoveTs = 0;
+          let lastMoveX = 0;
+          let lastMoveY = 0;
+          let lastScrollTs = 0;
+          let lastScrollY = 0;
+          const shouldCapture = (eventType, bridgeControl = false) => {
+            const bar = document.getElementById('__bridge_session_top_bar');
+            const stateRaw = bar?.dataset?.state || '{}';
+            let state = {};
+            try { state = JSON.parse(stateRaw); } catch (_e) { state = {}; }
+            const mode = String(state.observer_noise_mode || 'minimal').toLowerCase();
+            if (mode === 'debug') return true;
+            const controlled = !!state.controlled;
+            const learningActive = !!state.learning_active;
+            if (eventType === 'click') {
+              if (bridgeControl) return false;
+              return controlled || learningActive;
+            }
+            if (eventType === 'scroll') {
+              return learningActive;
+            }
+            if (eventType === 'mousemove') {
+              return false;
+            }
+            return true;
+          };
+          const cssPath = (node) => {
+            try {
+              if (!node || !(node instanceof Element)) return '';
+              if (node.id) return `#${node.id}`;
+              const testid = node.getAttribute && (node.getAttribute('data-testid') || node.getAttribute('data-test'));
+              if (testid) return `[data-testid="${testid}"]`;
+              const tag = String(node.tagName || '').toLowerCase();
+              const cls = String(node.className || '').trim().split(/\\s+/).filter(Boolean).slice(0, 2).join('.');
+              if (tag) return cls ? `${tag}.${cls}` : tag;
+              return '';
+            } catch (_e) { return ''; }
+          };
           document.addEventListener('click', (ev) => {
             const el = ev.target;
             let target = '';
+            let selector = '';
+            let text = '';
+            let bridgeControl = false;
             if (el && typeof el.closest === 'function') {
               const btn = el.closest('button,[role="button"],a,input,select,textarea');
-              if (btn) target = (btn.textContent || btn.id || btn.className || '').trim();
+              if (btn) {
+                target = (btn.textContent || btn.id || btn.className || '').trim();
+                selector = cssPath(btn);
+                text = String(btn.textContent || '').trim().slice(0, 180);
+                const bid = String(btn.id || '');
+                bridgeControl = bid.startsWith('__bridge_') || selector.includes('__bridge_');
+              }
             }
+            if (!bridgeControl && shouldCapture('click', bridgeControl)) {
+              window.__bridgeShowClick?.(
+                Number(ev.clientX || 0),
+                Number(ev.clientY || 0),
+                'manual click captured'
+              );
+            }
+            if (!shouldCapture('click', bridgeControl)) return;
             window.__bridgeSendSessionEvent({
               type: 'click',
               target,
+              selector,
+              text,
               message: `click ${target}`,
               x: Number(ev.clientX || 0),
               y: Number(ev.clientY || 0),
             });
           }, true);
+          window.addEventListener('mousemove', (ev) => {
+            if (!shouldCapture('mousemove', false)) return;
+            const now = Date.now();
+            if ((now - lastMoveTs) < 350) return;
+            const x = Number(ev.clientX || 0);
+            const y = Number(ev.clientY || 0);
+            const dist = Math.hypot(x - lastMoveX, y - lastMoveY);
+            if (dist < 18) return;
+            lastMoveTs = now;
+            lastMoveX = x;
+            lastMoveY = y;
+            window.__bridgeSendSessionEvent({
+              type: 'mousemove',
+              message: `mousemove ${x},${y}`,
+              x,
+              y,
+            });
+          }, true);
+          window.addEventListener('scroll', () => {
+            if (!shouldCapture('scroll', false)) return;
+            const now = Date.now();
+            if ((now - lastScrollTs) < 300) return;
+            const sy = Number(window.scrollY || window.pageYOffset || 0);
+            const delta = Math.abs(sy - lastScrollY);
+            if (delta < 80) return;
+            lastScrollTs = now;
+            lastScrollY = sy;
+            window.__bridgeSendSessionEvent({
+              type: 'scroll',
+              message: `scroll y=${sy}`,
+              scroll_y: sy,
+            });
+          }, { passive: true, capture: true });
           window.addEventListener('error', (ev) => {
             window.__bridgeSendSessionEvent({
               type: 'page_error',
@@ -1406,7 +2396,8 @@ def _install_visual_overlay(
           const controlUrl = window.__bridgeResolveControlUrl(s);
           const agentOnline = !!controlUrl && s.agent_online !== false;
           const incidentOpen = !!s.incident_open;
-          const readyManual = open && !controlled && agentOnline && !incidentOpen;
+          const learningActive = !!s.learning_active;
+          const readyManual = open && !controlled && agentOnline && !incidentOpen && !learningActive;
           const incidentText = String(s.last_error || '').slice(0, 96);
           bar.style.background = controlled
             ? 'rgba(59,167,255,0.22)'
@@ -1414,20 +2405,30 @@ def _install_visual_overlay(
               incidentOpen
                 ? 'rgba(255,82,82,0.26)'
                 : (
-                  readyManual
+                  learningActive
+                    ? 'rgba(245,158,11,0.24)'
+                    : (
+                      readyManual
                     ? 'rgba(22,163,74,0.22)'
                     : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)')
+                    )
                 )
             );
-          bar.style.borderBottom = readyManual
-            ? '2px solid rgba(34,197,94,0.95)'
-            : '1px solid rgba(255,255,255,0.18)';
+          bar.style.borderBottom = learningActive
+            ? '2px solid rgba(245,158,11,0.95)'
+            : (
+              readyManual
+                ? '2px solid rgba(34,197,94,0.95)'
+                : '1px solid rgba(255,255,255,0.18)'
+            );
           bar.dataset.state = JSON.stringify(s);
           window.__bridgeSetIncidentOverlay(incidentOpen && !controlled, incidentText || 'INCIDENT DETECTED');
           window.__bridgeSetStateBorder?.(s);
           window.__bridgeEnsureSessionObserver();
           window.__bridgeStartTopBarPolling(s);
-          const ctrl = controlled ? 'assistant' : 'user';
+          const ctrl = controlled
+            ? 'ASSISTANT CONTROL'
+            : (learningActive ? 'LEARNING/HANDOFF' : 'USER CONTROL');
           const url = String(s.url || '').slice(0, 70);
           const last = String(s.last_seen_at || '').replace('T', ' ').slice(0, 16);
           const status = !agentOnline
@@ -1834,11 +2835,88 @@ def _set_assistant_control_overlay(page: Any, enabled: bool) -> None:
     )
 
 
+def _set_user_control_overlay(page: Any, enabled: bool) -> None:
+    page.evaluate(
+        """
+        ([enabled]) => {
+          const id = '__bridge_user_control_overlay';
+          const existing = document.getElementById(id);
+          if (!enabled) {
+            if (existing) existing.remove();
+            return;
+          }
+          if (existing) return;
+          const wrap = document.createElement('div');
+          wrap.id = id;
+          wrap.style.position = 'fixed';
+          wrap.style.inset = '0';
+          wrap.style.border = '3px solid #22c55e';
+          wrap.style.boxSizing = 'border-box';
+          wrap.style.pointerEvents = 'none';
+          wrap.style.zIndex = '2147483644';
+          const badge = document.createElement('div');
+          badge.textContent = 'USER CONTROL';
+          badge.style.position = 'fixed';
+          badge.style.top = '10px';
+          badge.style.right = '12px';
+          badge.style.padding = '4px 8px';
+          badge.style.borderRadius = '999px';
+          badge.style.font = '11px/1.2 monospace';
+          badge.style.color = '#fff';
+          badge.style.background = 'rgba(34,197,94,0.9)';
+          badge.style.pointerEvents = 'none';
+          wrap.appendChild(badge);
+          document.documentElement.appendChild(wrap);
+        }
+        """,
+        [enabled],
+    )
+
+
+def _set_learning_handoff_overlay(page: Any, enabled: bool) -> None:
+    page.evaluate(
+        """
+        ([enabled]) => {
+          const id = '__bridge_learning_handoff_overlay';
+          const existing = document.getElementById(id);
+          if (!enabled) {
+            if (existing) existing.remove();
+            return;
+          }
+          if (existing) return;
+          const wrap = document.createElement('div');
+          wrap.id = id;
+          wrap.style.position = 'fixed';
+          wrap.style.inset = '0';
+          wrap.style.border = '3px solid #f59e0b';
+          wrap.style.boxSizing = 'border-box';
+          wrap.style.pointerEvents = 'none';
+          wrap.style.zIndex = '2147483645';
+          const badge = document.createElement('div');
+          badge.textContent = 'LEARNING/HANDOFF';
+          badge.style.position = 'fixed';
+          badge.style.top = '10px';
+          badge.style.right = '12px';
+          badge.style.padding = '4px 8px';
+          badge.style.borderRadius = '999px';
+          badge.style.font = '11px/1.2 monospace';
+          badge.style.color = '#111';
+          badge.style.background = 'rgba(245,158,11,0.95)';
+          badge.style.pointerEvents = 'none';
+          wrap.appendChild(badge);
+          document.documentElement.appendChild(wrap);
+        }
+        """,
+        [enabled],
+    )
+
+
 def _session_state_payload(
     session: WebSession | None,
     *,
     override_controlled: bool | None = None,
     override_state: str | None = None,
+    learning_active: bool = False,
 ) -> dict[str, Any]:
     if session is None:
         return {}
@@ -1849,6 +2927,8 @@ def _session_state_payload(
         "title": session.title,
         "controlled": session.controlled if override_controlled is None else override_controlled,
         "state": session.state if override_state is None else override_state,
+        "learning_active": bool(learning_active),
+        "observer_noise_mode": _observer_noise_mode(),
         "last_seen_at": session.last_seen_at,
         "control_port": control_port,
         "control_url": f"http://127.0.0.1:{control_port}" if control_port > 0 else "",
@@ -1862,6 +2942,30 @@ def _update_top_bar_state(page: Any, payload: dict[str, Any]) -> None:
 
 def _destroy_top_bar(page: Any) -> None:
     page.evaluate("() => window.__bridgeDestroyTopBar?.()")
+
+
+def _notify_learning_state(session: WebSession | None, *, active: bool, window_seconds: int) -> None:
+    if session is None:
+        return
+    port = int(session.control_port or 0)
+    if port <= 0:
+        return
+    payload = {
+        "type": "learning_on" if active else "learning_off",
+        "window_seconds": int(max(1, min(600, window_seconds))),
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/event",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2.0):
+            return
+    except Exception:
+        return
 
 
 def _same_origin_path(current_url: str, target_url: str) -> bool:

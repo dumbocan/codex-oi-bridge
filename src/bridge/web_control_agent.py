@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import time
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,11 +31,28 @@ class _AgentRuntime:
         self._ack_count = 0
         self._last_ack_at = ""
         self._last_ack_by = ""
+        self._learning_active_until = 0.0
 
     def record_event(self, payload: dict[str, Any]) -> None:
         event_type = str(payload.get("type", "")).strip().lower() or "unknown"
+        if event_type == "learning_on":
+            seconds = float(payload.get("window_seconds", 25) or 25)
+            self.set_learning_active(seconds=max(1.0, min(600.0, seconds)))
+            return
+        if event_type == "learning_off":
+            self.set_learning_inactive()
+            return
         message = str(payload.get("message", ""))[:400]
         status = int(payload.get("status", 0) or 0)
+        noise_mode = _observer_noise_mode()
+        controlled = bool(payload.get("controlled", False))
+        learning_active = bool(payload.get("learning_active", False)) or self._learning_active()
+        if noise_mode == "minimal" and not controlled and not learning_active and event_type in {
+            "click",
+            "mousemove",
+            "scroll",
+        }:
+            return
         severity = self._event_severity(event_type, status, message)
         now = datetime.now(timezone.utc).isoformat()
         event = {
@@ -43,6 +62,11 @@ class _AgentRuntime:
             "url": str(payload.get("url", ""))[:300],
             "status": status,
             "target": str(payload.get("target", ""))[:180],
+            "selector": str(payload.get("selector", ""))[:240],
+            "text": str(payload.get("text", ""))[:240],
+            "x": int(payload.get("x", 0) or 0),
+            "y": int(payload.get("y", 0) or 0),
+            "scroll_y": int(payload.get("scroll_y", 0) or 0),
             "created_at": now,
         }
         with self._lock:
@@ -53,10 +77,24 @@ class _AgentRuntime:
                 reason = event["message"] or event["url"] or event_type
                 self._last_error = reason[:220]
 
+    def set_learning_active(self, seconds: float) -> None:
+        with self._lock:
+            self._learning_active_until = time.time() + float(seconds)
+
+    def set_learning_inactive(self) -> None:
+        with self._lock:
+            self._learning_active_until = 0.0
+
+    def _learning_active(self) -> bool:
+        with self._lock:
+            return time.time() < float(self._learning_active_until or 0.0)
+
     @staticmethod
     def _event_severity(event_type: str, status: int, message: str) -> str:
         low = message.lower().strip()
         if event_type == "click":
+            return "info"
+        if event_type in {"mousemove", "scroll"}:
             return "info"
         if event_type in {"network_warn", "console_warn"}:
             return "warn"
@@ -81,6 +119,9 @@ class _AgentRuntime:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            learning_active = self._learning_active_until > 0.0 and (
+                time.time() < float(self._learning_active_until)
+            )
             recent = list(self._events)[-12:]
             last_event_at = recent[-1]["created_at"] if recent else ""
             return {
@@ -90,12 +131,19 @@ class _AgentRuntime:
                 "ack_count": self._ack_count,
                 "last_ack_at": self._last_ack_at,
                 "last_ack_by": self._last_ack_by,
+                "learning_active": learning_active,
+                "observer_noise_mode": _observer_noise_mode(),
                 "last_event_at": last_event_at,
                 "recent_events": recent,
             }
 
 
 _RUNTIME = _AgentRuntime()
+
+
+def _observer_noise_mode() -> str:
+    raw = str(os.getenv("BRIDGE_OBSERVER_NOISE_MODE", "minimal")).strip().lower()
+    return "debug" if raw == "debug" else "minimal"
 
 
 def _session_payload(session: Any) -> dict[str, Any]:
@@ -187,6 +235,7 @@ def perform_session_action(session_id: str, action: str) -> tuple[dict[str, Any]
 
     if action_name == "release":
         mark_controlled(session, False)
+        _RUNTIME.set_learning_inactive()
         session = refresh_session_state(load_session(session_id))
         _update_overlay_state(session, controlled=False)
         payload = _session_payload(session)

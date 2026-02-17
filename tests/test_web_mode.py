@@ -2,6 +2,8 @@ import sys
 import tempfile
 import types
 import unittest
+import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +12,8 @@ from bridge.constants import WEB_ALLOWED_COMMAND_PREFIXES
 from bridge.models import OIReport
 from bridge.web_backend import (
     WebStep,
+    _is_relevant_manual_learning_event,
+    _observer_useful_event_count,
     _ensure_visual_overlay_ready,
     _execute_playwright,
     _install_visual_overlay,
@@ -64,6 +68,9 @@ class _FakeNode:
     def wait_for(self, state: str = "visible", timeout: int | None = None) -> None:
         if self._text and self._text == self._page.fail_wait_for_text:
             raise TimeoutError("Timeout exceeded while waiting for target")
+        if self._selector and self._page.fail_selector_contains:
+            if self._page.fail_selector_contains in self._selector:
+                raise TimeoutError("Timeout exceeded while waiting for selector")
         self._page.waited_text = self._text
 
     def is_visible(self, timeout: int | None = None) -> bool:
@@ -127,6 +134,7 @@ class _FakePage:
         fail_click_text: str = "",
         fail_wait_for_text: str = "",
         demo_button_available: bool = True,
+        fail_selector_contains: str = "",
     ):
         self._handlers = {}
         self.url = "about:blank"
@@ -135,6 +143,7 @@ class _FakePage:
         self.fail_click_text = fail_click_text
         self.fail_wait_for_text = fail_wait_for_text
         self.demo_button_available = demo_button_available
+        self.fail_selector_contains = fail_selector_contains
         self.waited_selector = ""
         self.waited_text = ""
         self.mouse = _FakeMouse(self)
@@ -475,7 +484,414 @@ class WebModeTests(unittest.TestCase):
         self.assertEqual(report.result, "failed")
         self.assertTrue(any("Timeout on interactive step" in item for item in report.console_errors))
         self.assertTrue(any("timeout on click_text:Reproducir" in item for item in report.ui_findings))
+        self.assertTrue(any("why_likely=" in item for item in report.ui_findings))
         self.assertTrue(any(path.endswith("_timeout.png") for path in report.evidence_paths))
+
+    def test_click_text_falls_back_to_stable_selector(self) -> None:
+        page = _FakePage(fail_wait_for_text="Stop", demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_text", "Stop")],
+                    run_dir,
+                    30,
+                    verified=False,
+                    teaching_mode=True,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertEqual(report.result, "partial")
+        self.assertTrue(any("stable selector fallback" in item for item in report.observations))
+
+    def test_teaching_mode_releases_control_and_writes_learning_artifact(self) -> None:
+        page = _FakePage(
+            fail_wait_for_text="Stop",
+            fail_selector_contains="Stop",
+            demo_button_available=False,
+        )
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-teach",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            learn_dir = Path(tmp) / "learn"
+            learn_json = learn_dir / "selectors.json"
+            learned_written = False
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"), patch(
+                    "bridge.web_backend._LEARNING_DIR", learn_dir
+                ), patch("bridge.web_backend._LEARNING_JSON", learn_json), patch(
+                    "bridge.web_backend.request_session_state",
+                    return_value={
+                        "recent_events": [
+                            {
+                                "type": "click",
+                                "selector": "#transport-stop",
+                                "target": "Stop",
+                                "url": "http://localhost:5173",
+                                "created_at": "2026-02-16T10:00:00+00:00",
+                                "message": "click Stop",
+                            }
+                        ]
+                    },
+                ):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("click_text", "Stop")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        session=session,
+                        teaching_mode=True,
+                    )
+                    learned_written = learn_json.exists()
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertEqual(report.result, "partial")
+        self.assertTrue(any("No encuentro el botón: Stop" in item for item in report.ui_findings))
+        self.assertTrue(any("control released" in item for item in report.ui_findings))
+        self.assertTrue(any("/learning/teaching_" in path for path in report.evidence_paths))
+        self.assertTrue(learned_written)
+        self.assertTrue(any("Gracias, ya he aprendido" in item for item in report.ui_findings))
+
+    def test_teaching_mode_stuck_triggers_release_and_human_assist_metadata(self) -> None:
+        page = _FakePage(
+            fail_wait_for_text="Stop",
+            fail_selector_contains="Stop",
+            demo_button_available=False,
+        )
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-stuck",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"), patch(
+                    "bridge.web_backend._capture_manual_learning", return_value=None
+                ), patch(
+                    "bridge.web_backend._apply_interactive_step_with_retries",
+                    return_value=types.SimpleNamespace(
+                        stuck=True, selector_used="", attempted="retry=0"
+                    ),
+                ):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("click_text", "Stop")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        session=session,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertEqual(report.result, "partial")
+        self.assertTrue(any("Me he atascado en" in item for item in report.ui_findings))
+        self.assertTrue(any("control released" in item for item in report.ui_findings))
+        self.assertTrue(any("what_failed=stuck" in item for item in report.ui_findings))
+        self.assertTrue(any("next_best_action=human_assist" in item for item in report.ui_findings))
+        self.assertTrue(any("teaching handoff: browser kept open" in item for item in report.ui_findings))
+        self.assertTrue(any("learning_capture=none" in item for item in report.ui_findings))
+        self.assertTrue(any("__bridge_learning_handoff_overlay" in script for script, _ in page.eval_calls))
+
+    def test_teaching_mode_watchdog_stuck_without_exception_triggers_handoff(self) -> None:
+        page = _FakePage(demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-watchdog",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+
+        def ticking() -> float:
+            ticking.t += 5.0
+            return ticking.t
+
+        ticking.t = 0.0
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"), patch(
+                    "bridge.web_backend._apply_interactive_step_with_retries",
+                    return_value=types.SimpleNamespace(stuck=False, selector_used="", attempted="noop"),
+                ), patch("bridge.web_backend.time.monotonic", side_effect=ticking), patch(
+                    "bridge.web_backend._capture_manual_learning", return_value=None
+                ), patch.dict(
+                    os.environ,
+                    {
+                        "BRIDGE_WEB_STUCK_INTERACTIVE_SECONDS": "3",
+                        "BRIDGE_WEB_STUCK_STEP_SECONDS": "6",
+                    },
+                    clear=False,
+                ):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("click_text", "Stop")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        session=session,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertEqual(report.result, "partial")
+        self.assertTrue(any("what_failed=stuck" in item for item in report.ui_findings))
+        self.assertTrue(any("next_best_action=human_assist" in item for item in report.ui_findings))
+        self.assertTrue(any("cmd: playwright release control (teaching handoff)" in item for item in report.actions))
+
+    def test_stuck_manual_learning_is_persisted(self) -> None:
+        page = _FakePage(
+            fail_wait_for_text="Stop",
+            fail_selector_contains="Stop",
+            demo_button_available=False,
+        )
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-stuck-learn",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            learn_dir = Path(tmp) / "learn"
+            learn_json = learn_dir / "selectors.json"
+            learned_payload = {}
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"), patch(
+                    "bridge.web_backend._LEARNING_DIR", learn_dir
+                ), patch("bridge.web_backend._LEARNING_JSON", learn_json), patch(
+                    "bridge.web_backend.time.monotonic", side_effect=[0.0, 13.5, 14.2]
+                ), patch(
+                    "bridge.web_backend._capture_manual_learning",
+                    return_value={
+                        "failed_target": "Stop",
+                        "selector": "#transport-stop",
+                        "target": "Stop",
+                        "timestamp": "2026-02-16T10:00:00+00:00",
+                        "url": "http://localhost:5173",
+                        "state_key": "localhost:5173/|demo",
+                    },
+                ):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("click_text", "Stop")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        session=session,
+                        teaching_mode=True,
+                    )
+                    if learn_json.exists():
+                        learned_payload = json.loads(learn_json.read_text(encoding="utf-8"))
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertTrue(learned_payload)
+        self.assertIn("localhost:5173/|demo", learned_payload)
+        self.assertIn("stop", learned_payload["localhost:5173/|demo"])
+        self.assertTrue(any("/learning/teaching_" in path for path in report.evidence_paths))
+
+    def test_next_run_uses_selector_learned_for_same_context(self) -> None:
+        page = _FakePage(
+            fail_wait_for_text="Stop",
+            fail_selector_contains="button:has-text(\"Stop\")",
+            demo_button_available=False,
+        )
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            learn_dir = Path(tmp) / "learn"
+            learn_dir.mkdir(parents=True, exist_ok=True)
+            learn_json = learn_dir / "selectors.json"
+            learn_json.write_text(
+                json.dumps({"localhost:5173/|demo": {"stop": ["#transport-stop"]}}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend._LEARNING_DIR", learn_dir), patch(
+                    "bridge.web_backend._LEARNING_JSON", learn_json
+                ):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("click_text", "Stop")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertTrue(any("cmd: playwright click selector:#transport-stop" in a for a in report.actions))
+
+    def test_learning_event_filter_ignores_bridge_controls(self) -> None:
+        self.assertFalse(
+            _is_relevant_manual_learning_event(
+                {"selector": "#__bridge_release_btn", "target": "Release", "text": "Release"},
+                "Stop",
+            )
+        )
+        self.assertTrue(
+            _is_relevant_manual_learning_event(
+                {"selector": "#transport-stop", "target": "Stop", "text": "Stop"},
+                "step 2/2 click_text:Stop",
+            )
+        )
 
     def test_web_actions_and_evidence_validations(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
@@ -733,6 +1149,10 @@ class WebModeTests(unittest.TestCase):
         self.assertNotIn("__bridgeSessionAction?.", script)
         self.assertIn("Clear incident", script)
         self.assertIn("wire(ackBtn, 'ack')", script)
+        self.assertIn("manual click captured", script)
+        self.assertIn("type: 'mousemove'", script)
+        self.assertIn("type: 'scroll'", script)
+        self.assertIn("observer_noise_mode", script)
 
     def test_top_bar_includes_slide_transition_and_offline_label(self) -> None:
         page = _FakePage()
@@ -749,6 +1169,8 @@ class WebModeTests(unittest.TestCase):
         self.assertIn("translateY(-110%)", script)
         self.assertIn("transform 210ms ease-out", script)
         self.assertIn("agent offline", script)
+        self.assertIn("USER CONTROL", script)
+        self.assertIn("LEARNING/HANDOFF", script)
         self.assertIn("network_warn", script)
         self.assertIn("READY FOR MANUAL TEST", script)
         self.assertIn("readyManual", script)
@@ -774,6 +1196,7 @@ class WebModeTests(unittest.TestCase):
         self.assertIn("readyManual", script)
         self.assertIn("rgba(59,167,255,0.22)", script)
         self.assertIn("rgba(255,82,82,0.26)", script)
+        self.assertIn("rgba(245,158,11,0.24)", script)
         self.assertIn("rgba(22,163,74,0.22)", script)
         self.assertIn("rgba(34,197,94,0.95)", script)
 
@@ -786,6 +1209,66 @@ class WebModeTests(unittest.TestCase):
         self.assertTrue(ctrl_idx != -1 and inc_idx != -1 and ready_idx != -1)
         self.assertLess(ctrl_idx, inc_idx)
         self.assertLess(inc_idx, ready_idx)
+
+    def test_observer_useful_events_ignore_trivial_in_minimal(self) -> None:
+        session = WebSession(
+            session_id="s-noise",
+            pid=1,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=False,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+        with patch(
+            "bridge.web_backend.request_session_state",
+            return_value={
+                "observer_noise_mode": "minimal",
+                "recent_events": [
+                    {"type": "mousemove"},
+                    {"type": "scroll"},
+                    {"type": "click"},
+                    {"type": "console_error"},
+                ],
+            },
+        ):
+            self.assertEqual(_observer_useful_event_count(session), 2)
+
+    def test_observer_useful_events_include_scroll_move_in_debug(self) -> None:
+        session = WebSession(
+            session_id="s-noise-debug",
+            pid=1,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=False,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+        with patch(
+            "bridge.web_backend.request_session_state",
+            return_value={
+                "observer_noise_mode": "debug",
+                "recent_events": [
+                    {"type": "mousemove"},
+                    {"type": "scroll"},
+                    {"type": "click"},
+                    {"type": "console_error"},
+                ],
+            },
+        ):
+            self.assertEqual(_observer_useful_event_count(session), 4)
 
     def test_web_open_can_inject_top_bar_without_web_run(self) -> None:
         page = _FakePage()

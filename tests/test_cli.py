@@ -252,6 +252,7 @@ class CLITests(unittest.TestCase):
                 visual_click_hold_ms=180,
                 session=None,
                 keep_open=False,
+                teaching_mode=False,
             ):
                 progress_cb(1, 1, "web step 1/1: click_text")
                 return OIReport(
@@ -295,6 +296,92 @@ class CLITests(unittest.TestCase):
             final_status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertEqual(final_status["state"], "completed")
             self.assertEqual(final_status["result"], "success")
+
+    def test_run_command_stuck_partial_finishes_completed_state(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r2s"
+            run_dir.mkdir(parents=True)
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "step_1_before.png").write_bytes(b"png")
+            ctx = type(
+                "RunContext",
+                (),
+                {
+                    "run_id": "r2s",
+                    "run_dir": run_dir,
+                    "bridge_log": run_dir / "bridge.log",
+                    "stdout_log": run_dir / "oi_stdout.log",
+                    "stderr_log": run_dir / "oi_stderr.log",
+                    "report_path": run_dir / "report.json",
+                },
+            )()
+            status_path = Path(tmp) / "status.json"
+            snapshots: list[dict] = []
+
+            def fake_write_status(**kwargs):
+                snapshots.append(dict(kwargs))
+                status_path.write_text(json.dumps(kwargs, default=str), encoding="utf-8")
+
+            def fake_run_web_task(*_args, **_kwargs):
+                return OIReport(
+                    task_id="r2s",
+                    goal="web: http://localhost:5173",
+                    actions=[
+                        "cmd: playwright goto http://localhost:5173",
+                        "cmd: playwright release control (teaching handoff)",
+                    ],
+                    observations=["Opened URL"],
+                    console_errors=[],
+                    network_findings=[],
+                    ui_findings=[
+                        "what_failed=stuck",
+                        "where=step 1/1 click_text:Stop",
+                        "attempted=retry=0",
+                        "next_best_action=human_assist",
+                    ],
+                    result="partial",
+                    evidence_paths=[str((evidence / "step_1_before.png").resolve().relative_to(Path.cwd()))],
+                )
+            session = WebSession(
+                session_id="teach-partial",
+                pid=101,
+                port=9222,
+                user_data_dir="/tmp/x",
+                browser_binary="/usr/bin/chromium",
+                url="about:blank",
+                title="",
+                controlled=False,
+                created_at="2026-01-01T00:00:00+00:00",
+                last_seen_at="2026-01-01T00:00:00+00:00",
+                state="open",
+            )
+
+            with patch("bridge.cli.create_run_context", return_value=ctx), patch(
+                "bridge.cli._preflight_runtime"
+            ), patch("bridge.cli.require_sensitive_confirmation"), patch(
+                "bridge.cli.write_status",
+                side_effect=fake_write_status,
+            ), patch(
+                "bridge.cli.run_web_task",
+                side_effect=fake_run_web_task,
+            ), patch(
+                "bridge.cli.create_session", return_value=session
+            ), patch(
+                "bridge.cli.mark_controlled"
+            ):
+                with redirect_stdout(io.StringIO()):
+                    run_command(
+                        "abre http://localhost:5173 y haz click en 'Stop'",
+                        confirm_sensitive=True,
+                        mode="web",
+                        teaching_mode=True,
+                    )
+
+            self.assertTrue(any(item.get("state") == "running" for item in snapshots))
+            final_status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(final_status["state"], "completed")
+            self.assertEqual(final_status["result"], "partial")
 
     def test_run_command_timeout_error_closes_failed_report_and_status(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:

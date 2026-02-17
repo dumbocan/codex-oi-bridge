@@ -141,6 +141,7 @@ def main() -> None:
             visual_click_hold_ms=args.visual_click_hold_ms,
             attach_session_id=args.attach,
             keep_open=args.keep_open,
+            teaching_mode=args.teaching,
         )
         return
     if args.command == "gui-run":
@@ -167,6 +168,7 @@ def main() -> None:
             visual_click_hold_ms=args.visual_click_hold_ms,
             attach_session_id=args.attach,
             keep_open=args.keep_open,
+            teaching_mode=args.teaching,
         )
         return
     if args.command == "web-open":
@@ -277,6 +279,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep web browser open after run (web mode only).",
     )
+    run_parser.add_argument(
+        "--teaching",
+        action="store_true",
+        help="Enable teaching mode for web runs (retry+handoff+learning).",
+    )
     _add_visual_flags(run_parser)
 
     gui_run_parser = subparsers.add_parser(
@@ -324,6 +331,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-open",
         action="store_true",
         help="Keep browser open after run.",
+    )
+    web_run_parser.add_argument(
+        "--teaching",
+        action="store_true",
+        help="Enable teaching mode (retry+handoff+learning).",
     )
     _add_visual_flags(web_run_parser)
 
@@ -413,6 +425,7 @@ def run_command(
     visual_click_hold_ms: int = 180,
     attach_session_id: str | None = None,
     keep_open: bool = False,
+    teaching_mode: bool = False,
 ) -> None:
     ctx = None
     active_web_session = None
@@ -476,7 +489,7 @@ def run_command(
                         "Attached session is not alive; run web-open again. "
                         f"session_id={attach_session_id}"
                     )
-            elif keep_open:
+            elif keep_open or teaching_mode:
                 session = create_session()
                 created_session_here = True
             active_web_session = session
@@ -512,6 +525,7 @@ def run_command(
                 visual_click_hold_ms=visual_click_hold_ms,
                 session=session,
                 keep_open=keep_open,
+                teaching_mode=teaching_mode,
             )
             if session is not None:
                 mark_controlled(session, False)
@@ -542,6 +556,7 @@ def run_command(
                     "visual_click_hold_ms": visual_click_hold_ms,
                     "attach_session_id": session.session_id if session else None,
                     "keep_open": keep_open,
+                    "teaching_mode": teaching_mode,
                 },
             )
             if created_session_here and session is not None:

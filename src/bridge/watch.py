@@ -47,6 +47,10 @@ def _format_event_line(evt: dict[str, object]) -> str:
     etype = str(evt.get("type", "") or "unknown").strip()
     sev = str(evt.get("severity", "") or "info").strip().lower()
     target = str(evt.get("target", "") or "").strip()
+    selector = str(evt.get("selector", "") or "").strip()
+    x = int(evt.get("x", 0) or 0)
+    y = int(evt.get("y", 0) or 0)
+    scroll_y = int(evt.get("scroll_y", 0) or 0)
     url = str(evt.get("url", "") or "").strip()
     msg = str(evt.get("message", "") or "").strip()
     status = int(evt.get("status", 0) or 0)
@@ -69,9 +73,15 @@ def _format_event_line(evt: dict[str, object]) -> str:
         parts = [f"{t} click"]
         if target:
             parts.append(f'target="{target}"')
+        if selector:
+            parts.append(f"selector={selector}")
         if url:
             parts.append(f"url={url}")
         return " ".join(parts)
+    if etype == "mousemove":
+        return f"{t} mousemove x={x} y={y}"
+    if etype == "scroll":
+        return f"{t} scroll y={scroll_y}"
 
     if msg:
         return f"{t} {etype} {msg}"
