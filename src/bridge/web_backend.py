@@ -17,7 +17,12 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from bridge.models import OIReport
-from bridge.web_session import WebSession, mark_controlled, request_session_state
+from bridge.storage import write_json, write_status
+from bridge.web_session import (
+    WebSession,
+    mark_controlled,
+    request_session_state,
+)
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
@@ -118,25 +123,66 @@ def run_web_task(
             "Install it in the environment to use --mode web."
         )
 
-    return _execute_playwright(
-        url,
-        steps,
-        run_dir,
-        timeout_seconds,
-        verified=verified,
-        progress_cb=progress_cb,
-        visual=visual,
-        visual_cursor=visual_cursor,
-        visual_click_pulse=visual_click_pulse,
-        visual_scale=visual_scale,
-        visual_color=visual_color,
-        visual_human_mouse=visual_human_mouse,
-        visual_mouse_speed=visual_mouse_speed,
-        visual_click_hold_ms=visual_click_hold_ms,
-        session=session,
-        keep_open=keep_open,
-        teaching_mode=teaching_mode,
-    )
+    report: OIReport | None = None
+    try:
+        report = _execute_playwright(
+            url,
+            steps,
+            run_dir,
+            timeout_seconds,
+            verified=verified,
+            progress_cb=progress_cb,
+            visual=visual,
+            visual_cursor=visual_cursor,
+            visual_click_pulse=visual_click_pulse,
+            visual_scale=visual_scale,
+            visual_color=visual_color,
+            visual_human_mouse=visual_human_mouse,
+            visual_mouse_speed=visual_mouse_speed,
+            visual_click_hold_ms=visual_click_hold_ms,
+            session=session,
+            keep_open=keep_open,
+            teaching_mode=teaching_mode,
+        )
+    except BaseException as exc:
+        msg = str(exc) or exc.__class__.__name__
+        report = OIReport(
+            task_id=run_dir.name,
+            goal=f"web: {url}",
+            actions=[],
+            observations=["web executor aborted before completion"],
+            console_errors=[f"Unhandled web execution error: {msg}"],
+            network_findings=[],
+            ui_findings=[
+                "what_failed=run_crash",
+                "where=web-run",
+                f"why_likely={msg}",
+                "attempted=executor run",
+                "next_best_action=inspect logs and retry",
+                "final_state=failed",
+            ],
+            result="failed",
+            evidence_paths=[],
+        )
+    finally:
+        if report is not None:
+            try:
+                write_json(run_dir / "report.json", report.to_dict())
+            except Exception:
+                pass
+            try:
+                write_status(
+                    run_id=run_dir.name,
+                    run_dir=run_dir,
+                    task=task,
+                    result=report.result,
+                    state="completed",
+                    report_path=run_dir / "report.json",
+                    progress="web run finalized",
+                )
+            except Exception:
+                pass
+    return report
 
 
 def _preflight_target_reachable(url: str, timeout_seconds: float = 1.2) -> None:
@@ -348,6 +394,33 @@ def _safe_page_title(page: object) -> str:
         return ""
 
 
+def _page_is_closed(page: Any | None) -> bool:
+    if page is None:
+        return True
+    checker = getattr(page, "is_closed", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return True
+    return False
+
+
+def _is_page_closed_error(exc: BaseException) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "target page" in msg and "closed" in msg
+    ) or "context or browser has been closed" in msg or "page closed" in msg
+
+
+def _runtime_closed(page: Any | None, session: WebSession | None) -> bool:
+    if _page_is_closed(page):
+        return True
+    if session is None:
+        return False
+    return str(getattr(session, "state", "open")).strip().lower() == "closed"
+
+
 def _execute_playwright(
     url: str,
     steps: list[WebStep],
@@ -390,13 +463,23 @@ def _execute_playwright(
     handoff_where = ""
     handoff_attempted = ""
     failed_target_for_teaching = ""
+    learning_iframe_guard: dict[str, Any] | None = None
     page = None
     interactive_timeout_ms = 8000
     learned_selector_map = _load_learned_selectors()
     current_step_signature = ""
+    current_learning_target = ""
     last_step_change_ts = time.monotonic()
     last_progress_event_ts = last_step_change_ts
     last_useful_events = 0
+    step_hard_timeout_seconds = max(
+        0.1, float(os.getenv("BRIDGE_WEB_STEP_HARD_TIMEOUT_SECONDS", "20") or "20")
+    )
+    run_hard_timeout_seconds = max(
+        0.1, float(os.getenv("BRIDGE_WEB_RUN_HARD_TIMEOUT_SECONDS", "120") or "120")
+    )
+    run_started_at = time.monotonic()
+    run_deadline_ts = run_started_at + run_hard_timeout_seconds
 
     with sync_playwright() as p:
         browser = None
@@ -470,6 +553,19 @@ def _execute_playwright(
         interactive_timeout_ms = max(1000, min(60000, interactive_timeout_ms))
         stuck_interactive_seconds = float(os.getenv("BRIDGE_WEB_STUCK_INTERACTIVE_SECONDS", "12"))
         stuck_step_seconds = float(os.getenv("BRIDGE_WEB_STUCK_STEP_SECONDS", "20"))
+        stuck_iframe_seconds = float(os.getenv("BRIDGE_WEB_STUCK_IFRAME_SECONDS", "8"))
+        try:
+            page.set_default_timeout(
+                max(
+                    1000,
+                    min(
+                        int(timeout_seconds * 1000),
+                        int(run_hard_timeout_seconds * 1000),
+                    ),
+                )
+            )
+        except Exception:
+            pass
         last_useful_events = _observer_useful_event_count(session)
         try:
             learning_context = _learning_context(url, "")
@@ -562,6 +658,31 @@ def _execute_playwright(
                 now = time.monotonic()
                 if (
                     current_step_signature
+                    and (now - last_progress_event_ts) > max(0.1, stuck_iframe_seconds)
+                    and _is_iframe_focus_locked(page)
+                ):
+                    handoff_reason = "stuck_iframe_focus"
+                    handoff_where = current_step_signature
+                    handoff_attempted = f"{attempted}, iframe_focus>{stuck_iframe_seconds}s"
+                    failed_target_for_teaching = current_learning_target
+                    force_keep_open = True
+                    wait_for_human_learning = False
+                    release_for_handoff = True
+                    _show_custom_handoff_notice(
+                        page, "Me he quedado dentro de YouTube iframe. Te cedo el control."
+                    )
+                    ui_findings.append("Me he quedado dentro de YouTube iframe. Te cedo el control.")
+                    ui_findings.append("what_failed=stuck_iframe_focus")
+                    ui_findings.append(f"where={handoff_where}")
+                    ui_findings.append(
+                        "why_likely=focus/cursor remained in iframe without useful progress"
+                    )
+                    ui_findings.append(f"attempted={handoff_attempted}")
+                    ui_findings.append("next_best_action=human_assist")
+                    result = "partial"
+                    return True
+                if (
+                    current_step_signature
                     and (now - last_step_change_ts) > max(0.1, stuck_step_seconds)
                 ) or (
                     current_step_signature
@@ -570,7 +691,7 @@ def _execute_playwright(
                     handoff_reason = "stuck"
                     handoff_where = current_step_signature
                     handoff_attempted = attempted
-                    failed_target_for_teaching = current_step_signature
+                    failed_target_for_teaching = current_learning_target
                     force_keep_open = True
                     wait_for_human_learning = True
                     release_for_handoff = False
@@ -591,6 +712,55 @@ def _execute_playwright(
                     return True
                 return False
 
+            def _remaining_ms(deadline_ts: float) -> int:
+                return int(max(0.0, deadline_ts - time.monotonic()) * 1000)
+
+            def _trigger_timeout_handoff(
+                *,
+                what_failed: str,
+                where: str,
+                learning_target: str,
+                attempted: str,
+                why_likely: str,
+                notice_message: str,
+            ) -> bool:
+                nonlocal handoff_reason, handoff_where, handoff_attempted
+                nonlocal force_keep_open, wait_for_human_learning, failed_target_for_teaching
+                nonlocal control_enabled, result, release_for_handoff
+                handoff_reason = what_failed
+                handoff_where = where
+                handoff_attempted = attempted
+                failed_target_for_teaching = (
+                    learning_target if _is_learning_target_candidate(learning_target) else ""
+                )
+                force_keep_open = True
+                wait_for_human_learning = True
+                release_for_handoff = False
+                if teaching_mode:
+                    control_enabled = _trigger_stuck_handoff(
+                        page=page,
+                        session=session,
+                        visual=visual,
+                        control_enabled=control_enabled,
+                        where=where,
+                        attempted=attempted,
+                        learning_window_seconds=int(float(os.getenv("BRIDGE_LEARNING_WINDOW_SECONDS", "25"))),
+                        actions=actions,
+                        ui_findings=ui_findings,
+                        what_failed=what_failed,
+                        notice_message=notice_message,
+                        why_likely=why_likely,
+                    )
+                    result = "partial"
+                    return True
+                ui_findings.append(f"what_failed={what_failed}")
+                ui_findings.append(f"where={where}")
+                ui_findings.append(f"why_likely={why_likely}")
+                ui_findings.append(f"attempted={attempted}")
+                ui_findings.append("next_best_action=inspect logs and retry")
+                result = "failed"
+                return True
+
             interactive_step = 0
             total = len(steps)
             for idx, step in enumerate(steps, start=1):
@@ -600,6 +770,42 @@ def _execute_playwright(
                     current_step_signature = step_sig
                     last_step_change_ts = time.monotonic()
                     last_progress_event_ts = last_step_change_ts
+                current_learning_target = (
+                    str(step.target).strip()
+                    if step.kind in {"click_selector", "click_text", "maybe_click_text", "select_label", "select_value"}
+                    else ""
+                )
+                if _runtime_closed(page, session):
+                    result = "failed"
+                    ui_findings.append("what_failed=run_crash")
+                    ui_findings.append("where=web-run")
+                    ui_findings.append("why_likely=page_or_context_closed")
+                    ui_findings.append("attempted=executor run")
+                    ui_findings.append("next_best_action=reopen session and retry")
+                    break
+                if time.monotonic() > run_deadline_ts:
+                    if _trigger_timeout_handoff(
+                        what_failed="run_timeout",
+                        where=current_step_signature or "web-run",
+                        learning_target="",
+                        attempted="run hard timeout exceeded",
+                        why_likely=(
+                            "run exceeded BRIDGE_WEB_RUN_HARD_TIMEOUT_SECONDS without completing all steps"
+                        ),
+                        notice_message="He excedido el tiempo máximo del run. Te cedo el control.",
+                    ):
+                        break
+                try:
+                    step_budget_ms = max(
+                        800,
+                        min(
+                            int(step_hard_timeout_seconds * 1000),
+                            _remaining_ms(run_deadline_ts),
+                        ),
+                    )
+                    page.set_default_timeout(step_budget_ms)
+                except Exception:
+                    pass
                 if teaching_mode and _watchdog_stuck_attempt("watchdog:loop"):
                     break
                 if progress_cb:
@@ -622,6 +828,43 @@ def _execute_playwright(
                     "select_label",
                     "select_value",
                 ):
+                    step_started_at = time.monotonic()
+                    step_deadline_ts = step_started_at + step_hard_timeout_seconds
+                    if min(_remaining_ms(step_deadline_ts), _remaining_ms(run_deadline_ts)) <= 0:
+                        if _trigger_timeout_handoff(
+                            what_failed="interactive_timeout",
+                            where=current_step_signature or f"step {idx}/{total}",
+                            learning_target=step.target,
+                            attempted="step hard timeout precheck",
+                            why_likely=(
+                                "interactive step exceeded BRIDGE_WEB_STEP_HARD_TIMEOUT_SECONDS before execution"
+                            ),
+                            notice_message="El paso interactivo superó el tiempo límite. Te cedo el control.",
+                        ):
+                            break
+                    if not _force_main_frame_context(page):
+                        if teaching_mode:
+                            force_keep_open = True
+                            wait_for_human_learning = False
+                            handoff_reason = "stuck_iframe_focus"
+                            handoff_where = current_step_signature
+                            handoff_attempted = "main-frame-first precheck failed"
+                            failed_target_for_teaching = step.target
+                            release_for_handoff = True
+                            _show_custom_handoff_notice(
+                                page, "Me he quedado dentro de YouTube iframe. Te cedo el control."
+                            )
+                            ui_findings.append("Me he quedado dentro de YouTube iframe. Te cedo el control.")
+                            ui_findings.append("what_failed=stuck_iframe_focus")
+                            ui_findings.append(f"where={handoff_where}")
+                            ui_findings.append(
+                                "why_likely=unable to return focus/context to main frame before interactive action"
+                            )
+                            ui_findings.append(f"attempted={handoff_attempted}")
+                            ui_findings.append("next_best_action=human_assist")
+                            result = "partial"
+                            break
+                        raise RuntimeError("Unable to return to main frame context before interactive step")
                     interactive_step += 1
                     before = evidence_dir / f"step_{interactive_step}_before.png"
                     after = evidence_dir / f"step_{interactive_step}_after.png"
@@ -630,6 +873,25 @@ def _execute_playwright(
                     prev_action_len = len(actions)
                     attempted_hint = ""
                     try:
+                        effective_timeout_ms = min(
+                            interactive_timeout_ms,
+                            max(250, _remaining_ms(step_deadline_ts)),
+                            max(250, _remaining_ms(run_deadline_ts)),
+                        )
+                        if effective_timeout_ms <= 250 and (
+                            _remaining_ms(step_deadline_ts) <= 0 or _remaining_ms(run_deadline_ts) <= 0
+                        ):
+                            if _trigger_timeout_handoff(
+                                what_failed="interactive_timeout",
+                                where=current_step_signature or f"step {idx}/{total}",
+                                learning_target=step.target,
+                                attempted="step hard timeout in interactive execution",
+                                why_likely=(
+                                    "interactive action budget exhausted before action started"
+                                ),
+                                notice_message="El paso interactivo superó el tiempo límite. Te cedo el control.",
+                            ):
+                                break
                         if teaching_mode:
                             retry_result = _apply_interactive_step_with_retries(
                                 page,
@@ -645,7 +907,7 @@ def _execute_playwright(
                                 visual_human_mouse=visual_human_mouse,
                                 visual_mouse_speed=visual_mouse_speed,
                                 visual_click_hold_ms=visual_click_hold_ms,
-                                timeout_ms=interactive_timeout_ms,
+                                timeout_ms=effective_timeout_ms,
                                 max_retries=2,
                                 learning_selectors=_learned_selectors_for_step(
                                     step, learned_selector_map, learning_context
@@ -656,7 +918,21 @@ def _execute_playwright(
                                     os.getenv("BRIDGE_WEB_STUCK_INTERACTIVE_SECONDS", "12")
                                 ),
                                 stuck_step_seconds=float(os.getenv("BRIDGE_WEB_STUCK_STEP_SECONDS", "20")),
+                                step_deadline_ts=step_deadline_ts,
+                                run_deadline_ts=run_deadline_ts,
                             )
+                            if bool(getattr(retry_result, "deadline_hit", False)):
+                                if _trigger_timeout_handoff(
+                                    what_failed="interactive_timeout",
+                                    where=current_step_signature or f"step {idx}/{total}",
+                                    learning_target=step.target,
+                                    attempted=retry_result.attempted or "step hard timeout",
+                                    why_likely=(
+                                        "interactive retries exceeded hard timeout without completing action"
+                                    ),
+                                    notice_message="El paso interactivo superó el tiempo límite. Te cedo el control.",
+                                ):
+                                    break
                             if retry_result.stuck:
                                 force_keep_open = True
                                 wait_for_human_learning = True
@@ -704,9 +980,17 @@ def _execute_playwright(
                                 visual_human_mouse=visual_human_mouse,
                                 visual_mouse_speed=visual_mouse_speed,
                                 visual_click_hold_ms=visual_click_hold_ms,
-                                timeout_ms=interactive_timeout_ms,
+                                timeout_ms=effective_timeout_ms,
                             )
                     except Exception as exc:
+                        if _is_page_closed_error(exc) or _runtime_closed(page, session):
+                            result = "failed"
+                            ui_findings.append("what_failed=run_crash")
+                            ui_findings.append("where=web-run")
+                            ui_findings.append("why_likely=page_or_context_closed")
+                            ui_findings.append("attempted=executor run")
+                            ui_findings.append("next_best_action=reopen session and retry")
+                            break
                         if teaching_mode and step.kind in ("click_text", "click_selector"):
                             force_keep_open = True
                             release_for_handoff = True
@@ -754,7 +1038,7 @@ def _execute_playwright(
                             result = "failed"
                             break
                         raise
-                    if handoff_reason == "stuck":
+                    if handoff_reason in {"stuck", "stuck_iframe_focus"}:
                         break
                     if len(actions) > prev_action_len:
                         last_progress_event_ts = time.monotonic()
@@ -774,6 +1058,48 @@ def _execute_playwright(
                     continue
 
                 try:
+                    step_started_at = time.monotonic()
+                    step_deadline_ts = step_started_at + step_hard_timeout_seconds
+                    effective_wait_timeout_ms = min(
+                        wait_timeout_ms,
+                        max(250, _remaining_ms(step_deadline_ts)),
+                        max(250, _remaining_ms(run_deadline_ts)),
+                    )
+                    if effective_wait_timeout_ms <= 250 and (
+                        _remaining_ms(step_deadline_ts) <= 0 or _remaining_ms(run_deadline_ts) <= 0
+                    ):
+                        if _trigger_timeout_handoff(
+                            what_failed="interactive_timeout",
+                            where=current_step_signature or f"step {idx}/{total}",
+                            learning_target=step.target,
+                            attempted="step hard timeout before wait",
+                            why_likely="wait step deadline exceeded before operation",
+                            notice_message="El paso superó el tiempo límite. Te cedo el control.",
+                        ):
+                            break
+                    if not _force_main_frame_context(page):
+                        if teaching_mode:
+                            force_keep_open = True
+                            wait_for_human_learning = False
+                            handoff_reason = "stuck_iframe_focus"
+                            handoff_where = current_step_signature
+                            handoff_attempted = "main-frame-first precheck failed"
+                            failed_target_for_teaching = step.target
+                            release_for_handoff = True
+                            _show_custom_handoff_notice(
+                                page, "Me he quedado dentro de YouTube iframe. Te cedo el control."
+                            )
+                            ui_findings.append("Me he quedado dentro de YouTube iframe. Te cedo el control.")
+                            ui_findings.append("what_failed=stuck_iframe_focus")
+                            ui_findings.append(f"where={handoff_where}")
+                            ui_findings.append(
+                                "why_likely=unable to return focus/context to main frame before wait step"
+                            )
+                            ui_findings.append(f"attempted={handoff_attempted}")
+                            ui_findings.append("next_best_action=human_assist")
+                            result = "partial"
+                            break
+                        raise RuntimeError("Unable to return to main frame context before wait step")
                     _apply_wait_step(
                         page,
                         step,
@@ -781,10 +1107,26 @@ def _execute_playwright(
                         actions,
                         observations,
                         ui_findings,
-                        timeout_ms=wait_timeout_ms,
+                        timeout_ms=effective_wait_timeout_ms,
                     )
                 except Exception as exc:
+                    if _is_page_closed_error(exc) or _runtime_closed(page, session):
+                        result = "failed"
+                        ui_findings.append("what_failed=run_crash")
+                        ui_findings.append("where=web-run")
+                        ui_findings.append("why_likely=page_or_context_closed")
+                        ui_findings.append("attempted=executor run")
+                        ui_findings.append("next_best_action=reopen session and retry")
+                        break
                     if _is_timeout_error(exc):
+                        if _should_soft_skip_wait_timeout(steps=steps, idx=idx, step=step, teaching_mode=teaching_mode):
+                            observations.append(
+                                "teaching wait soft-skip: timed out on wait_text but next step is Stop"
+                            )
+                            ui_findings.append(
+                                f"step {idx} soft-skip wait timeout on {step.kind}:{step.target} (teaching)"
+                            )
+                            continue
                         timeout_path = evidence_dir / f"step_{idx}_timeout.png"
                         try:
                             page.screenshot(path=str(timeout_path), full_page=True)
@@ -832,6 +1174,8 @@ def _execute_playwright(
                     _set_assistant_control_overlay(page, False)
                     if wait_for_human_learning:
                         _set_learning_handoff_overlay(page, True)
+                    else:
+                        _set_user_control_overlay(page, True)
                     _update_top_bar_state(
                         page,
                         _session_state_payload(
@@ -846,6 +1190,20 @@ def _execute_playwright(
                     ui_findings.append("control released")
             if wait_for_human_learning:
                 learn = None
+                if session is not None:
+                    _notify_learning_state(
+                        session,
+                        active=True,
+                        window_seconds=int(float(os.getenv("BRIDGE_LEARNING_WINDOW_SECONDS", "25"))),
+                    )
+                    try:
+                        _update_top_bar_state(
+                            page,
+                            _session_state_payload(session, override_controlled=False, learning_active=True),
+                        )
+                    except Exception:
+                        pass
+                learning_iframe_guard = _disable_active_youtube_iframe_pointer_events(page)
                 if session is not None:
                     learn = _capture_manual_learning(
                         page=page,
@@ -893,6 +1251,8 @@ def _execute_playwright(
                 else:
                     ui_findings.append("learning_capture=none")
                 _set_learning_handoff_overlay(page, False)
+                _restore_iframe_pointer_events(page, learning_iframe_guard)
+                learning_iframe_guard = None
                 if session is not None:
                     _notify_learning_state(session, active=False, window_seconds=1)
                     try:
@@ -903,6 +1263,10 @@ def _execute_playwright(
                     except Exception:
                         pass
         finally:
+            try:
+                _restore_iframe_pointer_events(page, learning_iframe_guard)
+            except Exception:
+                pass
             try:
                 _set_learning_handoff_overlay(page, False)
             except Exception:
@@ -926,7 +1290,17 @@ def _execute_playwright(
     if result != "failed" and (console_errors or network_findings):
         result = "partial"
     if verified and steps and not ui_findings:
-        raise SystemExit("Verified web mode requires post-step visible verification findings.")
+        result = "failed"
+        ui_findings.append("what_failed=verified_mode_missing_findings")
+        ui_findings.append("where=post-run")
+        ui_findings.append("why_likely=verified mode requires explicit visible verification findings")
+        ui_findings.append("attempted=verified post-check")
+        ui_findings.append("next_best_action=add verify visible result findings")
+    _ensure_structured_ui_findings(
+        ui_findings,
+        result=result,
+        where_default=current_step_signature or "web-run",
+    )
 
     return OIReport(
         task_id=run_dir.name,
@@ -941,11 +1315,43 @@ def _execute_playwright(
     )
 
 
+def _ensure_structured_ui_findings(
+    ui_findings: list[str],
+    *,
+    result: str,
+    where_default: str,
+) -> None:
+    keys = ("what_failed=", "where=", "why_likely=", "attempted=", "next_best_action=")
+    has = {k: any(str(item).startswith(k) for item in ui_findings) for k in keys}
+    if result == "success":
+        defaults = {
+            "what_failed=": "none",
+            "where=": "n/a",
+            "why_likely=": "n/a",
+            "attempted=": "normal execution",
+            "next_best_action=": "none",
+        }
+    else:
+        defaults = {
+            "what_failed=": "unknown",
+            "where=": where_default or "web-run",
+            "why_likely=": "run ended without explicit failure classification",
+            "attempted=": "executor run",
+            "next_best_action=": "inspect report/logs and retry",
+        }
+    for key in keys:
+        if not has[key]:
+            ui_findings.append(f"{key}{defaults[key]}")
+    if not any(str(item).startswith("final_state=") for item in ui_findings):
+        ui_findings.append(f"final_state={result}")
+
+
 @dataclass(frozen=True)
 class _RetryResult:
     selector_used: str = ""
     stuck: bool = False
     attempted: str = ""
+    deadline_hit: bool = False
 
 
 def _apply_interactive_step_with_retries(
@@ -970,6 +1376,8 @@ def _apply_interactive_step_with_retries(
     step_label: str,
     stuck_interactive_seconds: float,
     stuck_step_seconds: float,
+    step_deadline_ts: float,
+    run_deadline_ts: float,
 ) -> _RetryResult:
     candidates: list[WebStep] = [step]
     if step.kind == "click_text":
@@ -980,6 +1388,10 @@ def _apply_interactive_step_with_retries(
     elif step.kind == "click_selector":
         for selector in learning_selectors:
             candidates.insert(0, WebStep("click_selector", selector))
+        for hint in _semantic_hints_for_selector(step.target):
+            candidates.append(WebStep("click_text", hint))
+            for selector in _stable_selectors_for_target(hint):
+                candidates.append(WebStep("click_selector", selector))
 
     last_exc: Exception | None = None
     total_attempts = max(1, int(max_retries) + 1)
@@ -987,6 +1399,10 @@ def _apply_interactive_step_with_retries(
     baseline_events = _observer_useful_event_count(session)
     attempted_parts: list[str] = []
     for attempt in range(1, total_attempts + 1):
+        now = time.monotonic()
+        if now > step_deadline_ts or now > run_deadline_ts:
+            attempted = ", ".join((attempted_parts + ["deadline=step_or_run"])[:18])
+            return _RetryResult(selector_used="", stuck=False, attempted=attempted, deadline_hit=True)
         attempted_parts.append(f"retry={attempt - 1}")
         if attempt > 1:
             _retry_scroll(page)
@@ -1000,6 +1416,10 @@ def _apply_interactive_step_with_retries(
         except Exception:
             pass
         for candidate in candidates:
+            now = time.monotonic()
+            if now > step_deadline_ts or now > run_deadline_ts:
+                attempted = ", ".join((attempted_parts + ["deadline=step_or_run"])[:18])
+                return _RetryResult(selector_used="", stuck=False, attempted=attempted, deadline_hit=True)
             try:
                 if candidate.kind == "click_selector":
                     attempted_parts.append(f"selector={candidate.target}")
@@ -1135,6 +1555,18 @@ def _stable_selectors_for_target(target: str) -> list[str]:
     ]
 
 
+def _semantic_hints_for_selector(selector: str) -> list[str]:
+    low = str(selector or "").strip().lower()
+    if not low:
+        return []
+    hints: list[str] = []
+    if "stop" in low:
+        hints.append("Stop")
+    if "play" in low or "reproducir" in low:
+        hints.append("Reproducir")
+    return hints
+
+
 def _learning_context(url: str, title: str) -> dict[str, str]:
     parsed = urlparse(str(url))
     hostname = str(parsed.netloc or "").lower()
@@ -1177,7 +1609,7 @@ def _store_learned_selector(
     context: dict[str, str],
     source: str,
 ) -> None:
-    target_norm = str(target).strip().lower()
+    target_norm = _normalize_learning_target_key(target, selector=selector)
     selector_norm = str(selector).strip()
     if not target_norm or not selector_norm:
         return
@@ -1207,6 +1639,34 @@ def _write_learning_audit(target: str, selector: str, context: dict[str, str], s
         fh.write("\n".join(lines) + "\n")
 
 
+def _normalize_learning_target_key(raw: str, *, selector: str = "") -> str:
+    text = str(raw or "").strip().lower()
+    sel = str(selector or "").strip().lower()
+    probe = _normalize_failed_target_label(text).lower() or text
+    merged = " ".join([text, probe, sel]).strip()
+    if not merged:
+        return ""
+    if "stop" in merged or "#player-stop-btn" in merged:
+        return "stop"
+    # Avoid persisting noisy step signatures as learning keys.
+    if text.startswith("step ") and ("click_" in text or "wait_" in text):
+        return ""
+    cleaned = re.sub(r"[^a-z0-9]+", " ", probe).strip()
+    if not cleaned:
+        return ""
+    return cleaned[:48]
+
+
+def _is_learning_target_candidate(target: str) -> bool:
+    text = str(target or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith("step ") and ("wait_" in lowered or "click_" in lowered):
+        return False
+    return True
+
+
 def _learned_selectors_for_step(
     step: WebStep,
     selector_map: dict[str, dict[str, list[str]]],
@@ -1218,7 +1678,35 @@ def _learned_selectors_for_step(
     if not state_key:
         return []
     bucket = selector_map.get(state_key, {})
-    return list(bucket.get(str(step.target).strip().lower(), []))
+    raw_key = str(step.target).strip().lower()
+    norm_key = _normalize_learning_target_key(step.target)
+    out: list[str] = []
+    for key in (norm_key, raw_key):
+        if not key:
+            continue
+        for selector in bucket.get(key, []):
+            if selector not in out:
+                out.append(selector)
+    return out
+
+
+def _is_stop_semantic_step(step: WebStep) -> bool:
+    if step.kind not in {"click_selector", "click_text", "maybe_click_text"}:
+        return False
+    probe = f"{step.kind}:{step.target}".lower()
+    return "stop" in probe or "#player-stop-btn" in probe
+
+
+def _should_soft_skip_wait_timeout(
+    *, steps: list[WebStep], idx: int, step: WebStep, teaching_mode: bool
+) -> bool:
+    if not teaching_mode or step.kind != "wait_text":
+        return False
+    target = str(step.target).strip().lower()
+    if "now playing" not in target:
+        return False
+    remaining = steps[idx:]
+    return any(_is_stop_semantic_step(candidate) for candidate in remaining)
 
 
 def _prioritize_steps_with_learned_selectors(
@@ -1306,6 +1794,38 @@ def _show_stuck_handoff_notice(page: Any, step_text: str) -> None:
         return
 
 
+def _show_custom_handoff_notice(page: Any, message: str) -> None:
+    try:
+        page.evaluate(
+            """
+            ([msg]) => {
+              const id = '__bridge_teaching_handoff_notice';
+              let el = document.getElementById(id);
+              if (!el) {
+                el = document.createElement('div');
+                el.id = id;
+                el.style.position = 'fixed';
+                el.style.left = '50%';
+                el.style.bottom = '18px';
+                el.style.transform = 'translateX(-50%)';
+                el.style.padding = '10px 14px';
+                el.style.borderRadius = '10px';
+                el.style.background = 'rgba(245,158,11,0.95)';
+                el.style.color = '#fff';
+                el.style.font = '13px/1.3 monospace';
+                el.style.zIndex = '2147483647';
+                el.style.boxShadow = '0 8px 18px rgba(0,0,0,0.3)';
+                document.documentElement.appendChild(el);
+              }
+              el.textContent = String(msg || '');
+            }
+            """,
+            [message],
+        )
+    except Exception:
+        return
+
+
 def _trigger_stuck_handoff(
     *,
     page: Any,
@@ -1317,8 +1837,14 @@ def _trigger_stuck_handoff(
     learning_window_seconds: int,
     actions: list[str],
     ui_findings: list[str],
+    what_failed: str = "stuck",
+    notice_message: str = "",
+    why_likely: str = "step unchanged/no useful progress within stuck thresholds during teaching mode",
 ) -> bool:
-    _show_stuck_handoff_notice(page, where)
+    if notice_message:
+        _show_custom_handoff_notice(page, notice_message)
+    else:
+        _show_stuck_handoff_notice(page, where)
     _set_learning_handoff_overlay(page, True)
     if visual and control_enabled:
         _set_assistant_control_overlay(page, False)
@@ -1334,16 +1860,145 @@ def _trigger_stuck_handoff(
             pass
     if "cmd: playwright release control (teaching handoff)" not in actions:
         actions.append("cmd: playwright release control (teaching handoff)")
-    ui_findings.append(f"Me he atascado en: {where}. Te cedo el control para que me ayudes.")
+    ui_findings.append(
+        notice_message or f"Me he atascado en: {where}. Te cedo el control para que me ayudes."
+    )
     if "control released" not in ui_findings:
         ui_findings.append("control released")
-    ui_findings.append("what_failed=stuck")
+    ui_findings.append(f"what_failed={what_failed}")
     ui_findings.append(f"where={where}")
     ui_findings.append(f"attempted={attempted or 'watchdog'}")
     ui_findings.append("next_best_action=human_assist")
-    ui_findings.append(
-        "why_likely=step unchanged/no useful progress within stuck thresholds during teaching mode"
-    )
+    ui_findings.append(f"why_likely={why_likely}")
+    return False
+
+
+def _is_iframe_focus_locked(page: Any) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  const active = document.activeElement;
+                  if (!active) return false;
+                  if (String(active.tagName || '').toUpperCase() === 'IFRAME') return true;
+                  return !!document.querySelector('iframe:focus,iframe:focus-within');
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _disable_active_youtube_iframe_pointer_events(page: Any) -> dict[str, Any] | None:
+    if _page_is_closed(page):
+        return None
+    try:
+        token = page.evaluate(
+            """
+            () => {
+              const active = document.activeElement;
+              let frame = null;
+              if (active && String(active.tagName || '').toUpperCase() === 'IFRAME') {
+                frame = active;
+              }
+              if (!frame) frame = document.querySelector('iframe:focus,iframe:focus-within');
+              if (!frame) return null;
+              const src = String(frame.getAttribute('src') || '').toLowerCase();
+              const isYoutube =
+                src.includes('youtube.com') ||
+                src.includes('youtube-nocookie.com') ||
+                src.includes('youtu.be');
+              if (!isYoutube) return null;
+              const prev = String(frame.style.pointerEvents || '');
+              frame.setAttribute('data-bridge-prev-pe', prev || '__EMPTY__');
+              frame.style.pointerEvents = 'none';
+              const all = Array.from(document.querySelectorAll('iframe'));
+              const idx = all.indexOf(frame);
+              return { idx, id: String(frame.id || ''), prev };
+            }
+            """
+        )
+    except Exception:
+        return None
+    return token if isinstance(token, dict) else None
+
+
+def _restore_iframe_pointer_events(page: Any, token: dict[str, Any] | None) -> None:
+    if not token or _page_is_closed(page):
+        return
+    try:
+        page.evaluate(
+            """
+            ([tok]) => {
+              if (!tok || typeof tok !== 'object') return;
+              const all = Array.from(document.querySelectorAll('iframe'));
+              let frame = null;
+              if (tok.id) frame = document.getElementById(String(tok.id));
+              if (!frame && Number.isInteger(tok.idx) && tok.idx >= 0 && tok.idx < all.length) {
+                frame = all[tok.idx];
+              }
+              if (!frame) return;
+              const prevAttr = frame.getAttribute('data-bridge-prev-pe');
+              const prev = prevAttr === '__EMPTY__' ? '' : String(prevAttr || tok.prev || '');
+              frame.style.pointerEvents = prev;
+              frame.removeAttribute('data-bridge-prev-pe');
+            }
+            """,
+            [token],
+        )
+    except Exception:
+        return
+
+
+def _force_main_frame_context(page: Any, max_seconds: float = 8.0) -> bool:
+    # Main-frame-first policy: escape iframe focus and re-anchor to document body before actions.
+    deadline = time.monotonic() + max(0.1, float(max_seconds))
+    while time.monotonic() <= deadline:
+        try:
+            page.evaluate(
+                """
+                () => {
+                  const active = document.activeElement;
+                  if (active && String(active.tagName || '').toUpperCase() === 'IFRAME') {
+                    try { active.blur(); } catch (_e) {}
+                  }
+                }
+                """
+            )
+        except Exception:
+            pass
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        try:
+            page.evaluate(
+                """
+                () => {
+                  if (!document.body) return false;
+                  if (typeof document.body.focus === 'function') document.body.focus();
+                  try {
+                    const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                    document.body.dispatchEvent(evt);
+                  } catch (_e) {}
+                  return true;
+                }
+                """
+            )
+        except Exception:
+            pass
+        try:
+            is_main = bool(page.evaluate("() => !!document.body && window === window.top"))
+        except Exception:
+            is_main = False
+        if is_main and not _is_iframe_focus_locked(page):
+            return True
+        try:
+            page.wait_for_timeout(120)
+        except Exception:
+            pass
     return False
 
 
@@ -1498,10 +2153,17 @@ def _is_relevant_manual_learning_event(evt: dict[str, Any], failed_target: str) 
     probe = raw.split(":")[-1].strip().strip("'\"")
     if not probe:
         return True
+    if probe.startswith("#") and probe in selector:
+        return True
     token = re.sub(r"[^a-z0-9]+", " ", probe).strip()
     if not token:
         return True
-    return token in selector or token in target or token in text or token in message
+    if token in selector or token in target or token in text or token in message:
+        return True
+    parts = [p for p in token.split() if len(p) >= 3]
+    if parts and any(p in selector for p in parts) and ("stop" in parts or "play" in parts):
+        return True
+    return False
 
 
 def _write_teaching_artifacts(run_dir: Path, payload: dict[str, Any]) -> list[str]:
@@ -1565,38 +2227,13 @@ def _apply_interactive_step(
     visual_click_hold_ms: int = 180,
     timeout_ms: int = 8000,
 ) -> None:
-    if step.kind == "click_selector":
-        locator = page.locator(step.target).first
-        locator.wait_for(state="visible", timeout=timeout_ms)
-        target = _highlight_target(
-            page,
-            locator,
-            f"step {step_num}",
-            click_pulse_enabled=click_pulse_enabled and visual,
-        )
-        if target is None:
-            raise SystemExit(f"Target occluded or not visible: selector {step.target}")
-        if visual:
-            if visual_human_mouse and target:
-                _human_mouse_click(
-                    page,
-                    target[0],
-                    target[1],
-                    speed=visual_mouse_speed,
-                    hold_ms=visual_click_hold_ms,
-                )
-            else:
-                locator.click(timeout=timeout_ms)
-        else:
-            locator.click(timeout=timeout_ms)
-        actions.append(f"cmd: playwright click selector:{step.target}")
-        observations.append(f"Clicked selector in step {step_num}: {step.target}")
-        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
-        return
-
-    if step.kind == "click_text":
-        locator = page.get_by_text(step.target, exact=False).first
-        try:
+    iframe_guard = _disable_active_youtube_iframe_pointer_events(page)
+    if not _force_main_frame_context(page):
+        _restore_iframe_pointer_events(page, iframe_guard)
+        raise RuntimeError("Unable to enforce main frame context for interactive step")
+    try:
+        if step.kind == "click_selector":
+            locator = page.locator(step.target).first
             locator.wait_for(state="visible", timeout=timeout_ms)
             target = _highlight_target(
                 page,
@@ -1605,7 +2242,7 @@ def _apply_interactive_step(
                 click_pulse_enabled=click_pulse_enabled and visual,
             )
             if target is None:
-                raise SystemExit(f"Target occluded or not visible: text {step.target}")
+                raise SystemExit(f"Target occluded or not visible: selector {step.target}")
             if visual:
                 if visual_human_mouse and target:
                     _human_mouse_click(
@@ -1619,26 +2256,27 @@ def _apply_interactive_step(
                     locator.click(timeout=timeout_ms)
             else:
                 locator.click(timeout=timeout_ms)
-            actions.append(f"cmd: playwright click text:{step.target}")
-            observations.append(f"Clicked text in step {step_num}: {step.target}")
+            actions.append(f"cmd: playwright click selector:{step.target}")
+            observations.append(f"Clicked selector in step {step_num}: {step.target}")
             ui_findings.append(
                 f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
             )
             return
-        except Exception as exc:
-            if _is_timeout_error(exc):
-                raise
-            if str(step.target).strip().lower() == "reproducir":
-                fallback = page.locator('.track-card:has-text("Stan") button:has-text("Reproducir")').first
-                fallback.wait_for(state="visible", timeout=timeout_ms)
+
+        if step.kind == "click_text":
+            locator = page.locator("body").get_by_text(step.target, exact=False).first
+            try:
+                locator.wait_for(state="visible", timeout=timeout_ms)
                 target = _highlight_target(
                     page,
-                    fallback,
-                    f"step {step_num} fallback",
+                    locator,
+                    f"step {step_num}",
                     click_pulse_enabled=click_pulse_enabled and visual,
                 )
-                if target is not None:
-                    if visual and visual_human_mouse and target:
+                if target is None:
+                    raise SystemExit(f"Target occluded or not visible: text {step.target}")
+                if visual:
+                    if visual_human_mouse and target:
                         _human_mouse_click(
                             page,
                             target[0],
@@ -1647,32 +2285,97 @@ def _apply_interactive_step(
                             hold_ms=visual_click_hold_ms,
                         )
                     else:
-                        fallback.click(timeout=timeout_ms)
-                    actions.append(
-                        'cmd: playwright click selector:.track-card:has-text("Stan") '
-                        'button:has-text("Reproducir")'
-                    )
-                    observations.append(
-                        f"Clicked fallback selector in step {step_num}: .track-card:has-text('Stan') "
-                        "button:has-text('Reproducir')"
-                    )
-                    ui_findings.append(
-                        f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
-                    )
-                    return
-            if _is_login_target(step.target) and _looks_authenticated(page):
-                observations.append(
-                    f"Step {step_num}: target '{step.target}' not found; authenticated state detected."
-                )
+                        locator.click(timeout=timeout_ms)
+                else:
+                    locator.click(timeout=timeout_ms)
+                actions.append(f"cmd: playwright click text:{step.target}")
+                observations.append(f"Clicked text in step {step_num}: {step.target}")
                 ui_findings.append(
-                    f"step {step_num} verify authenticated session already active"
+                    f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
                 )
                 return
-            raise
+            except Exception as exc:
+                if _is_timeout_error(exc):
+                    raise
+                if str(step.target).strip().lower() == "reproducir":
+                    fallback = page.locator('.track-card:has-text("Stan") button:has-text("Reproducir")').first
+                    fallback.wait_for(state="visible", timeout=timeout_ms)
+                    target = _highlight_target(
+                        page,
+                        fallback,
+                        f"step {step_num} fallback",
+                        click_pulse_enabled=click_pulse_enabled and visual,
+                    )
+                    if target is not None:
+                        if visual and visual_human_mouse and target:
+                            _human_mouse_click(
+                                page,
+                                target[0],
+                                target[1],
+                                speed=visual_mouse_speed,
+                                hold_ms=visual_click_hold_ms,
+                            )
+                        else:
+                            fallback.click(timeout=timeout_ms)
+                        actions.append(
+                            'cmd: playwright click selector:.track-card:has-text("Stan") '
+                            'button:has-text("Reproducir")'
+                        )
+                        observations.append(
+                            f"Clicked fallback selector in step {step_num}: .track-card:has-text('Stan') "
+                            "button:has-text('Reproducir')"
+                        )
+                        ui_findings.append(
+                            f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
+                        )
+                        return
+                if _is_login_target(step.target) and _looks_authenticated(page):
+                    observations.append(
+                        f"Step {step_num}: target '{step.target}' not found; authenticated state detected."
+                    )
+                    ui_findings.append(
+                        f"step {step_num} verify authenticated session already active"
+                    )
+                    return
+                raise
 
-    if step.kind == "maybe_click_text":
-        locator = page.get_by_text(step.target, exact=False).first
-        try:
+        if step.kind == "maybe_click_text":
+            locator = page.locator("body").get_by_text(step.target, exact=False).first
+            try:
+                locator.wait_for(state="visible", timeout=timeout_ms)
+                target = _highlight_target(
+                    page,
+                    locator,
+                    f"step {step_num}",
+                    click_pulse_enabled=click_pulse_enabled and visual,
+                )
+                if target is None:
+                    observations.append(f"Step {step_num}: maybe click target not visible/occluded: {step.target}")
+                    ui_findings.append(f"step {step_num} verify optional click skipped: {step.target}")
+                    return
+                if visual and visual_human_mouse and target:
+                    _human_mouse_click(
+                        page,
+                        target[0],
+                        target[1],
+                        speed=visual_mouse_speed,
+                        hold_ms=visual_click_hold_ms,
+                    )
+                else:
+                    locator.click(timeout=timeout_ms)
+                actions.append(f"cmd: playwright maybe click text:{step.target}")
+                observations.append(f"Maybe clicked text in step {step_num}: {step.target}")
+                ui_findings.append(
+                    f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
+                )
+                return
+            except Exception:
+                observations.append(f"Step {step_num}: maybe click not present: {step.target}")
+                ui_findings.append(f"step {step_num} verify optional click skipped: {step.target}")
+                return
+
+        if step.kind == "select_label":
+            locator = page.locator(step.target).first
             locator.wait_for(state="visible", timeout=timeout_ms)
             target = _highlight_target(
                 page,
@@ -1681,71 +2384,45 @@ def _apply_interactive_step(
                 click_pulse_enabled=click_pulse_enabled and visual,
             )
             if target is None:
-                observations.append(f"Step {step_num}: maybe click target not visible/occluded: {step.target}")
-                ui_findings.append(f"step {step_num} verify optional click skipped: {step.target}")
-                return
-            if visual and visual_human_mouse and target:
-                _human_mouse_click(
-                    page,
-                    target[0],
-                    target[1],
-                    speed=visual_mouse_speed,
-                    hold_ms=visual_click_hold_ms,
-                )
-            else:
-                locator.click(timeout=timeout_ms)
-            actions.append(f"cmd: playwright maybe click text:{step.target}")
-            observations.append(f"Maybe clicked text in step {step_num}: {step.target}")
-            ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
-            return
-        except Exception:
-            observations.append(f"Step {step_num}: maybe click not present: {step.target}")
-            ui_findings.append(f"step {step_num} verify optional click skipped: {step.target}")
+                raise SystemExit(f"Target occluded or not visible: selector {step.target}")
+            if visual:
+                if visual_human_mouse and target:
+                    _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
+            locator.select_option(label=step.value)
+            actions.append(f"cmd: playwright select selector:{step.target} label:{step.value}")
+            observations.append(
+                f"Selected option by label in step {step_num}: selector={step.target}, label={step.value}"
+            )
+            ui_findings.append(
+                f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
+            )
             return
 
-    if step.kind == "select_label":
-        locator = page.locator(step.target).first
-        locator.wait_for(state="visible", timeout=timeout_ms)
-        target = _highlight_target(
-            page,
-            locator,
-            f"step {step_num}",
-            click_pulse_enabled=click_pulse_enabled and visual,
-        )
-        if target is None:
-            raise SystemExit(f"Target occluded or not visible: selector {step.target}")
-        if visual:
-            if visual_human_mouse and target:
-                _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
-        locator.select_option(label=step.value)
-        actions.append(f"cmd: playwright select selector:{step.target} label:{step.value}")
-        observations.append(
-            f"Selected option by label in step {step_num}: selector={step.target}, label={step.value}"
-        )
-        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
-        return
-
-    if step.kind == "select_value":
-        locator = page.locator(step.target).first
-        locator.wait_for(state="visible", timeout=timeout_ms)
-        target = _highlight_target(
-            page,
-            locator,
-            f"step {step_num}",
-            click_pulse_enabled=click_pulse_enabled and visual,
-        )
-        if target is None:
-            raise SystemExit(f"Target occluded or not visible: selector {step.target}")
-        if visual:
-            if visual_human_mouse and target:
-                _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
-        locator.select_option(value=step.value)
-        actions.append(f"cmd: playwright select selector:{step.target} value:{step.value}")
-        observations.append(
-            f"Selected option by value in step {step_num}: selector={step.target}, value={step.value}"
-        )
-        ui_findings.append(f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}")
-        return
+        if step.kind == "select_value":
+            locator = page.locator(step.target).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            target = _highlight_target(
+                page,
+                locator,
+                f"step {step_num}",
+                click_pulse_enabled=click_pulse_enabled and visual,
+            )
+            if target is None:
+                raise SystemExit(f"Target occluded or not visible: selector {step.target}")
+            if visual:
+                if visual_human_mouse and target:
+                    _human_mouse_move(page, target[0], target[1], speed=visual_mouse_speed)
+            locator.select_option(value=step.value)
+            actions.append(f"cmd: playwright select selector:{step.target} value:{step.value}")
+            observations.append(
+                f"Selected option by value in step {step_num}: selector={step.target}, value={step.value}"
+            )
+            ui_findings.append(
+                f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
+            )
+            return
+    finally:
+        _restore_iframe_pointer_events(page, iframe_guard)
 
     raise RuntimeError(f"Unsupported interactive step kind: {step.kind}")
 
@@ -1760,18 +2437,27 @@ def _apply_wait_step(
     *,
     timeout_ms: int,
 ) -> None:
-    if step.kind == "wait_selector":
-        actions.append(f"cmd: playwright wait selector:{step.target}")
-        page.wait_for_selector(step.target, timeout=timeout_ms)
-        observations.append(f"Wait selector step {step_num}: {step.target}")
-        ui_findings.append(f"step {step_num} verify selector visible: {step.target}")
-        return
-    if step.kind == "wait_text":
-        actions.append(f"cmd: playwright wait text:{step.target}")
-        page.get_by_text(step.target, exact=False).first.wait_for(state="visible", timeout=timeout_ms)
-        observations.append(f"Wait text step {step_num}: {step.target}")
-        ui_findings.append(f"step {step_num} verify text visible: {step.target}")
-        return
+    iframe_guard = _disable_active_youtube_iframe_pointer_events(page)
+    if not _force_main_frame_context(page):
+        _restore_iframe_pointer_events(page, iframe_guard)
+        raise RuntimeError("Unable to enforce main frame context for wait step")
+    try:
+        if step.kind == "wait_selector":
+            actions.append(f"cmd: playwright wait selector:{step.target}")
+            page.wait_for_selector(step.target, timeout=timeout_ms)
+            observations.append(f"Wait selector step {step_num}: {step.target}")
+            ui_findings.append(f"step {step_num} verify selector visible: {step.target}")
+            return
+        if step.kind == "wait_text":
+            actions.append(f"cmd: playwright wait text:{step.target}")
+            page.locator("body").get_by_text(step.target, exact=False).first.wait_for(
+                state="visible", timeout=timeout_ms
+            )
+            observations.append(f"Wait text step {step_num}: {step.target}")
+            ui_findings.append(f"step {step_num} verify text visible: {step.target}")
+            return
+    finally:
+        _restore_iframe_pointer_events(page, iframe_guard)
     raise RuntimeError(f"Unsupported wait step kind: {step.kind}")
 
 
@@ -2798,8 +3484,11 @@ def _ensure_visual_overlay_ready_best_effort(
 
 
 def _set_assistant_control_overlay(page: Any, enabled: bool) -> None:
-    page.evaluate(
-        """
+    if _page_is_closed(page):
+        return
+    try:
+        page.evaluate(
+            """
         ([enabled]) => {
           const id = '__bridge_assistant_control_overlay';
           const existing = document.getElementById(id);
@@ -2830,14 +3519,19 @@ def _set_assistant_control_overlay(page: Any, enabled: bool) -> None:
           wrap.appendChild(badge);
           document.documentElement.appendChild(wrap);
         }
-        """,
-        [enabled],
-    )
+            """,
+            [enabled],
+        )
+    except Exception:
+        return
 
 
 def _set_user_control_overlay(page: Any, enabled: bool) -> None:
-    page.evaluate(
-        """
+    if _page_is_closed(page):
+        return
+    try:
+        page.evaluate(
+            """
         ([enabled]) => {
           const id = '__bridge_user_control_overlay';
           const existing = document.getElementById(id);
@@ -2868,14 +3562,19 @@ def _set_user_control_overlay(page: Any, enabled: bool) -> None:
           wrap.appendChild(badge);
           document.documentElement.appendChild(wrap);
         }
-        """,
-        [enabled],
-    )
+            """,
+            [enabled],
+        )
+    except Exception:
+        return
 
 
 def _set_learning_handoff_overlay(page: Any, enabled: bool) -> None:
-    page.evaluate(
-        """
+    if _page_is_closed(page):
+        return
+    try:
+        page.evaluate(
+            """
         ([enabled]) => {
           const id = '__bridge_learning_handoff_overlay';
           const existing = document.getElementById(id);
@@ -2906,9 +3605,11 @@ def _set_learning_handoff_overlay(page: Any, enabled: bool) -> None:
           wrap.appendChild(badge);
           document.documentElement.appendChild(wrap);
         }
-        """,
-        [enabled],
-    )
+            """,
+            [enabled],
+        )
+    except Exception:
+        return
 
 
 def _session_state_payload(
@@ -2937,11 +3638,21 @@ def _session_state_payload(
 
 
 def _update_top_bar_state(page: Any, payload: dict[str, Any]) -> None:
-    page.evaluate("([payload]) => window.__bridgeUpdateTopBarState?.(payload)", [payload])
+    if _page_is_closed(page):
+        return
+    try:
+        page.evaluate("([payload]) => window.__bridgeUpdateTopBarState?.(payload)", [payload])
+    except Exception:
+        return
 
 
 def _destroy_top_bar(page: Any) -> None:
-    page.evaluate("() => window.__bridgeDestroyTopBar?.()")
+    if _page_is_closed(page):
+        return
+    try:
+        page.evaluate("() => window.__bridgeDestroyTopBar?.()")
+    except Exception:
+        return
 
 
 def _notify_learning_state(session: WebSession | None, *, active: bool, window_seconds: int) -> None:

@@ -831,7 +831,7 @@ def _validate_report_actions(
             if _is_state_changing_gui_action(command):
                 sensitive_hits.append(command)
         elif mode == "web":
-            if _is_web_click_command(command):
+            if _is_web_click_command(command) and not _is_web_auxiliary_click_command(command):
                 click_steps += 1
 
         if decision.sensitive:
@@ -1299,6 +1299,11 @@ def _is_web_click_command(command: str) -> bool:
     if parts[0].lower() != "playwright":
         return False
     return parts[1].lower() in {"click", "select"}
+
+
+def _is_web_auxiliary_click_command(command: str) -> bool:
+    low = command.lower()
+    return any(token in low for token in ("(learning-resume)", "(auto-resume)", "(teaching-resume)"))
 
 
 def _finalize_failed_run(ctx, task: str, reason: str) -> None:

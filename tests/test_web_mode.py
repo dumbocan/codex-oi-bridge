@@ -13,7 +13,10 @@ from bridge.models import OIReport
 from bridge.web_backend import (
     WebStep,
     _is_relevant_manual_learning_event,
+    _learned_selectors_for_step,
+    _normalize_learning_target_key,
     _observer_useful_event_count,
+    _should_soft_skip_wait_timeout,
     _ensure_visual_overlay_ready,
     _execute_playwright,
     _install_visual_overlay,
@@ -103,6 +106,9 @@ class _FakeNode:
             return {"x": 130.0, "y": 90.0, "ok": True}
         return None
 
+    def get_by_text(self, text: str, exact: bool = False):
+        return _FakeNode(self._page, text=text)
+
 
 class _FakeMouse:
     def __init__(self, page):
@@ -126,6 +132,11 @@ class _FakeMouse:
         self._page._emit("requestfailed", _FakeRequest("GET", "http://localhost:5173/asset"))
 
 
+class _FakeKeyboard:
+    def press(self, _key: str) -> None:
+        return
+
+
 class _FakePage:
     def __init__(
         self,
@@ -144,9 +155,14 @@ class _FakePage:
         self.fail_wait_for_text = fail_wait_for_text
         self.demo_button_available = demo_button_available
         self.fail_selector_contains = fail_selector_contains
+        self.main_frame_context_failures = 0
+        self._main_frame_context_checks = 0
+        self.iframe_focus_locked = False
+        self.iframe_pointer_events_disabled = False
         self.waited_selector = ""
         self.waited_text = ""
         self.mouse = _FakeMouse(self)
+        self.keyboard = _FakeKeyboard()
         self.overlay_installed = False
         self.overlay_events: list[tuple[float, float, str]] = []
         self.pulse_events: list[tuple[float, float]] = []
@@ -164,9 +180,13 @@ class _FakePage:
             "mi cuenta",
             "perfil",
         }
+        self.closed = False
 
     def set_default_timeout(self, _value: int) -> None:
         return
+
+    def is_closed(self) -> bool:
+        return bool(self.closed)
 
     def on(self, event: str, handler) -> None:
         self._handlers.setdefault(event, []).append(handler)
@@ -207,6 +227,22 @@ class _FakePage:
 
     def evaluate(self, _script: str, payload=None):
         self.eval_calls.append((_script, payload))
+        if "active.blur" in _script and "IFRAME" in _script:
+            self.iframe_focus_locked = False
+            return True
+        if "data-bridge-prev-pe" in _script and "pointerEvents = 'none'" in _script:
+            if self.iframe_focus_locked:
+                self.iframe_pointer_events_disabled = True
+                return {"idx": 0, "id": "yt-iframe", "prev": ""}
+            return None
+        if "frame.style.pointerEvents = prev" in _script and "data-bridge-prev-pe" in _script:
+            self.iframe_pointer_events_disabled = False
+            return True
+        if "iframe:focus,iframe:focus-within" in _script:
+            return self.iframe_focus_locked
+        if "window === window.top" in _script:
+            self._main_frame_context_checks += 1
+            return self._main_frame_context_checks > self.main_frame_context_failures
         if "window.__bridgeEnsureOverlay" in _script:
             return True
         if "getElementById('__bridge_cursor_overlay')" in _script and "pointerEvents" in _script:
@@ -315,6 +351,246 @@ class WebModeTests(unittest.TestCase):
             run_dir.mkdir(parents=True)
             with self.assertRaises(SystemExit):
                 run_web_task("haz click en boton demo", run_dir, 30)
+
+    def test_run_web_task_interactive_hard_timeout_finishes_and_writes_report(self) -> None:
+        page = _FakePage(demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r-hard-step"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            status_calls: list[dict] = []
+            try:
+                with patch("bridge.web_backend._preflight_target_reachable"), patch(
+                    "bridge.web_backend._preflight_stack_prereqs"
+                ), patch(
+                    "bridge.web_backend._playwright_available",
+                    return_value=True,
+                ), patch(
+                    "bridge.web_backend.write_status",
+                    side_effect=lambda **kwargs: status_calls.append(dict(kwargs)),
+                ), patch(
+                    "bridge.web_backend._apply_interactive_step_with_retries",
+                    return_value=types.SimpleNamespace(
+                        stuck=False,
+                        selector_used="",
+                        attempted="hard-timeout",
+                        deadline_hit=True,
+                    ),
+                ):
+                    report = run_web_task(
+                        "open http://localhost:5173, click 'Stop'",
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+            report_path = run_dir / "report.json"
+            self.assertTrue(report_path.exists())
+            saved = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertIn(report.result, {"partial", "failed"})
+        self.assertTrue(any("what_failed=interactive_timeout" in i for i in report.ui_findings))
+        self.assertTrue(any("final_state=" in i for i in report.ui_findings))
+        self.assertEqual(saved["result"], report.result)
+        self.assertTrue(any(call.get("state") == "completed" for call in status_calls))
+        self.assertTrue(all(call.get("state") != "running" for call in status_calls[-1:]))
+
+    def test_run_web_task_run_timeout_finishes_and_releases_control(self) -> None:
+        page = _FakePage(demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        def ticking() -> float:
+            ticking.t += 1.0
+            return ticking.t
+
+        ticking.t = 0.0
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r-hard-run"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            status_calls: list[dict] = []
+            try:
+                with patch("bridge.web_backend._preflight_target_reachable"), patch(
+                    "bridge.web_backend._preflight_stack_prereqs"
+                ), patch(
+                    "bridge.web_backend._playwright_available",
+                    return_value=True,
+                ), patch(
+                    "bridge.web_backend.write_status",
+                    side_effect=lambda **kwargs: status_calls.append(dict(kwargs)),
+                ), patch(
+                    "bridge.web_backend.time.monotonic",
+                    side_effect=ticking,
+                ), patch.dict(
+                    os.environ,
+                    {"BRIDGE_WEB_RUN_HARD_TIMEOUT_SECONDS": "0.1"},
+                    clear=False,
+                ):
+                    report = run_web_task(
+                        "open http://localhost:5173, click 'Stop'",
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+            report_path = run_dir / "report.json"
+            self.assertTrue(report_path.exists())
+
+        self.assertIn(report.result, {"partial", "failed"})
+        self.assertTrue(any("what_failed=run_timeout" in i for i in report.ui_findings))
+        self.assertTrue(any("control released" in i for i in report.ui_findings))
+        self.assertTrue(any("final_state=" in i for i in report.ui_findings))
+        self.assertTrue(any(call.get("state") == "completed" for call in status_calls))
+        self.assertNotEqual(status_calls[-1].get("state"), "running")
+
+    def test_page_closed_during_step_finishes_with_run_crash_report(self) -> None:
+        page = _FakePage(demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r-closed-step"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend._preflight_target_reachable"), patch(
+                    "bridge.web_backend._preflight_stack_prereqs"
+                ), patch("bridge.web_backend._playwright_available", return_value=True), patch(
+                    "bridge.web_backend._apply_interactive_step_with_retries",
+                    side_effect=RuntimeError("Target page, context or browser has been closed"),
+                ):
+                    report = run_web_task(
+                        "open http://localhost:5173, click 'Stop'",
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+            report_path = run_dir / "report.json"
+            self.assertTrue(report_path.exists())
+            saved = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(report.result, "failed")
+        self.assertEqual(saved["result"], "failed")
+        self.assertTrue(any("what_failed=run_crash" in i for i in report.ui_findings))
+        self.assertTrue(any("final_state=failed" in i for i in report.ui_findings))
+
+    def test_close_during_handoff_finally_does_not_break_report_persistence(self) -> None:
+        page = _FakePage(
+            fail_wait_for_text="Stop",
+            fail_selector_contains="Stop",
+            demo_button_available=False,
+        )
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-closed-finally",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r-closed-finally"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"), patch(
+                    "bridge.web_backend._capture_manual_learning", return_value=None
+                ), patch(
+                    "bridge.web_backend._show_custom_handoff_notice",
+                    side_effect=lambda *_args, **_kwargs: setattr(page, "closed", True),
+                ):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("click_text", "Stop")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        session=session,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertIn(report.result, {"failed", "partial"})
+        self.assertTrue(any("what_failed=" in i for i in report.ui_findings))
+        self.assertTrue(any("final_state=" in i for i in report.ui_findings))
 
     def test_web_open_click_select_wait_and_capture(self) -> None:
         page = _FakePage(demo_button_available=False)
@@ -522,6 +798,45 @@ class WebModeTests(unittest.TestCase):
 
         self.assertEqual(report.result, "partial")
         self.assertTrue(any("stable selector fallback" in item for item in report.observations))
+
+    def test_click_selector_stop_falls_back_to_stop_text_in_teaching(self) -> None:
+        page = _FakePage(fail_selector_contains="#player-stop-btn", demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r-stop-fallback"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_selector", "#player-stop-btn")],
+                    run_dir,
+                    30,
+                    verified=False,
+                    visual=True,
+                    teaching_mode=True,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertIn(report.result, {"success", "partial"})
+        self.assertTrue(
+            any("cmd: playwright click" in a and "stop" in a.lower() for a in report.actions)
+        )
 
     def test_teaching_mode_releases_control_and_writes_learning_artifact(self) -> None:
         page = _FakePage(
@@ -750,6 +1065,115 @@ class WebModeTests(unittest.TestCase):
         self.assertTrue(any("next_best_action=human_assist" in item for item in report.ui_findings))
         self.assertTrue(any("cmd: playwright release control (teaching handoff)" in item for item in report.actions))
 
+    def test_iframe_focus_recovers_to_main_frame_and_continues(self) -> None:
+        page = _FakePage(demo_button_available=False)
+        page.iframe_focus_locked = True
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_selector", "#player-stop-btn")],
+                    run_dir,
+                    30,
+                    verified=False,
+                    visual=True,
+                    teaching_mode=True,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertIn(report.result, {"success", "partial"})
+        self.assertFalse(page.iframe_focus_locked)
+        self.assertFalse(page.iframe_pointer_events_disabled)
+        self.assertTrue(any("cmd: playwright click" in item and "stop" in item.lower() for item in report.actions))
+        self.assertFalse(any("iframe" in item.lower() and "click" in item.lower() for item in report.actions))
+
+    def test_iframe_focus_cannot_recover_triggers_handoff(self) -> None:
+        page = _FakePage(demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-iframe-stuck",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://localhost:5173",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"), patch(
+                    "bridge.web_backend._capture_manual_learning", return_value=None
+                ), patch(
+                    "bridge.web_backend._force_main_frame_context", return_value=False
+                ):
+                    report = _execute_playwright(
+                        "http://localhost:5173",
+                        [WebStep("click_text", "Stop")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        session=session,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertEqual(report.result, "partial")
+        self.assertTrue(any("what_failed=stuck_iframe_focus" in item for item in report.ui_findings))
+        self.assertTrue(any("Me he quedado dentro de YouTube iframe" in item for item in report.ui_findings))
+        self.assertTrue(any("cmd: playwright release control (teaching handoff)" in item for item in report.actions))
+        self.assertTrue(any("teaching handoff: browser kept open" in item for item in report.ui_findings))
+        self.assertTrue(any("__bridge_user_control_overlay" in script for script, _ in page.eval_calls))
+        self.assertFalse(
+            any(
+                "__bridge_learning_handoff_overlay" in script and payload == [True]
+                for script, payload in page.eval_calls
+            )
+        )
+
     def test_stuck_manual_learning_is_persisted(self) -> None:
         page = _FakePage(
             fail_wait_for_text="Stop",
@@ -786,11 +1210,17 @@ class WebModeTests(unittest.TestCase):
             old_sync = sys.modules.get("playwright.sync_api")
             sys.modules["playwright"] = fake_playwright
             sys.modules["playwright.sync_api"] = fake_sync_module
+            t = {"v": 0.0}
+
+            def monotonic_tick() -> float:
+                t["v"] += 0.7
+                return t["v"]
+
             try:
                 with patch("bridge.web_backend.mark_controlled"), patch(
                     "bridge.web_backend._LEARNING_DIR", learn_dir
                 ), patch("bridge.web_backend._LEARNING_JSON", learn_json), patch(
-                    "bridge.web_backend.time.monotonic", side_effect=[0.0, 13.5, 14.2]
+                    "bridge.web_backend.time.monotonic", side_effect=monotonic_tick
                 ), patch(
                     "bridge.web_backend._capture_manual_learning",
                     return_value={
@@ -893,6 +1323,130 @@ class WebModeTests(unittest.TestCase):
             )
         )
 
+    def test_timeout_handoff_captures_manual_stop_and_persists_stop_key(self) -> None:
+        page = _FakePage(demo_button_available=False)
+        page._title = "Audio3"
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+        session = WebSession(
+            session_id="s-timeout-learn",
+            pid=123,
+            port=9222,
+            user_data_dir="/tmp/x",
+            browser_binary="/usr/bin/chromium",
+            url="http://127.0.0.1:5181",
+            title="Audio3",
+            controlled=True,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_seen_at="2026-01-01T00:00:00+00:00",
+            state="open",
+            control_port=9555,
+            agent_pid=201,
+        )
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r-timeout-learn"
+            run_dir.mkdir(parents=True)
+            learn_dir = Path(tmp) / "learn"
+            learn_json = learn_dir / "selectors.json"
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend.mark_controlled"), patch(
+                    "bridge.web_backend._LEARNING_DIR", learn_dir
+                ), patch(
+                    "bridge.web_backend._LEARNING_JSON", learn_json
+                ), patch(
+                    "bridge.web_backend._apply_interactive_step_with_retries",
+                    return_value=types.SimpleNamespace(
+                        stuck=False,
+                        selector_used="",
+                        attempted="retry=0, selector=#player-stop-btn",
+                        deadline_hit=True,
+                    ),
+                ), patch(
+                    "bridge.web_backend.request_session_state",
+                    return_value={
+                        "recent_events": [
+                            {
+                                "type": "click",
+                                "selector": "#player-stop-btn",
+                                "target": "Stop",
+                                "text": "Stop",
+                                "url": "http://127.0.0.1:5181",
+                                "created_at": "2026-02-18T00:11:00+00:00",
+                                "message": "click Stop",
+                            }
+                        ]
+                    },
+                ):
+                    report = _execute_playwright(
+                        "http://127.0.0.1:5181",
+                        [WebStep("click_selector", "#player-stop-btn")],
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=True,
+                        session=session,
+                        teaching_mode=True,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+            payload = json.loads(learn_json.read_text(encoding="utf-8"))
+
+        self.assertTrue(any("what_failed=interactive_timeout" in item for item in report.ui_findings))
+        self.assertFalse(any("learning_capture=none" in item for item in report.ui_findings))
+        self.assertIn("127.0.0.1:5181/|audio3", payload)
+        self.assertIn("stop", payload["127.0.0.1:5181/|audio3"])
+        self.assertIn("#player-stop-btn", payload["127.0.0.1:5181/|audio3"]["stop"])
+
+    def test_learning_key_normalization_avoids_step_signature_garbage(self) -> None:
+        self.assertEqual(_normalize_learning_target_key("step 4/5 wait_text:Audio3"), "")
+        self.assertEqual(
+            _normalize_learning_target_key("step 4/5 click_selector:#player-stop-btn"),
+            "stop",
+        )
+
+    def test_learned_selectors_lookup_uses_normalized_key(self) -> None:
+        step = WebStep("click_selector", "#player-stop-btn")
+        selector_map = {"127.0.0.1:5181/|audio3": {"stop": ["#player-stop-btn"]}}
+        context = {"state_key": "127.0.0.1:5181/|audio3"}
+        learned = _learned_selectors_for_step(step, selector_map, context)
+        self.assertEqual(learned, ["#player-stop-btn"])
+
+    def test_soft_skip_wait_timeout_for_now_playing_when_stop_follows(self) -> None:
+        steps = [
+            WebStep("click_selector", "#track-play-track-stan"),
+            WebStep("wait_text", "Now playing:"),
+            WebStep("click_selector", "#player-stop-btn"),
+        ]
+        self.assertTrue(
+            _should_soft_skip_wait_timeout(
+                steps=steps,
+                idx=2,
+                step=steps[1],
+                teaching_mode=True,
+            )
+        )
+        self.assertFalse(
+            _should_soft_skip_wait_timeout(
+                steps=steps,
+                idx=2,
+                step=steps[1],
+                teaching_mode=False,
+            )
+        )
+
     def test_web_actions_and_evidence_validations(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
             run_dir = Path(tmp) / "runs" / "r1"
@@ -936,6 +1490,31 @@ class WebModeTests(unittest.TestCase):
             )
             self.assertEqual(click_steps, 1)
             self.assertEqual(len(safe), 2)
+
+    def test_web_actions_ignore_learning_resume_click_for_evidence_count(self) -> None:
+        report = OIReport(
+            task_id="r1",
+            goal="web",
+            actions=[
+                "cmd: playwright goto http://localhost:5173",
+                "cmd: playwright click text:Entrar demo",
+                "cmd: playwright click selector:#track-play-track-stan (learning-resume)",
+            ],
+            observations=["Opened URL", "Clicked text in step 1"],
+            console_errors=[],
+            network_findings=[],
+            ui_findings=["step 1 verify visible result"],
+            result="partial",
+            evidence_paths=[],
+        )
+        click_steps = _validate_report_actions(
+            report,
+            confirm_sensitive=True,
+            expected_targets={"http://localhost:5173"},
+            allowlist=WEB_ALLOWED_COMMAND_PREFIXES,
+            mode="web",
+        )
+        self.assertEqual(click_steps, 1)
 
     def test_visual_mode_runs_headed_with_overlay(self) -> None:
         page = _FakePage()

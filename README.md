@@ -108,9 +108,13 @@ Modo enseñanza (`--teaching`):
 - Si sigue fallando, muestra aviso en la UI y cede control automático (`release`) manteniendo la ventana abierta.
 - Si detecta atasco (paso interactivo sin avance / sin eventos útiles), hace handoff proactivo con aviso:
   `Me he atascado en: <paso>. Te cedo el control para que me ayudes.`
+- Política `main-frame-first`: antes de cada paso interactivo/wait, el executor fuerza contexto al frame principal (salida de iframe, `Escape`, foco/click noop en `document.body`).
+- Nuevo motivo de atasco `stuck_iframe_focus`: si queda foco/cursor en iframe (p.ej. YouTube) > 8s sin progreso útil, desactiva temporalmente `pointer-events` del iframe activo, reintenta en main frame y, si no recupera, lanza handoff normal a `USER CONTROL` (verde) con `release` y `keep-open`.
 - Observa clicks manuales del usuario, guarda artefacto local en `runs/<run_id>/learning/` y prioriza selectores aprendidos en ejecuciones futuras para el mismo estado.
 - Ventana de aprendizaje configurable con `BRIDGE_LEARNING_WINDOW_SECONDS` (default `25`).
 - Verbosidad del observer configurable con `BRIDGE_OBSERVER_NOISE_MODE=minimal|debug` (default `minimal`).
+- Timeout duro por paso `BRIDGE_WEB_STEP_HARD_TIMEOUT_SECONDS` (default `20`) para evitar runs colgados en interacción.
+- Timeout duro global `BRIDGE_WEB_RUN_HARD_TIMEOUT_SECONDS` (default `120`) para forzar cierre del run con reporte consistente.
 
 Nota sobre `wait text`:
 - Si hay colisiones con texto oculto (por ejemplo `<option>` en un `<select>`), preferir `wait selector:"..."` con un selector único.
