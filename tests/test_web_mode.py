@@ -64,6 +64,9 @@ class _FakeNode:
         self._page._emit("response", _FakeResponse("GET", "http://localhost:5173/api", 500))
         self._page._emit("requestfailed", _FakeRequest("GET", "http://localhost:5173/asset"))
 
+    def fill(self, value: str, timeout: int | None = None) -> None:
+        self._page.filled[self._selector or self._text or "unknown"] = value
+
     def select_option(self, *, label: str | None = None, value: str | None = None) -> None:
         choice = label or value or ""
         self._page._title = f"Selected {choice}"
@@ -161,6 +164,7 @@ class _FakePage:
         self.iframe_pointer_events_disabled = False
         self.waited_selector = ""
         self.waited_text = ""
+        self.filled: dict[str, str] = {}
         self.mouse = _FakeMouse(self)
         self.keyboard = _FakeKeyboard()
         self.overlay_installed = False
@@ -344,6 +348,29 @@ class WebModeTests(unittest.TestCase):
         self.assertIn("click_text", kinds)
         self.assertIn("wait_selector", kinds)
         self.assertNotIn("click_selector", kinds)
+
+    def test_parse_steps_supports_fill_selector_text(self) -> None:
+        steps = _parse_steps(
+            'open http://localhost:5173 type text "ready mix" into selector "#playlist-name-input" '
+            'click selector:"#create-playlist-btn"'
+        )
+        self.assertEqual(steps[0].kind, "fill_selector")
+        self.assertEqual(steps[0].target, "#playlist-name-input")
+        self.assertEqual(steps[0].value, "ready mix")
+
+    def test_parse_steps_supports_add_all_ready(self) -> None:
+        steps = _parse_steps(
+            "open http://localhost:5173 add all ready tracks to playlist"
+        )
+        kinds = [step.kind for step in steps]
+        self.assertIn("add_all_ready_to_playlist", kinds)
+
+    def test_parse_steps_supports_remove_all_playlist_tracks(self) -> None:
+        steps = _parse_steps(
+            "open http://localhost:5173 remove all tracks from playlist"
+        )
+        kinds = [step.kind for step in steps]
+        self.assertIn("remove_all_playlist_tracks", kinds)
 
     def test_run_web_task_requires_url(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
