@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-
 _CLICK_TEXT_RE = re.compile(
     r"(?:click|haz\s+click|pulsa|presiona)[^\"'<>]{0,120}[\"'“”]([^\"'“”]{1,120})[\"'“”]",
     flags=re.IGNORECASE,
@@ -22,16 +21,6 @@ _CLICK_SELECTOR_RE = re.compile(
 _CLICK_SELECTOR_UNQUOTED_RE = re.compile(
     r"(?:click|haz\s+click|pulsa|presiona)\s+(?:en\s+)?(?:el\s+)?"
     r"selector\s*[=:]?\s*([#.\[][^\s,;]{1,200})",
-    flags=re.IGNORECASE,
-)
-_ADD_ALL_READY_RE = re.compile(
-    r"(?:add|añade|agrega)\b[^\n\r]{0,120}?\b(?:all|todas?)\b[^\n\r]{0,120}?\bready\b[^\n\r]{0,160}?"
-    r"(?:playlist|lista)",
-    flags=re.IGNORECASE,
-)
-_REMOVE_ALL_PLAYLIST_RE = re.compile(
-    r"(?:remove|delete|borra|elimina|quita)\b[^\n\r]{0,120}?\b(?:all|todas?)\b[^\n\r]{0,140}?"
-    r"(?:tracks|songs|canciones|pistas)\b[^\n\r]{0,140}?(?:playlist|lista)",
     flags=re.IGNORECASE,
 )
 _BULK_CLICK_IN_CARDS_RE = re.compile(
@@ -79,15 +68,6 @@ _WAIT_TEXT_RE = re.compile(
     r"(?:wait|espera)(?:\s+for)?\s+text\s*[=:]?\s*[\"'“”]([^\"'“”]{1,160})[\"'“”]",
     flags=re.IGNORECASE,
 )
-_PLAY_TRACK_QUOTED_RE = re.compile(
-    r"(?:reproducir|reproduce|play)\s+[\"'“”]([^\"'“”]{1,120})[\"'“”]",
-    flags=re.IGNORECASE,
-)
-_CLICK_PLAY_OF_RE = re.compile(
-    r"(?:click|haz\s+click|pulsa|presiona)\s+[\"'“”](?:reproducir|play local|play)[\"'“”]\s+"
-    r"(?:de|for)\s+[\"'“”]?([^\"'“”,.;]{1,120})",
-    flags=re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -100,10 +80,6 @@ class WebStep:
 def parse_steps(task: str) -> list[WebStep]:
     captures: list[tuple[int, int, WebStep]] = []
 
-    for match in _ADD_ALL_READY_RE.finditer(task):
-        captures.append((match.start(), match.end(), WebStep("add_all_ready_to_playlist", "READY")))
-    for match in _REMOVE_ALL_PLAYLIST_RE.finditer(task):
-        captures.append((match.start(), match.end(), WebStep("remove_all_playlist_tracks", "ALL")))
     for match in _BULK_CLICK_IN_CARDS_RE.finditer(task):
         packed = f"{match.group(2).strip()}||{match.group(3).strip()}"
         captures.append((match.start(), match.end(), WebStep("bulk_click_in_cards", match.group(1).strip(), packed)))
@@ -169,10 +145,6 @@ def parse_steps(task: str) -> list[WebStep]:
         steps.append(WebStep("wait_selector", match.group(1).strip()))
     for match in _WAIT_TEXT_RE.finditer(task):
         steps.append(WebStep("wait_text", match.group(1).strip()))
-    for _match in _ADD_ALL_READY_RE.finditer(task):
-        steps.append(WebStep("add_all_ready_to_playlist", "READY"))
-    for _match in _REMOVE_ALL_PLAYLIST_RE.finditer(task):
-        steps.append(WebStep("remove_all_playlist_tracks", "ALL"))
     for match in _BULK_CLICK_IN_CARDS_RE.finditer(task):
         packed = f"{match.group(2).strip()}||{match.group(3).strip()}"
         steps.append(WebStep("bulk_click_in_cards", match.group(1).strip(), packed))
@@ -193,41 +165,6 @@ def parse_steps(task: str) -> list[WebStep]:
     return steps
 
 
-def extract_play_track_hints(task: str) -> list[str]:
-    hints: list[str] = []
-    for pattern in (_PLAY_TRACK_QUOTED_RE, _CLICK_PLAY_OF_RE):
-        for match in pattern.finditer(task):
-            value = _collapse_ws(match.group(1))
-            low = value.strip().lower()
-            if not low:
-                continue
-            if low in {"reproducir", "play", "play local", "stop", "next", "prev"}:
-                continue
-            if value not in hints:
-                hints.append(value)
-    return hints
-
-
-def rewrite_generic_play_steps(steps: list[WebStep], play_hints: list[str]) -> list[WebStep]:
-    if not steps or not play_hints:
-        return steps
-    out: list[WebStep] = []
-    hint_idx = 0
-    for step in steps:
-        if step.kind == "click_text" and _is_generic_play_label(step.target):
-            target_hint = play_hints[min(hint_idx, len(play_hints) - 1)]
-            hint_idx += 1
-            out.append(WebStep("click_track_play", target_hint))
-            continue
-        out.append(step)
-    return out
-
-
-def _is_generic_play_label(value: str) -> bool:
-    low = str(value or "").strip().lower()
-    return low in {"reproducir", "play", "play local"}
-
-
 def _text_clicks_outside_spans(task: str, spans: list[tuple[int, int]]) -> list[tuple[int, int, str]]:
     found: list[tuple[int, int, str]] = []
     for match in _CLICK_TEXT_RE.finditer(task):
@@ -236,7 +173,3 @@ def _text_clicks_outside_spans(task: str, spans: list[tuple[int, int]]) -> list[
             continue
         found.append((start, end, match.group(1).strip()))
     return found
-
-
-def _collapse_ws(value: str) -> str:
-    return " ".join(str(value or "").split())

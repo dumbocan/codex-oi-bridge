@@ -260,7 +260,7 @@ class CLITests(unittest.TestCase):
                     goal="web: http://localhost:5173",
                     actions=[
                         "cmd: playwright goto http://localhost:5173",
-                        "cmd: playwright click text:Entrar demo",
+                        "cmd: playwright click text:Sign in",
                     ],
                     observations=["Opened URL", "Clicked text in step 1"],
                     console_errors=[],
@@ -284,7 +284,7 @@ class CLITests(unittest.TestCase):
             ):
                 with redirect_stdout(io.StringIO()):
                     run_command(
-                        "abre http://localhost:5173 y haz click en 'Entrar demo'",
+                        "abre http://localhost:5173 y haz click en 'Sign in'",
                         confirm_sensitive=True,
                         mode="web",
                     )
@@ -460,7 +460,7 @@ class CLITests(unittest.TestCase):
                     "cmd: playwright goto http://localhost:5173",
                     "cmd: playwright wait selector:#form",
                     "cmd: playwright wait text:Cargando",
-                    "cmd: playwright click text:Entrar demo",
+                    "cmd: playwright click text:Sign in",
                 ],
                 observations=["Opened URL", "Waited selector", "Clicked text in step 1"],
                 console_errors=[],
@@ -504,7 +504,7 @@ class CLITests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=False,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -583,7 +583,7 @@ class CLITests(unittest.TestCase):
                     goal="web: http://localhost:5173",
                     actions=[
                         "cmd: playwright goto http://localhost:5173",
-                        "cmd: playwright click text:Entrar demo",
+                        "cmd: playwright click text:Sign in",
                     ],
                     observations=["Opened URL", "Clicked text in step 1"],
                     console_errors=[],
@@ -606,7 +606,7 @@ class CLITests(unittest.TestCase):
             ), patch("bridge.cli.mark_controlled") as mark_mock:
                 with redirect_stdout(io.StringIO()):
                     run_command(
-                        "abre http://localhost:5173 y haz click en 'Entrar demo'",
+                        "abre http://localhost:5173 y haz click en 'Sign in'",
                         confirm_sensitive=True,
                         mode="web",
                         keep_open=True,
@@ -621,7 +621,7 @@ class CLITests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -660,7 +660,7 @@ class CLITests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=False,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",

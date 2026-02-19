@@ -5,10 +5,7 @@ from __future__ import annotations
 INTERACTIVE_STEP_KINDS = {
     "click_selector",
     "click_text",
-    "click_track_play",
     "maybe_click_text",
-    "add_all_ready_to_playlist",
-    "remove_all_playlist_tracks",
     "bulk_click_in_cards",
     "bulk_click_until_empty",
     "fill_selector",
@@ -19,9 +16,6 @@ INTERACTIVE_STEP_KINDS = {
 TEACHING_HANDOFF_KINDS = {
     "click_text",
     "click_selector",
-    "click_track_play",
-    "add_all_ready_to_playlist",
-    "remove_all_playlist_tracks",
     "bulk_click_in_cards",
     "bulk_click_until_empty",
     "fill_selector",
@@ -30,9 +24,7 @@ TEACHING_HANDOFF_KINDS = {
 LEARNING_TARGET_STEP_KINDS = {
     "click_selector",
     "click_text",
-    "click_track_play",
     "maybe_click_text",
-    "add_all_ready_to_playlist",
     "fill_selector",
     "select_label",
     "select_value",

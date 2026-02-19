@@ -35,6 +35,18 @@ Flujo recomendado:
 
 No usar `bridge` directo salvo que la sesión tenga `.venv` y `.env` cargados manualmente.
 
+## App Semantics Policy
+
+- `codex-oi-bridge` mantiene motor **genérico** (acciones, prechecks, skip, retries, teaching/handoff, reporting).
+- La semántica específica de cada app (flujos, estado login, selectores de negocio) vive en el repositorio de esa app.
+- Para Audio3, el playbook oficial está en:
+  - `/home/micasa/audio3/docs/11-OI-PLAYBOOK.md`
+- Contrato de lectura para ejecutar Audio3 con OI:
+  1. `/home/micasa/audio3/README.md`
+  2. `/home/micasa/audio3/docs/11-OI-PLAYBOOK.md`
+  3. `/home/micasa/audio3/AGENTS.md`
+  - Precedencia: `AGENTS.md > README.md > PLAYBOOK`.
+
 ## Contrato JSON
 
 Salida final estricta:
@@ -347,6 +359,145 @@ Ver handoff completo en `docs/CODEX_HANDOFF.md`.
 - Antiruido de observabilidad:
   - `minimal` evita ruido en `USER CONTROL` libre y no cuenta `mousemove/scroll` triviales como progreso útil,
   - `debug` habilita telemetría amplia para debugging.
+
+## Playbook reproducible: movimiento visual + Stop (Audio3)
+
+Este flujo es el que se validó en sesión real para ver cursor/colores y ejecutar `Stop`.
+
+Precondiciones:
+- App Audio3 levantada en `http://127.0.0.1:5181`.
+- Usar siempre `bridge-safe` (carga runtime/entorno correcto).
+
+Comando exacto (visual + teaching + keep-open):
+
+```bash
+./bridge-safe web-run --visual --visual-cursor on --visual-click-pulse on --visual-human-mouse on --visual-mouse-speed 0.75 --visual-click-hold-ms 180 --teaching --keep-open "open http://127.0.0.1:5181, click selector '#track-play-track-stan', wait text:'Now playing:', click selector '#player-stop-btn', verify visible result"
+```
+
+Verificación esperada:
+- Se ve borde/estado visual en top bar (`ASSISTANT CONTROL` azul cuando controla el asistente).
+- Se ve cursor/pulso de click.
+- En `report.json` aparecen acciones:
+  - `cmd: playwright visual on`
+  - `cmd: playwright click selector:#track-play-track-stan`
+  - `cmd: playwright wait text:Now playing:`
+  - `cmd: playwright click selector:#player-stop-btn`
+
+Evidence:
+- `runs/<run_id>/report.json`
+- `runs/<run_id>/evidence/step_*_before.png`
+- `runs/<run_id>/evidence/step_*_after.png`
+
+Comprobación rápida de resultado:
+
+```bash
+cat runs/status.json
+```
+
+Debe terminar con `state: "completed"` (nunca quedarse en `running`).
+
+### Playbook específico: mouse humano (el que nos costó estabilizar)
+
+Objetivo:
+- Ver trayectoria de puntero + click humano (hold/release) de forma consistente.
+
+Comando recomendado:
+
+```bash
+./bridge-safe web-run --visual --visual-cursor on --visual-click-pulse on --visual-human-mouse on --visual-mouse-speed 0.75 --visual-click-hold-ms 180 --teaching --keep-open "open http://127.0.0.1:5181, click selector '#player-stop-btn'"
+```
+
+Ajustes que sí funcionaron:
+- `--visual-human-mouse on`: activa movimiento humano, no click instantáneo.
+- `--visual-mouse-speed 0.75`: evita movimiento excesivamente lento (atasca) o demasiado rápido (sin feedback claro).
+- `--visual-click-hold-ms 180`: `mousedown`/`mouseup` visible y estable.
+- `--visual-cursor on` + `--visual-click-pulse on`: feedback visual claro.
+
+Señales de que está bien:
+- El cursor se desplaza hasta el target (no “teletransporte”).
+- Se ve pulso al click.
+- En `report.json` hay acción de click del target esperado.
+
+Si falla:
+- confirmar `cmd: playwright visual on` en `report.json`,
+- reducir complejidad del prompt a un solo click,
+- repetir sin `--keep-open` para aislar estado viejo de sesión,
+- cerrar sesión previa con `./bridge-safe web-close --attach <session_id>`.
+
+### Fallos reales que tuvimos y cómo evitarlos
+
+1. Overlay de color no visible aunque el click sí funcionaba.
+- Causa: capa visual/overlay no siempre se inyectaba en ciertos runs.
+- Prevención: ejecutar con `--visual --visual-cursor on --visual-click-pulse on` y verificar en `report.json` `cmd: playwright visual on`.
+
+2. Run atascado en `wait text:'Now playing:'` y no llegaba a `Stop`.
+- Causa: espera estricta en un estado frágil de reproducción.
+- Prevención: teaching con soft-skip de ese wait cuando el siguiente objetivo es `Stop`.
+
+3. Handoff aprendía una clave basura tipo `step 3/4 wait_text:...`.
+- Causa: target de learning tomado desde firma de paso, no desde objetivo interactivo.
+- Prevención: learning solo con target interactivo real (`#player-stop-btn`, `Stop`).
+
+4. Click manual tras handoff no se capturaba (`learning_capture=none`).
+- Causa: ventana/estado de learning no mantenido correctamente o click filtrado.
+- Prevención: `learning_active=true` durante ventana de aprendizaje y captura explícita de click manual útil.
+
+5. Foco atrapado en iframe YouTube.
+- Causa: contexto en iframe durante acción de app.
+- Prevención: política `main-frame-first`, desactivar `pointer-events` en iframe activo y reintentar en DOM principal; si no recupera, handoff automático.
+
+6. Runs quedaban en `running` sin `report.json`.
+- Causa: falta de cierre duro en ciertos atascos/timeouts.
+- Prevención: timeout duro por paso/run + finalización garantizada con `report.json` consistente.
+
+7. Sesiones abiertas acumuladas tras pruebas visuales.
+- Causa: uso de `--keep-open` sin cierre manual.
+- Prevención: cerrar siempre al terminar pruebas:
+
+```bash
+./bridge-safe web-close --attach <session_id>
+```
+
+## Resumen consolidado de lo implementado
+
+- Web teaching robusto:
+  - retries con selector estable + scroll y evidencia before/after,
+  - handoff automático por `target_not_found`, `stuck`, `stuck_iframe_focus`, `interactive_timeout`, `run_timeout`,
+  - `keep-open` efectivo en handoff.
+- Watchdog global:
+  - detección por step sin cambio y por falta de progreso útil,
+  - no depende de excepción para ceder control.
+- Aprendizaje real:
+  - captura click manual útil (selector/text/url/timestamp),
+  - persistencia en `runs/<run_id>/learning/` y `runs/learning/web_teaching_selectors.json`,
+  - reutilización en runs siguientes por contexto.
+- Main-frame-first/iframe:
+  - salida activa de foco iframe,
+  - guard temporal `pointer-events: none` en iframe YouTube durante handoff/learning.
+- Antiruido observabilidad:
+  - `BRIDGE_OBSERVER_NOISE_MODE=minimal|debug`,
+  - en `minimal` no se cuentan eventos triviales como progreso útil.
+- Cierre garantizado:
+  - `report.json` y `status.json` consistentes al finalizar,
+  - run no queda en `running` indefinido.
+- Refactor incremental en progreso (sin romper tests):
+  - extracción a módulos: parser, bulk scan, teaching, watchdog, handoff, frame-guard, executor step helpers, finalización.
+
+## Estructura de carpetas (refactor en progreso)
+
+Nota:
+- Esta sección refleja el estado actual. Cuando cerremos la refactor completa, se actualizará con el árbol final estable.
+
+Módulos principales en `src/bridge/`:
+- `web_backend.py`: orquestación principal de ejecución web (todavía en reducción progresiva).
+- `web_steps.py`: parseo de comandos web y rewrite de pasos genéricos (ej. play ambiguo).
+- `web_bulk_scan.py`: escaneo DOM para operaciones bulk (cards, selectors visibles, playlist seleccionada).
+- `web_teaching.py`: captura de aprendizaje manual, validación de click útil, artefactos y resume.
+- `web_watchdog.py`: estado/config de watchdog y evaluación de atascos.
+- `web_executor_steps.py`: clasificación de tipos de step y findings repetidos de error/timeout.
+- `web_run_finalize.py`: normalización de resultado final y estructura de `ui_findings`.
+- `web_handoff.py`: avisos y transición de control en handoff teaching.
+- `web_frame_guard.py`: política main-frame-first y guardias de foco/iframe.
 
 ## Modelo mental: OI + Bridge + App
 

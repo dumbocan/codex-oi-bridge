@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
-import math
-import random
 import re
 import socket
 import os
@@ -19,12 +16,27 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from bridge.models import OIReport
+from bridge.web_common import (
+    collapse_ws as _collapse_ws,
+    is_generic_play_label as _is_generic_play_label,
+    is_valid_url as _is_valid_url,
+    normalize_url as _normalize_url,
+    playwright_available as _playwright_available,
+    safe_page_title as _safe_page_title,
+    same_origin_path as _same_origin_path,
+)
+from bridge.web_overlay import (
+    destroy_top_bar as _destroy_top_bar,
+    notify_learning_state as _notify_learning_state,
+    session_state_payload as _session_state_payload,
+    set_assistant_control_overlay as _set_assistant_control_overlay,
+    set_learning_handoff_overlay as _set_learning_handoff_overlay,
+    set_user_control_overlay as _set_user_control_overlay,
+    update_top_bar_state as _update_top_bar_state,
+)
 from bridge.web_bulk_scan import (
-    scan_playlist_remove_selectors as _bulk_scan_playlist_remove_selectors,
     scan_visible_buttons_in_cards as _bulk_scan_visible_buttons_in_cards,
-    scan_visible_ready_add_selectors as _bulk_scan_visible_ready_add_selectors,
     scan_visible_selectors as _bulk_scan_visible_selectors,
-    selected_playlist_name as _bulk_selected_playlist_name,
 )
 from bridge.web_executor_steps import (
     INTERACTIVE_STEP_KINDS,
@@ -35,8 +47,32 @@ from bridge.web_executor_steps import (
     append_wait_timeout_findings,
     step_learning_target as _step_learning_target,
 )
+from bridge.web_frame_guard import (
+    disable_active_youtube_iframe_pointer_events as _frame_disable_active_youtube_iframe_pointer_events,
+    force_main_frame_context as _frame_force_main_frame_context,
+    is_iframe_focus_locked as _frame_is_iframe_focus_locked,
+    restore_iframe_pointer_events as _frame_restore_iframe_pointer_events,
+)
+from bridge.web_handoff import (
+    show_custom_handoff_notice as _handoff_show_custom_notice,
+    show_stuck_handoff_notice as _handoff_show_stuck_notice,
+    trigger_stuck_handoff as _handoff_trigger_stuck,
+)
+from bridge.web_interaction_helpers import (
+    apply_wait_step as _helpers_apply_wait_step,
+    retry_scroll as _retry_scroll,
+    semantic_hints_for_selector as _semantic_hints_for_selector,
+    stable_selectors_for_target as _stable_selectors_for_target,
+)
+from bridge.web_interactive_capture import (
+    capture_movement as _capture_movement_artifact,
+)
+from bridge.web_mouse import (
+    _human_mouse_click,
+    _human_mouse_move,
+    get_last_human_route as _get_last_human_route,
+)
 from bridge.web_run_finalize import (
-    ensure_structured_ui_findings as _finalize_ensure_structured_ui_findings,
     finalize_result as _finalize_result,
 )
 from bridge.storage import write_json, write_status
@@ -58,11 +94,16 @@ from bridge.web_watchdog import (
     remaining_ms as watchdog_remaining_ms,
     update_step_signature,
 )
+from bridge.web_visual_overlay import (
+    _ensure_visual_overlay_installed,
+    _highlight_target,
+    _install_visual_overlay,
+    _read_visual_overlay_snapshot,
+    _verify_visual_overlay_visible,
+)
 from bridge.web_steps import (
     WebStep,
-    extract_play_track_hints,
     parse_steps,
-    rewrite_generic_play_steps,
 )
 from bridge.web_session import (
     WebSession,
@@ -70,20 +111,7 @@ from bridge.web_session import (
     request_session_state,
 )
 
-_LAST_HUMAN_ROUTE: list[tuple[float, float]] = []
-
-
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
-
-_AUTH_HINTS = (
-    "cerrar sesion",
-    "cerrar sesión",
-    "logout",
-    "sign out",
-    "dashboard",
-    "mi cuenta",
-    "perfil",
-)
 
 _LEARNING_DIR = Path("runs") / "learning"
 _LEARNING_JSON = _LEARNING_DIR / "web_teaching_selectors.json"
@@ -121,8 +149,6 @@ def run_web_task(
     _preflight_target_reachable(url)
     _preflight_stack_prereqs()
     steps = _parse_steps(task)
-    play_hints = _extract_play_track_hints(task)
-    steps = _rewrite_generic_play_steps(steps, play_hints)
 
     if not _playwright_available():
         raise SystemExit(
@@ -326,26 +352,6 @@ def ensure_session_top_bar(session: WebSession) -> None:
 
 def _parse_steps(task: str) -> list[WebStep]:
     return parse_steps(task)
-
-
-def _extract_play_track_hints(task: str) -> list[str]:
-    return extract_play_track_hints(task)
-
-
-def _rewrite_generic_play_steps(steps: list[WebStep], play_hints: list[str]) -> list[WebStep]:
-    return rewrite_generic_play_steps(steps, play_hints)
-
-
-def _playwright_available() -> bool:
-    return importlib.util.find_spec("playwright") is not None
-
-
-def _safe_page_title(page: object) -> str:
-    try:
-        # Playwright can throw if execution context is destroyed during navigation/HMR.
-        return str(getattr(page, "title")())
-    except Exception:
-        return ""
 
 
 def _page_is_closed(page: Any | None) -> bool:
@@ -583,20 +589,6 @@ def _execute_playwright(
                 f"context title={_safe_page_title(page)} url={page.url} body[:500]={body_snippet}"
             )
 
-            # Conditional login: if demo button exists+visible+enabled, click; otherwise continue as already authed.
-            if _demo_login_button_available(page):
-                if _task_already_requests_demo_click(steps):
-                    observations.append(
-                        "Login step already requested by task; skipping auto demo click insertion"
-                    )
-                else:
-                    observations.append("Login state detected: Entrar demo present and enabled")
-                    # Insert a native optional step at the front (keeps evidence before/after machinery).
-                    steps = [WebStep("maybe_click_text", "Entrar demo")] + steps
-            else:
-                observations.append("demo not present; already authed")
-                ui_findings.append("demo not present; already authed")
-
             def _remaining_ms(deadline_ts: float) -> int:
                 return watchdog_remaining_ms(deadline_ts, now_ts=time.monotonic())
 
@@ -709,6 +701,20 @@ def _execute_playwright(
 
             interactive_step = 0
             total = len(steps)
+            step_outcomes: list[dict[str, Any]] = []
+
+            def _record_step_outcome(*, idx: int, step: WebStep, status: str, reason: str = "") -> None:
+                payload = {
+                    "index": int(idx),
+                    "kind": str(step.kind),
+                    "target": str(step.target),
+                    "status": str(status),
+                }
+                if reason:
+                    payload["reason"] = str(reason)
+                step_outcomes.append(payload)
+                ui_findings.append(f"step_status={json.dumps(payload, ensure_ascii=False)}")
+
             for idx, step in enumerate(steps, start=1):
                 attempted_hint = ""
                 step_sig = f"step {idx}/{total} {step.kind}:{step.target}"
@@ -762,6 +768,22 @@ def _execute_playwright(
                     )
 
                 if step.kind in INTERACTIVE_STEP_KINDS:
+                    skip_reason = _interactive_step_not_applicable_reason(page, step)
+                    if skip_reason:
+                        observations.append(
+                            f"Step {idx}: skipped_not_applicable {step.kind}:{step.target} ({skip_reason})"
+                        )
+                        ui_findings.append(
+                            f"step {idx} skipped_not_applicable: {step.kind}:{step.target} reason={skip_reason}"
+                        )
+                        _record_step_outcome(
+                            idx=idx,
+                            step=step,
+                            status="skipped_not_applicable",
+                            reason=skip_reason,
+                        )
+                        watchdog_state.last_progress_event_ts = time.monotonic()
+                        continue
                     step_started_at = time.monotonic()
                     step_deadline_ts = step_started_at + step_hard_timeout_seconds
                     if min(_remaining_ms(step_deadline_ts), _remaining_ms(run_deadline_ts)) <= 0:
@@ -970,6 +992,7 @@ def _execute_playwright(
                         break
                     if len(actions) > prev_action_len:
                         watchdog_state.last_progress_event_ts = time.monotonic()
+                    _record_step_outcome(idx=idx, step=step, status="executed")
                     page.wait_for_timeout(1000)
                     page.screenshot(path=str(after), full_page=False)
                     evidence_paths.append(_to_repo_rel(after))
@@ -1050,6 +1073,12 @@ def _execute_playwright(
                             ui_findings.append(
                                 f"step {idx} soft-skip wait timeout on {step.kind}:{step.target} (teaching)"
                             )
+                            _record_step_outcome(
+                                idx=idx,
+                                step=step,
+                                status="skipped_not_applicable",
+                                reason="teaching soft-skip wait timeout",
+                            )
                             continue
                         timeout_path = evidence_dir / f"step_{idx}_timeout.png"
                         try:
@@ -1079,10 +1108,12 @@ def _execute_playwright(
                         force_reinit=True,
                     )
                 watchdog_state.last_progress_event_ts = time.monotonic()
+                _record_step_outcome(idx=idx, step=step, status="executed")
                 if teaching_mode and _watchdog_stuck_attempt(
                     attempted_hint or f"watchdog:post-step:{step.kind}"
                 ):
                     break
+            ui_findings.append(f"steps_outcome={json.dumps(step_outcomes, ensure_ascii=False)}")
             if release_for_handoff and handoff_reason != "stuck" and session is not None:
                 mark_controlled(session, False, url=page.url, title=_safe_page_title(page))
                 if wait_for_human_learning:
@@ -1230,19 +1261,6 @@ def _execute_playwright(
     )
 
 
-def _ensure_structured_ui_findings(
-    ui_findings: list[str],
-    *,
-    result: str,
-    where_default: str,
-) -> None:
-    _finalize_ensure_structured_ui_findings(
-        ui_findings,
-        result=result,
-        where_default=where_default,
-    )
-
-
 @dataclass(frozen=True)
 class _RetryResult:
     selector_used: str = ""
@@ -1286,21 +1304,14 @@ def _apply_interactive_step_with_retries(
     elif step.kind == "click_selector":
         for selector in learning_selectors:
             candidates.insert(0, WebStep("click_selector", selector))
-        if (not _is_specific_selector(step.target)) or _is_stop_semantic_step(step):
+        if not _is_specific_selector(step.target):
             for hint in _semantic_hints_for_selector(step.target):
                 candidates.append(WebStep("click_text", hint))
                 for selector in _stable_selectors_for_target(hint):
                     candidates.append(WebStep("click_selector", selector))
-    elif step.kind == "click_track_play":
-        for selector in learning_selectors:
-            candidates.insert(0, WebStep("click_selector", selector))
 
     last_exc: Exception | None = None
-    if step.kind == "click_track_play":
-        # click_track_play already performs internal paged scanning; avoid triple full rescans.
-        total_attempts = 1
-    else:
-        total_attempts = max(1, int(max_retries) + 1)
+    total_attempts = max(1, int(max_retries) + 1)
     started_at = time.monotonic()
     baseline_events = _observer_useful_event_count(session)
     attempted_parts: list[str] = []
@@ -1425,63 +1436,6 @@ def _observer_useful_event_count(session: WebSession | None) -> int:
     return count
 
 
-def _retry_scroll(page: Any, *, amount: int = 180, pause_ms: int = 140) -> None:
-    step = max(80, int(amount))
-    try:
-        page.evaluate(
-            """
-            (step) => {
-              const main = document.querySelector('main,[role="main"],#main,.main,#__next,.app,[data-testid="main"]');
-              if (main && typeof main.scrollBy === 'function') {
-                main.scrollBy(0, step);
-              }
-              window.scrollBy(0, step);
-            }
-            """,
-            step,
-        )
-    except Exception:
-        try:
-            page.evaluate("([step]) => window.scrollBy(0, step)", [step])
-        except Exception:
-            pass
-    try:
-        page.wait_for_timeout(max(40, int(pause_ms)))
-    except Exception:
-        pass
-
-
-def _stable_selectors_for_target(target: str) -> list[str]:
-    clean = str(target).strip()
-    if not clean:
-        return []
-    escaped = clean.replace('"', '\\"')
-    return [
-        f'button:has-text("{escaped}")',
-        f'[role="button"]:has-text("{escaped}")',
-        f'a:has-text("{escaped}")',
-        f'[aria-label*="{escaped}" i]',
-        f'[title*="{escaped}" i]',
-    ]
-
-
-def _is_generic_play_label(value: str) -> bool:
-    low = str(value or "").strip().lower()
-    return low in {"reproducir", "play", "play local"}
-
-
-def _semantic_hints_for_selector(selector: str) -> list[str]:
-    low = str(selector or "").strip().lower()
-    if not low:
-        return []
-    hints: list[str] = []
-    if "stop" in low:
-        hints.append("Stop")
-    if "play" in low or "reproducir" in low:
-        hints.append("Reproducir")
-    return hints
-
-
 def _learning_context(url: str, title: str) -> dict[str, str]:
     parsed = urlparse(str(url))
     hostname = str(parsed.netloc or "").lower()
@@ -1563,8 +1517,6 @@ def _normalize_learning_target_key(raw: str, *, selector: str = "") -> str:
     merged = " ".join([text, probe, sel]).strip()
     if not merged:
         return ""
-    if "stop" in merged or "#player-stop-btn" in merged:
-        return "stop"
     # Avoid persisting noisy step signatures as learning keys.
     if text.startswith("step ") and ("click_" in text or "wait_" in text):
         return ""
@@ -1590,11 +1542,7 @@ def _is_specific_selector(selector: str) -> bool:
         return False
     if ":has-text(" in low:
         return False
-    if low.startswith("#"):
-        return True
-    if low.startswith("[data-testid") or low.startswith("[data-test") or low.startswith("[id="):
-        return True
-    return "__bridge_" not in low and ("track-play-" in low or "player-stop-btn" in low)
+    return "__bridge_" not in low
 
 
 def _learned_selectors_for_step(
@@ -1602,7 +1550,7 @@ def _learned_selectors_for_step(
     selector_map: dict[str, dict[str, list[str]]],
     context: dict[str, str],
 ) -> list[str]:
-    if step.kind not in {"click_text", "click_selector", "click_track_play"}:
+    if step.kind not in {"click_text", "click_selector"}:
         return []
     state_key = str(context.get("state_key", "")).strip()
     if not state_key:
@@ -1624,23 +1572,13 @@ def _learned_selectors_for_step(
     return out
 
 
-def _is_stop_semantic_step(step: WebStep) -> bool:
-    if step.kind not in {"click_selector", "click_text", "maybe_click_text"}:
-        return False
-    probe = f"{step.kind}:{step.target}".lower()
-    return "stop" in probe or "#player-stop-btn" in probe
-
-
 def _should_soft_skip_wait_timeout(
     *, steps: list[WebStep], idx: int, step: WebStep, teaching_mode: bool
 ) -> bool:
     if not teaching_mode or step.kind != "wait_text":
         return False
-    target = str(step.target).strip().lower()
-    if "now playing" not in target:
-        return False
     remaining = steps[idx:]
-    return any(_is_stop_semantic_step(candidate) for candidate in remaining)
+    return any(candidate.kind in INTERACTIVE_STEP_KINDS for candidate in remaining)
 
 
 def _prioritize_steps_with_learned_selectors(
@@ -1667,68 +1605,11 @@ def _show_teaching_handoff_notice(page: Any, target: str) -> None:
 
 
 def _show_stuck_handoff_notice(page: Any, step_text: str) -> None:
-    msg = f"Me he atascado en: {step_text}. Te cedo el control para que me ayudes."
-    try:
-        page.evaluate(
-            """
-            ([message]) => {
-              const id = '__bridge_teaching_handoff_notice';
-              let el = document.getElementById(id);
-              if (!el) {
-                el = document.createElement('div');
-                el.id = id;
-                el.style.position = 'fixed';
-                el.style.left = '50%';
-                el.style.bottom = '18px';
-                el.style.transform = 'translateX(-50%)';
-                el.style.padding = '10px 14px';
-                el.style.borderRadius = '10px';
-                el.style.background = 'rgba(245,158,11,0.95)';
-                el.style.color = '#fff';
-                el.style.font = '13px/1.3 monospace';
-                el.style.zIndex = '2147483647';
-                el.style.boxShadow = '0 8px 18px rgba(0,0,0,0.3)';
-                document.documentElement.appendChild(el);
-              }
-              el.textContent = String(message || '');
-            }
-            """,
-            [msg],
-        )
-    except Exception:
-        return
+    _handoff_show_stuck_notice(page, step_text)
 
 
 def _show_custom_handoff_notice(page: Any, message: str) -> None:
-    try:
-        page.evaluate(
-            """
-            ([msg]) => {
-              const id = '__bridge_teaching_handoff_notice';
-              let el = document.getElementById(id);
-              if (!el) {
-                el = document.createElement('div');
-                el.id = id;
-                el.style.position = 'fixed';
-                el.style.left = '50%';
-                el.style.bottom = '18px';
-                el.style.transform = 'translateX(-50%)';
-                el.style.padding = '10px 14px';
-                el.style.borderRadius = '10px';
-                el.style.background = 'rgba(245,158,11,0.95)';
-                el.style.color = '#fff';
-                el.style.font = '13px/1.3 monospace';
-                el.style.zIndex = '2147483647';
-                el.style.boxShadow = '0 8px 18px rgba(0,0,0,0.3)';
-                document.documentElement.appendChild(el);
-              }
-              el.textContent = String(msg || '');
-            }
-            """,
-            [message],
-        )
-    except Exception:
-        return
+    _handoff_show_custom_notice(page, message)
 
 
 def _trigger_stuck_handoff(
@@ -1746,165 +1627,56 @@ def _trigger_stuck_handoff(
     notice_message: str = "",
     why_likely: str = "step unchanged/no useful progress within stuck thresholds during teaching mode",
 ) -> bool:
-    if notice_message:
-        _show_custom_handoff_notice(page, notice_message)
-    else:
-        _show_stuck_handoff_notice(page, where)
-    _set_learning_handoff_overlay(page, True)
-    if visual and control_enabled:
-        _set_assistant_control_overlay(page, False)
-    if session is not None:
-        mark_controlled(session, False, url=getattr(page, "url", ""), title=_safe_page_title(page))
-        _notify_learning_state(session, active=True, window_seconds=learning_window_seconds)
-        try:
-            _update_top_bar_state(
-                page,
-                _session_state_payload(session, override_controlled=False, learning_active=True),
-            )
-        except Exception:
-            pass
-    if "cmd: playwright release control (teaching handoff)" not in actions:
-        actions.append("cmd: playwright release control (teaching handoff)")
-    ui_findings.append(
-        notice_message or f"Me he atascado en: {where}. Te cedo el control para que me ayudes."
+    return _handoff_trigger_stuck(
+        page=page,
+        session=session,
+        visual=visual,
+        control_enabled=control_enabled,
+        where=where,
+        attempted=attempted,
+        learning_window_seconds=learning_window_seconds,
+        actions=actions,
+        ui_findings=ui_findings,
+        what_failed=what_failed,
+        notice_message=notice_message,
+        why_likely=why_likely,
+        show_custom_notice=_show_custom_handoff_notice,
+        show_stuck_notice=_show_stuck_handoff_notice,
+        set_learning_handoff_overlay=_set_learning_handoff_overlay,
+        set_assistant_control_overlay=_set_assistant_control_overlay,
+        mark_controlled=mark_controlled,
+        safe_page_title=_safe_page_title,
+        notify_learning_state=_notify_learning_state,
+        update_top_bar_state=_update_top_bar_state,
+        session_state_payload=_session_state_payload,
     )
-    if "control released" not in ui_findings:
-        ui_findings.append("control released")
-    ui_findings.append(f"what_failed={what_failed}")
-    ui_findings.append(f"where={where}")
-    ui_findings.append(f"attempted={attempted or 'watchdog'}")
-    ui_findings.append("next_best_action=human_assist")
-    ui_findings.append(f"why_likely={why_likely}")
-    return False
 
 
 def _is_iframe_focus_locked(page: Any) -> bool:
-    try:
-        return bool(
-            page.evaluate(
-                """
-                () => {
-                  const active = document.activeElement;
-                  if (!active) return false;
-                  if (String(active.tagName || '').toUpperCase() === 'IFRAME') return true;
-                  return !!document.querySelector('iframe:focus,iframe:focus-within');
-                }
-                """
-            )
-        )
-    except Exception:
-        return False
+    return _frame_is_iframe_focus_locked(page)
 
 
 def _disable_active_youtube_iframe_pointer_events(page: Any) -> dict[str, Any] | None:
-    if _page_is_closed(page):
-        return None
-    try:
-        token = page.evaluate(
-            """
-            () => {
-              const active = document.activeElement;
-              let frame = null;
-              if (active && String(active.tagName || '').toUpperCase() === 'IFRAME') {
-                frame = active;
-              }
-              if (!frame) frame = document.querySelector('iframe:focus,iframe:focus-within');
-              if (!frame) return null;
-              const src = String(frame.getAttribute('src') || '').toLowerCase();
-              const isYoutube =
-                src.includes('youtube.com') ||
-                src.includes('youtube-nocookie.com') ||
-                src.includes('youtu.be');
-              if (!isYoutube) return null;
-              const prev = String(frame.style.pointerEvents || '');
-              frame.setAttribute('data-bridge-prev-pe', prev || '__EMPTY__');
-              frame.style.pointerEvents = 'none';
-              const all = Array.from(document.querySelectorAll('iframe'));
-              const idx = all.indexOf(frame);
-              return { idx, id: String(frame.id || ''), prev };
-            }
-            """
-        )
-    except Exception:
-        return None
-    return token if isinstance(token, dict) else None
+    return _frame_disable_active_youtube_iframe_pointer_events(
+        page,
+        page_is_closed=_page_is_closed,
+    )
 
 
 def _restore_iframe_pointer_events(page: Any, token: dict[str, Any] | None) -> None:
-    if not token or _page_is_closed(page):
-        return
-    try:
-        page.evaluate(
-            """
-            ([tok]) => {
-              if (!tok || typeof tok !== 'object') return;
-              const all = Array.from(document.querySelectorAll('iframe'));
-              let frame = null;
-              if (tok.id) frame = document.getElementById(String(tok.id));
-              if (!frame && Number.isInteger(tok.idx) && tok.idx >= 0 && tok.idx < all.length) {
-                frame = all[tok.idx];
-              }
-              if (!frame) return;
-              const prevAttr = frame.getAttribute('data-bridge-prev-pe');
-              const prev = prevAttr === '__EMPTY__' ? '' : String(prevAttr || tok.prev || '');
-              frame.style.pointerEvents = prev;
-              frame.removeAttribute('data-bridge-prev-pe');
-            }
-            """,
-            [token],
-        )
-    except Exception:
-        return
+    _frame_restore_iframe_pointer_events(
+        page,
+        token,
+        page_is_closed=_page_is_closed,
+    )
 
 
 def _force_main_frame_context(page: Any, max_seconds: float = 8.0) -> bool:
-    # Main-frame-first policy: escape iframe focus and re-anchor to document body before actions.
-    deadline = time.monotonic() + max(0.1, float(max_seconds))
-    while time.monotonic() <= deadline:
-        try:
-            page.evaluate(
-                """
-                () => {
-                  const active = document.activeElement;
-                  if (active && String(active.tagName || '').toUpperCase() === 'IFRAME') {
-                    try { active.blur(); } catch (_e) {}
-                  }
-                }
-                """
-            )
-        except Exception:
-            pass
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
-        try:
-            page.evaluate(
-                """
-                () => {
-                  if (!document.body) return false;
-                  if (typeof document.body.focus === 'function') document.body.focus();
-                  try {
-                    const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
-                    document.body.dispatchEvent(evt);
-                  } catch (_e) {}
-                  return true;
-                }
-                """
-            )
-        except Exception:
-            pass
-        try:
-            is_main = bool(page.evaluate("() => !!document.body && window === window.top"))
-        except Exception:
-            is_main = False
-        if is_main and not _is_iframe_focus_locked(page):
-            return True
-        try:
-            page.wait_for_timeout(120)
-        except Exception:
-            pass
-    return False
+    return _frame_force_main_frame_context(
+        page,
+        max_seconds=max_seconds,
+        iframe_focus_locked=_is_iframe_focus_locked,
+    )
 
 
 def _show_learning_thanks_notice(page: Any, target: str) -> None:
@@ -1965,18 +1737,6 @@ def _resume_after_learning(
     )
 
 
-def _selected_playlist_name(page: Any) -> str:
-    return _bulk_selected_playlist_name(page)
-
-
-def _scan_visible_ready_add_selectors(page: Any, seen: set[str]) -> tuple[list[str], bool]:
-    return _bulk_scan_visible_ready_add_selectors(page, seen)
-
-
-def _scan_playlist_remove_selectors(page: Any, seen: set[str]) -> tuple[list[str], bool]:
-    return _bulk_scan_playlist_remove_selectors(page, seen)
-
-
 def _scan_visible_buttons_in_cards(
     page: Any,
     *,
@@ -2024,238 +1784,17 @@ def _apply_interactive_step(
 
         def _capture_movement(tag: str) -> None:
             nonlocal move_capture_count
-            if not visual:
-                return
-            if movement_capture_dir is None or evidence_paths is None:
-                return
-            move_capture_count += 1
-            shot = movement_capture_dir / f"step_{step_num}_move_{move_capture_count}_{tag}.png"
-            try:
-                pts = list(_LAST_HUMAN_ROUTE)
-                vw_vh = page.evaluate(
-                    "() => ({w: window.innerWidth || 1280, h: window.innerHeight || 860})"
-                )
-                if isinstance(pts, list) and len(pts) >= 2:
-                    w = int((vw_vh or {}).get("w") or 1280)
-                    h = int((vw_vh or {}).get("h") or 860)
-                    clean_pts: list[tuple[float, float]] = []
-                    for p in pts:
-                        if isinstance(p, (list, tuple)) and len(p) >= 2:
-                            try:
-                                clean_pts.append((float(p[0]), float(p[1])))
-                            except Exception:
-                                continue
-                    if len(clean_pts) >= 2:
-                        svg_path = movement_capture_dir / f"step_{step_num}_move_{move_capture_count}_{tag}.svg"
-                        points_attr = " ".join(f"{x:.2f},{y:.2f}" for x, y in clean_pts)
-                        svg = (
-                            f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
-                            f'viewBox="0 0 {w} {h}">'
-                            f'<polyline fill="none" stroke="rgb(0,180,255)" stroke-width="6" '
-                            f'stroke-linecap="round" stroke-linejoin="round" points="{points_attr}" />'
-                            "</svg>\n"
-                        )
-                        svg_path.write_text(svg, encoding="utf-8")
-                        evidence_paths.append(_to_repo_rel(svg_path))
-                page.evaluate(
-                    """
-                    () => {
-                      const prev = document.getElementById('__bridge_capture_path');
-                      if (prev) prev.remove();
-                      const pts = window.__bridgeLastHumanRoute;
-                      if (!Array.isArray(pts) || pts.length < 2) return;
-                      const clean = pts
-                        .map((p) => Array.isArray(p) ? { x: Number(p[0]), y: Number(p[1]) } : null)
-                        .filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
-                      if (clean.length < 2) return;
-                      const svgNS = 'http://www.w3.org/2000/svg';
-                      const svg = document.createElementNS(svgNS, 'svg');
-                      svg.id = '__bridge_capture_path';
-                      svg.setAttribute('width', '100%');
-                      svg.setAttribute('height', '100%');
-                      svg.setAttribute(
-                        'viewBox',
-                        `0 0 ${Math.max(1, window.innerWidth || 1)} ${Math.max(1, window.innerHeight || 1)}`
-                      );
-                      svg.setAttribute('preserveAspectRatio', 'none');
-                      svg.style.position = 'fixed';
-                      svg.style.inset = '0';
-                      svg.style.pointerEvents = 'none';
-                      svg.style.zIndex = '2147483646';
-                      const poly = document.createElementNS(svgNS, 'polyline');
-                      poly.setAttribute('fill', 'none');
-                      poly.setAttribute('stroke', 'rgba(0,180,255,1)');
-                      poly.setAttribute('stroke-width', '8');
-                      poly.setAttribute('stroke-linecap', 'round');
-                      poly.setAttribute('stroke-linejoin', 'round');
-                      poly.setAttribute('points', clean.map((p) => `${p.x},${p.y}`).join(' '));
-                      svg.appendChild(poly);
-                      document.documentElement.appendChild(svg);
-                    }
-                    """
-                )
-                page.wait_for_timeout(50)
-                page.screenshot(path=str(shot), full_page=False)
-                page.evaluate("() => document.getElementById('__bridge_capture_path')?.remove()")
-                evidence_paths.append(_to_repo_rel(shot))
-            except Exception:
-                return
-
-        def _is_generic_play_click(target_text: str) -> bool:
-            return _is_generic_play_label(target_text)
-
-        def _scan_whole_page_for_play_buttons() -> int:
-            # Force full-page scan before generic play clicks. This avoids clicking the first visible
-            # "Reproducir" without disambiguation when multiple tracks are present.
-            total = 0
-            try:
-                page.evaluate("() => window.scrollTo(0, 0)")
-            except Exception:
-                pass
-            for _ in range(18):
-                try:
-                    total = int(
-                        page.evaluate(
-                            """
-                            () => document.querySelectorAll(
-                              "[id^='track-play-'], [data-testid^='track-play-'], .track-card button"
-                            ).length
-                            """
-                        )
-                    )
-                except Exception:
-                    total = 0
-                try:
-                    moved = bool(
-                        page.evaluate(
-                            """
-                            () => {
-                              const maxY = Math.max(
-                                0,
-                                (document.documentElement?.scrollHeight || 0) - window.innerHeight
-                              );
-                              const prev = window.scrollY || 0;
-                              const next = Math.min(maxY, prev + Math.max(130, Math.floor(window.innerHeight * 0.28)));
-                              window.scrollTo(0, next);
-                              return next > prev;
-                            }
-                            """
-                        )
-                    )
-                except Exception:
-                    moved = False
-                if not moved:
-                    break
-                try:
-                    page.wait_for_timeout(95)
-                except Exception:
-                    pass
-            try:
-                page.evaluate("() => window.scrollTo(0, 0)")
-            except Exception:
-                pass
-            return total
-
-        if step.kind == "click_track_play":
-            track_hint = _collapse_ws(step.target)
-            card = None
-            try:
-                page.evaluate("() => window.scrollTo(0, 0)")
-                page.wait_for_timeout(80)
-            except Exception:
-                pass
-            max_scan_pages = 14
-            for page_idx in range(max_scan_pages):
-                candidate = page.locator(".track-card").filter(has_text=track_hint).first
-                try:
-                    if candidate.count() > 0:
-                        in_viewport = bool(
-                            candidate.evaluate(
-                                """
-                                (el) => {
-                                  const r = el.getBoundingClientRect();
-                                  return !!r && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight;
-                                }
-                                """
-                            )
-                        )
-                        if in_viewport:
-                            card = candidate
-                            observations.append(f"scan page {page_idx + 1}: track card visible for '{track_hint}'")
-                            break
-                except Exception:
-                    pass
-                observations.append(f"scan page {page_idx + 1}: track card not visible yet for '{track_hint}'")
-                _retry_scroll(page, amount=120, pause_ms=160)
-            if card is None:
-                # Final deep scroll pass: sometimes one extra page down is enough.
-                try:
-                    page.evaluate("() => window.scrollBy(0, Math.max(220, Math.floor(window.innerHeight * 0.45)))")
-                    page.wait_for_timeout(170)
-                except Exception:
-                    pass
-                candidate = page.locator(".track-card").filter(has_text=track_hint).first
-                try:
-                    if candidate.count() > 0:
-                        card = candidate
-                        observations.append(f"scan final pass: found card for '{track_hint}'")
-                except Exception:
-                    pass
-            if card is None:
-                raise RuntimeError(f"Track card not found for play target: {track_hint}")
-            local_btn = card.locator('[id^="track-play-local-"], [data-testid^="track-play-local-"]').first
-            play_btn = card.locator('[id^="track-play-"], [data-testid^="track-play-"]').first
-            button = None
-            try:
-                if local_btn.count() > 0:
-                    button = local_btn
-            except Exception:
-                button = None
-            if button is None:
-                button = play_btn
-            button.wait_for(state="visible", timeout=timeout_ms)
-            target = _highlight_target(
-                page,
-                button,
-                f"step {step_num}",
-                click_pulse_enabled=click_pulse_enabled and visual,
-                show_preview=not (visual and visual_human_mouse),
-                auto_scroll=False,
+            move_capture_count = _capture_movement_artifact(
+                page=page,
+                tag=tag,
+                step_num=step_num,
+                move_capture_count=move_capture_count,
+                visual=visual,
+                movement_capture_dir=movement_capture_dir,
+                evidence_paths=evidence_paths,
+                get_last_human_route=_get_last_human_route,
+                to_repo_rel=_to_repo_rel,
             )
-            if target is None:
-                raise SystemExit(f"Play button occluded for track: {track_hint}")
-            if visual and visual_human_mouse and target:
-                _human_mouse_click(
-                    page,
-                    target[0],
-                    target[1],
-                    speed=visual_mouse_speed,
-                    hold_ms=visual_click_hold_ms,
-                )
-                _capture_movement("after_click_track_play")
-            else:
-                button.click(timeout=timeout_ms)
-            chosen_selector = ""
-            try:
-                chosen_selector = str(
-                    button.get_attribute("id")
-                    or button.get_attribute("data-testid")
-                    or ""
-                ).strip()
-            except Exception:
-                chosen_selector = ""
-            actions.append(
-                f"cmd: playwright click track_play:{track_hint}"
-                + (f" selector:#{chosen_selector}" if chosen_selector and not chosen_selector.startswith("#") else "")
-            )
-            observations.append(
-                f"Clicked track card play in step {step_num}: track={track_hint}"
-                + (f", selector={chosen_selector}" if chosen_selector else "")
-            )
-            ui_findings.append(
-                f"step {step_num} verify visible result: url={page.url}, title={_safe_page_title(page)}"
-            )
-            return
 
         if step.kind == "click_selector":
             locator = page.locator(step.target).first
@@ -2291,15 +1830,6 @@ def _apply_interactive_step(
             return
 
         if step.kind == "click_text":
-            if _is_generic_play_click(step.target):
-                play_candidates = _scan_whole_page_for_play_buttons()
-                if play_candidates > 1:
-                    ui_findings.append(
-                        f"step {step_num} blocked ambiguous generic play click: candidates={play_candidates}"
-                    )
-                    raise RuntimeError(
-                        "Ambiguous generic play click detected. Specify track selector before clicking Reproducir."
-                    )
             locator = page.locator("body").get_by_text(step.target, exact=False).first
             try:
                 locator.wait_for(state="visible", timeout=timeout_ms)
@@ -2335,14 +1865,6 @@ def _apply_interactive_step(
             except Exception as exc:
                 if _is_timeout_error(exc):
                     raise
-                if _is_login_target(step.target) and _looks_authenticated(page):
-                    observations.append(
-                        f"Step {step_num}: target '{step.target}' not found; authenticated state detected."
-                    )
-                    ui_findings.append(
-                        f"step {step_num} verify authenticated session already active"
-                    )
-                    return
                 raise
 
         if step.kind == "maybe_click_text":
@@ -2381,67 +1903,6 @@ def _apply_interactive_step(
                 observations.append(f"Step {step_num}: maybe click not present: {step.target}")
                 ui_findings.append(f"step {step_num} verify optional click skipped: {step.target}")
                 return
-
-        if step.kind == "add_all_ready_to_playlist":
-            selected_playlist = _selected_playlist_name(page)
-            if not selected_playlist:
-                raise RuntimeError("No playlist selected. Select playlist before adding READY tracks.")
-            observations.append(f"step {step_num}: target playlist selected -> {selected_playlist}")
-            try:
-                page.evaluate("() => window.scrollTo(0, 0)")
-                page.wait_for_timeout(90)
-            except Exception:
-                pass
-            seen_selectors: set[str] = set()
-            added = 0
-            no_new_rounds = 0
-            for _round in range(1, 18):
-                selectors, reached_bottom = _scan_visible_ready_add_selectors(page, seen_selectors)
-                if not selectors:
-                    no_new_rounds += 1
-                for selector in selectors:
-                    locator = page.locator(selector).first
-                    try:
-                        locator.wait_for(state="visible", timeout=timeout_ms)
-                    except Exception:
-                        continue
-                    target = _highlight_target(
-                        page,
-                        locator,
-                        f"step {step_num} READY",
-                        click_pulse_enabled=click_pulse_enabled and visual,
-                        show_preview=not (visual and visual_human_mouse),
-                    )
-                    if target is None:
-                        continue
-                    if visual and visual_human_mouse and target:
-                        _human_mouse_click(
-                            page,
-                            target[0],
-                            target[1],
-                            speed=visual_mouse_speed,
-                            hold_ms=visual_click_hold_ms,
-                        )
-                        _capture_movement("after_add_ready_click")
-                    else:
-                        locator.click(timeout=timeout_ms)
-                    seen_selectors.add(selector)
-                    added += 1
-                if no_new_rounds >= 2 and reached_bottom:
-                    break
-                if no_new_rounds >= 3:
-                    break
-                if reached_bottom and not selectors:
-                    break
-                _retry_scroll(page, amount=120, pause_ms=160)
-            actions.append(f"cmd: playwright add_all_ready_to_playlist selected:{selected_playlist}")
-            observations.append(
-                f"Added READY tracks in step {step_num}: count={added}, playlist={selected_playlist}"
-            )
-            ui_findings.append(
-                f"step {step_num} verify added READY tracks: count={added}, playlist={selected_playlist}"
-            )
-            return
 
         if step.kind == "bulk_click_in_cards":
             card_selector, required_text = ".track-card", ""
@@ -2555,34 +2016,6 @@ def _apply_interactive_step(
             )
             return
 
-        if step.kind == "remove_all_playlist_tracks":
-            selected_playlist = _selected_playlist_name(page)
-            if not selected_playlist:
-                raise RuntimeError("No playlist selected. Select playlist before removing tracks.")
-            observations.append(f"step {step_num}: removing all tracks from playlist -> {selected_playlist}")
-            bulk_step = WebStep("bulk_click_until_empty", '[id^="playlist-track-remove-"]')
-            _apply_interactive_step(
-                page,
-                bulk_step,
-                step_num,
-                actions,
-                observations,
-                ui_findings,
-                visual=visual,
-                click_pulse_enabled=click_pulse_enabled,
-                visual_human_mouse=visual_human_mouse,
-                visual_mouse_speed=visual_mouse_speed,
-                visual_click_hold_ms=visual_click_hold_ms,
-                timeout_ms=timeout_ms,
-                movement_capture_dir=movement_capture_dir,
-                evidence_paths=evidence_paths,
-            )
-            actions.append(f"cmd: playwright remove_all_playlist_tracks selected:{selected_playlist}")
-            ui_findings.append(
-                f"step {step_num} verify removed playlist tracks: playlist={selected_playlist}"
-            )
-            return
-
         if step.kind == "select_label":
             locator = page.locator(step.target).first
             locator.wait_for(state="visible", timeout=timeout_ms)
@@ -2675,55 +2108,18 @@ def _apply_wait_step(
     *,
     timeout_ms: int,
 ) -> None:
-    iframe_guard = _disable_active_youtube_iframe_pointer_events(page)
-    if not _force_main_frame_context(page):
-        _restore_iframe_pointer_events(page, iframe_guard)
-        raise RuntimeError("Unable to enforce main frame context for wait step")
-    try:
-        if step.kind == "wait_selector":
-            actions.append(f"cmd: playwright wait selector:{step.target}")
-            page.wait_for_selector(step.target, timeout=timeout_ms)
-            observations.append(f"Wait selector step {step_num}: {step.target}")
-            ui_findings.append(f"step {step_num} verify selector visible: {step.target}")
-            return
-        if step.kind == "wait_text":
-            actions.append(f"cmd: playwright wait text:{step.target}")
-            page.locator("body").get_by_text(step.target, exact=False).first.wait_for(
-                state="visible", timeout=timeout_ms
-            )
-            observations.append(f"Wait text step {step_num}: {step.target}")
-            ui_findings.append(f"step {step_num} verify text visible: {step.target}")
-            return
-    finally:
-        _restore_iframe_pointer_events(page, iframe_guard)
-    raise RuntimeError(f"Unsupported wait step kind: {step.kind}")
-
-
-def _is_login_target(text: str) -> bool:
-    low = text.lower().strip()
-    return low in ("entrar demo", "entrar", "login", "sign in", "iniciar sesión")
-
-
-def _task_already_requests_demo_click(steps: list[WebStep]) -> bool:
-    for step in steps:
-        if step.kind in ("click_text", "maybe_click_text") and _is_login_target(step.target):
-            return True
-    return False
-
-
-def _looks_authenticated(page: Any) -> bool:
-    try:
-        if page.locator(".track-card").first.is_visible(timeout=500):
-            return True
-    except Exception:
-        pass
-    for hint in _AUTH_HINTS:
-        try:
-            if page.get_by_text(hint, exact=False).count() > 0:
-                return True
-        except Exception:
-            continue
-    return False
+    _helpers_apply_wait_step(
+        page,
+        step,
+        step_num,
+        actions,
+        observations,
+        ui_findings,
+        timeout_ms=timeout_ms,
+        disable_active_youtube_iframe_pointer_events=_disable_active_youtube_iframe_pointer_events,
+        force_main_frame_context=_force_main_frame_context,
+        restore_iframe_pointer_events=_restore_iframe_pointer_events,
+    )
 
 
 def _launch_browser(
@@ -2744,982 +2140,6 @@ def _launch_browser(
         return playwright_obj.chromium.launch(channel="chrome", **kwargs)
     except Exception:
         return playwright_obj.chromium.launch(**kwargs)
-
-
-def _install_visual_overlay(
-    page: Any,
-    *,
-    cursor_enabled: bool,
-    click_pulse_enabled: bool,
-    scale: float,
-    color: str,
-    trace_enabled: bool,
-    session_state: dict[str, Any] | None = None,
-) -> None:
-    config = {
-        "cursorEnabled": bool(cursor_enabled),
-        "clickPulseEnabled": bool(click_pulse_enabled),
-        "scale": float(scale),
-        "color": str(color),
-        "traceEnabled": bool(trace_enabled),
-    }
-    session_json = json.dumps(session_state or {}, ensure_ascii=False)
-    script_template = """
-    (() => {
-      const cfg = __CFG_JSON__;
-      const sessionState = __SESSION_JSON__;
-      const installOverlay = () => {
-        const prevCfgRaw = window.__bridgeOverlayConfig || null;
-        const cfgRaw = JSON.stringify(cfg || {});
-        const prevRaw = JSON.stringify(prevCfgRaw || {});
-        if (window.__bridgeOverlayInstalled && prevRaw !== cfgRaw) {
-          const ids = [
-            '__bridge_cursor_overlay',
-            '__bridge_trail_layer',
-            '__bridge_state_border',
-            '__bridge_step_badge',
-          ];
-          ids.forEach((id) => document.getElementById(id)?.remove());
-          window.__bridgeOverlayInstalled = false;
-        }
-        if (window.__bridgeOverlayInstalled) return true;
-        window.__bridgeOverlayConfig = cfg;
-        const root = document.documentElement;
-        const body = document.body;
-        if (!root || !body) {
-          if (!window.__bridgeOverlayRetryAttached) {
-            window.__bridgeOverlayRetryAttached = true;
-            document.addEventListener('DOMContentLoaded', () => {
-              installOverlay();
-            }, { once: true });
-          }
-          return false;
-        }
-        const overlayHost = body;
-        const cursor = document.createElement('div');
-        cursor.id = '__bridge_cursor_overlay';
-        cursor.style.position = 'fixed';
-        cursor.style.width = `${14 * cfg.scale}px`;
-        cursor.style.height = `${14 * cfg.scale}px`;
-        cursor.style.border = `${2 * cfg.scale}px solid ${cfg.color}`;
-        cursor.style.borderRadius = '50%';
-        cursor.style.boxShadow = `0 0 0 ${3 * cfg.scale}px rgba(59,167,255,0.25)`;
-        cursor.style.pointerEvents = 'none';
-        cursor.style.zIndex = '2147483647';
-        cursor.style.background = 'rgba(59,167,255,0.15)';
-        cursor.style.display = cfg.cursorEnabled ? 'block' : 'none';
-        cursor.style.transition = 'width 120ms ease, height 120ms ease, left 80ms linear, top 80ms linear';
-        overlayHost.appendChild(cursor);
-        const trailLayer = document.createElement('div');
-        trailLayer.id = '__bridge_trail_layer';
-        trailLayer.style.position = 'fixed';
-        trailLayer.style.inset = '0';
-        trailLayer.style.pointerEvents = 'none';
-        trailLayer.style.zIndex = '2147483646';
-        overlayHost.appendChild(trailLayer);
-
-        const stateBorder = document.createElement('div');
-        stateBorder.id = '__bridge_state_border';
-        stateBorder.style.position = 'fixed';
-        stateBorder.style.inset = '0';
-        stateBorder.style.pointerEvents = 'none';
-        stateBorder.style.zIndex = '2147483642';
-        stateBorder.style.boxSizing = 'border-box';
-        stateBorder.style.borderRadius = String(14 * cfg.scale) + 'px';
-        stateBorder.style.border = String(6 * cfg.scale) + 'px solid rgba(210,210,210,0.22)';
-        stateBorder.style.boxShadow = '0 0 0 1px rgba(0,0,0,0.28) inset';
-        stateBorder.style.transition =
-          'border-color 180ms ease-out, box-shadow 180ms ease-out, ' +
-          'border-width 180ms ease-out';
-        overlayHost.appendChild(stateBorder);
-
-        window.__bridgeSetStateBorder = (state) => {
-          const s = state || {};
-          const controlled = !!s.controlled;
-          const open = String(s.state || 'open') === 'open';
-          const incidentOpen = !!s.incident_open;
-          const learningActive = !!s.learning_active;
-          const controlUrl = window.__bridgeResolveControlUrl ? window.__bridgeResolveControlUrl(s) : null;
-          const agentOnline = !!controlUrl && s.agent_online !== false;
-          const readyManual = open && !controlled && agentOnline && !incidentOpen && !learningActive;
-
-          let color = 'rgba(210,210,210,0.22)';
-          let glow = '0 0 0 1px rgba(0,0,0,0.28) inset';
-          if (!open) {
-            color = 'rgba(40,40,40,0.55)';
-            glow = '0 0 0 1px rgba(0,0,0,0.35) inset';
-          } else if (controlled) {
-            color = 'rgba(59,167,255,0.95)';
-            glow = '0 0 0 2px rgba(59,167,255,0.35) inset, 0 0 26px rgba(59,167,255,0.22)';
-          } else if (incidentOpen) {
-            color = 'rgba(255,82,82,0.95)';
-            glow = '0 0 0 2px rgba(255,82,82,0.32) inset, 0 0 26px rgba(255,82,82,0.18)';
-          } else if (learningActive) {
-            color = 'rgba(245,158,11,0.95)';
-            glow = '0 0 0 2px rgba(245,158,11,0.30) inset, 0 0 26px rgba(245,158,11,0.18)';
-          } else if (readyManual) {
-            color = 'rgba(34,197,94,0.95)';
-            glow = '0 0 0 2px rgba(34,197,94,0.32) inset, 0 0 26px rgba(34,197,94,0.18)';
-          } else {
-            color = 'rgba(210,210,210,0.22)';
-            glow = '0 0 0 1px rgba(0,0,0,0.28) inset';
-          }
-
-          const emphasized = (controlled || incidentOpen || readyManual);
-          stateBorder.style.borderWidth = String((emphasized ? 10 : 6) * cfg.scale) + 'px';
-          stateBorder.style.borderColor = color;
-          stateBorder.style.boxShadow = glow;
-          window.__bridgeOverlayState = {
-            controlled,
-            incidentOpen,
-            learningActive,
-            readyManual,
-          };
-        };
-
-        let lastTrailPoint = null;
-        const emitTrail = (x, y) => {
-        if (!cfg.cursorEnabled) return;
-        const px = Number(x);
-        const py = Number(y);
-        if (!Number.isFinite(px) || !Number.isFinite(py)) return;
-        if (lastTrailPoint && Number.isFinite(lastTrailPoint.x) && Number.isFinite(lastTrailPoint.y)) {
-          const dx = px - lastTrailPoint.x;
-          const dy = py - lastTrailPoint.y;
-          const len = Math.hypot(dx, dy);
-          if (len >= 1.5) {
-            const seg = document.createElement('div');
-            seg.style.position = 'fixed';
-            seg.style.left = `${lastTrailPoint.x}px`;
-            seg.style.top = `${lastTrailPoint.y}px`;
-            seg.style.width = `${len}px`;
-            seg.style.height = '4px';
-            seg.style.transformOrigin = '0 50%';
-            seg.style.transform = `rotate(${Math.atan2(dy, dx)}rad)`;
-            seg.style.borderRadius = '999px';
-            seg.style.background = 'rgba(0,180,255,1)';
-            seg.style.boxShadow = '0 0 10px rgba(0,180,255,1)';
-            seg.style.pointerEvents = 'none';
-            seg.style.opacity = '0.95';
-            seg.style.transition = 'opacity 5000ms linear';
-            trailLayer.appendChild(seg);
-            requestAnimationFrame(() => { seg.style.opacity = '0'; });
-            setTimeout(() => seg.remove(), 5100);
-          }
-        }
-        const dot = document.createElement('div');
-        dot.style.position = 'fixed';
-        dot.style.left = `${Math.max(0, px - 2.5)}px`;
-        dot.style.top = `${Math.max(0, py - 2.5)}px`;
-        dot.style.width = '7px';
-        dot.style.height = '7px';
-        dot.style.borderRadius = '50%';
-        dot.style.background = 'rgba(0,180,255,1)';
-        dot.style.pointerEvents = 'none';
-        dot.style.opacity = '0.95';
-        dot.style.transition = 'opacity 5000ms linear';
-        trailLayer.appendChild(dot);
-        requestAnimationFrame(() => { dot.style.opacity = '0'; });
-        setTimeout(() => dot.remove(), 5100);
-        lastTrailPoint = { x: px, y: py };
-        };
-
-        const normalizePoint = (x, y) => {
-        const nx = Number(x);
-        const ny = Number(y);
-        if (!Number.isFinite(nx) || !Number.isFinite(ny)) return null;
-        const w = window.innerWidth || 0;
-        const h = window.innerHeight || 0;
-        const cx = Math.max(0, w > 0 ? Math.min(w - 1, nx) : nx);
-        const cy = Math.max(0, h > 0 ? Math.min(h - 1, ny) : ny);
-        // Ignore noisy top-left synthetic points when we already have a stable cursor position.
-        if (cx <= 1 && cy <= 1 && window.__bridgeCursorPos) {
-          return { x: window.__bridgeCursorPos.x, y: window.__bridgeCursorPos.y };
-        }
-        return { x: cx, y: cy };
-        };
-
-        const setCursor = (x, y) => {
-        const p = normalizePoint(x, y);
-        if (!p) return;
-        x = p.x;
-        y = p.y;
-        const normal = 14 * cfg.scale;
-        window.__bridgeCursorPos = { x, y };
-        cursor.style.width = `${normal}px`;
-        cursor.style.height = `${normal}px`;
-        cursor.style.left = `${Math.max(0, x - normal / 2)}px`;
-        cursor.style.top = `${Math.max(0, y - normal / 2)}px`;
-        };
-
-        window.__bridgeGetCursorPos = () => {
-        const pos = window.__bridgeCursorPos || null;
-        if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') return null;
-        return { x: pos.x, y: pos.y };
-        };
-
-        window.addEventListener('mousemove', (ev) => {
-        if (!cfg.cursorEnabled) return;
-        const st = window.__bridgeOverlayState || null;
-        // Ignore native mousemove noise while assistant is driving the page.
-        if (st && st.controlled) return;
-        setCursor(ev.clientX, ev.clientY);
-        emitTrail(ev.clientX, ev.clientY);
-        }, true);
-
-        window.__bridgeMoveCursor = (x, y) => {
-        if (!cfg.cursorEnabled) return;
-        const p = normalizePoint(x, y);
-        if (!p) return;
-        setCursor(p.x, p.y);
-        emitTrail(p.x, p.y);
-        };
-
-        const initialPos = (() => {
-          const prev = window.__bridgeCursorPos;
-          if (prev && typeof prev.x === 'number' && typeof prev.y === 'number') {
-            return { x: prev.x, y: prev.y };
-          }
-          const w = window.innerWidth || 0;
-          const h = window.innerHeight || 0;
-          return { x: Math.max(12, w * 0.5), y: Math.max(12, h * 0.5) };
-        })();
-        setCursor(initialPos.x, initialPos.y);
-
-        window.__bridgeShowClick = (x, y, label) => {
-        const p = normalizePoint(x, y);
-        if (!p) return;
-        x = p.x;
-        y = p.y;
-        if (cfg.cursorEnabled) {
-          window.__bridgeMoveCursor(x, y);
-        }
-        if (cfg.clickPulseEnabled) {
-          window.__bridgePulseAt(x, y);
-        }
-        if (label) {
-          let badge = document.getElementById('__bridge_step_badge');
-          if (!badge) {
-            badge = document.createElement('div');
-            badge.id = '__bridge_step_badge';
-            badge.style.position = 'fixed';
-            badge.style.zIndex = '2147483647';
-            badge.style.padding = '4px 8px';
-            badge.style.borderRadius = '6px';
-            badge.style.font = '12px/1.2 monospace';
-            badge.style.background = '#111';
-            badge.style.color = '#fff';
-            badge.style.pointerEvents = 'none';
-            document.documentElement.appendChild(badge);
-          }
-          badge.textContent = label;
-          badge.style.left = `${Math.max(0, x + 14)}px`;
-          badge.style.top = `${Math.max(0, y - 8)}px`;
-        }
-        };
-
-        window.__bridgePulseAt = (x, y) => {
-        if (!cfg.clickPulseEnabled) return;
-        const p = normalizePoint(x, y);
-        if (!p) return;
-        x = p.x;
-        y = p.y;
-        const normal = 14 * cfg.scale;
-        const click = 22 * cfg.scale;
-        if (cfg.cursorEnabled) {
-          cursor.style.width = `${click}px`;
-          cursor.style.height = `${click}px`;
-          cursor.style.left = `${Math.max(0, x - click / 2)}px`;
-          cursor.style.top = `${Math.max(0, y - click / 2)}px`;
-          setTimeout(() => {
-            cursor.style.width = `${normal}px`;
-            cursor.style.height = `${normal}px`;
-            cursor.style.left = `${Math.max(0, x - normal / 2)}px`;
-            cursor.style.top = `${Math.max(0, y - normal / 2)}px`;
-          }, 200);
-        }
-        const ring = document.createElement('div');
-        ring.style.position = 'fixed';
-        ring.style.left = `${Math.max(0, x - 10)}px`;
-        ring.style.top = `${Math.max(0, y - 10)}px`;
-        ring.style.width = '20px';
-        ring.style.height = '20px';
-        ring.style.borderRadius = '50%';
-        ring.style.border = `2px solid ${cfg.color}`;
-        ring.style.opacity = '0.9';
-        ring.style.pointerEvents = 'none';
-        ring.style.zIndex = '2147483647';
-        ring.style.transform = 'scale(0.7)';
-        ring.style.transition = 'transform 650ms ease, opacity 650ms ease';
-        document.documentElement.appendChild(ring);
-        requestAnimationFrame(() => {
-          ring.style.transform = 'scale(2.1)';
-          ring.style.opacity = '0';
-        });
-        setTimeout(() => ring.remove(), 720);
-        };
-
-        window.__bridgeDrawPath = (points) => {
-        if (!cfg.cursorEnabled) return;
-        if (!Array.isArray(points) || points.length < 2) return;
-        const clean = points
-          .map((p) => Array.isArray(p) ? { x: Number(p[0]), y: Number(p[1]) } : null)
-          .filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
-        if (clean.length < 2) return;
-        const svgNS = 'http://www.w3.org/2000/svg';
-        const svg = document.createElementNS(svgNS, 'svg');
-        svg.setAttribute('width', '100%');
-        svg.setAttribute('height', '100%');
-        svg.setAttribute(
-          'viewBox',
-          `0 0 ${Math.max(1, window.innerWidth || 1)} ${Math.max(1, window.innerHeight || 1)}`
-        );
-        svg.style.position = 'fixed';
-        svg.style.inset = '0';
-        svg.style.pointerEvents = 'none';
-        svg.style.zIndex = '2147483646';
-        svg.style.overflow = 'visible';
-        svg.style.opacity = '0.98';
-        svg.style.transition = 'opacity 5000ms linear';
-        const poly = document.createElementNS(svgNS, 'polyline');
-        poly.setAttribute('fill', 'none');
-        poly.setAttribute('stroke', 'rgba(0,180,255,1)');
-        poly.setAttribute('stroke-width', '4');
-        poly.setAttribute('stroke-linecap', 'round');
-        poly.setAttribute('stroke-linejoin', 'round');
-        poly.setAttribute('points', clean.map((p) => `${p.x},${p.y}`).join(' '));
-        svg.appendChild(poly);
-        trailLayer.appendChild(svg);
-        requestAnimationFrame(() => { svg.style.opacity = '0'; });
-        setTimeout(() => svg.remove(), 5100);
-        };
-        window.__bridgeResolveControlUrl = (state) => {
-          const s = state || {};
-          if (s.control_url && typeof s.control_url === 'string') return s.control_url;
-          const p = Number(s.control_port || 0);
-          if (p > 0) return `http://127.0.0.1:${p}`;
-          return '';
-        };
-        window.__bridgeSetTopBarVisible = (visible) => {
-          const bar = document.getElementById('__bridge_session_top_bar');
-          if (!bar) return;
-          if (visible) {
-            bar.dataset.visible = '1';
-            bar.style.transform = 'translateY(0)';
-            bar.style.opacity = '1';
-          } else {
-            bar.dataset.visible = '0';
-            bar.style.transform = 'translateY(-110%)';
-            bar.style.opacity = '0';
-          }
-        };
-        window.__bridgeSetIncidentOverlay = (enabled, message) => {
-          const id = '__bridge_incident_overlay';
-          const existing = document.getElementById(id);
-          if (!enabled) {
-            if (existing) existing.remove();
-            return;
-          }
-          if (existing) {
-            const badge = existing.querySelector('[data-role="badge"]');
-            if (badge) badge.textContent = message || 'INCIDENT DETECTED';
-            return;
-          }
-          const wrap = document.createElement('div');
-          wrap.id = id;
-          wrap.style.position = 'fixed';
-          wrap.style.inset = '0';
-          wrap.style.border = '3px solid #ff5252';
-          wrap.style.boxSizing = 'border-box';
-          wrap.style.pointerEvents = 'none';
-          wrap.style.zIndex = '2147483645';
-          const badge = document.createElement('div');
-          badge.dataset.role = 'badge';
-          badge.textContent = message || 'INCIDENT DETECTED';
-          badge.style.position = 'fixed';
-          badge.style.top = '10px';
-          badge.style.left = '12px';
-          badge.style.padding = '4px 8px';
-          badge.style.borderRadius = '999px';
-          badge.style.font = '11px/1.2 monospace';
-          badge.style.color = '#fff';
-          badge.style.background = 'rgba(255,82,82,0.92)';
-          badge.style.pointerEvents = 'none';
-          wrap.appendChild(badge);
-          document.documentElement.appendChild(wrap);
-        };
-        window.__bridgeSendSessionEvent = (event) => {
-          const bar = document.getElementById('__bridge_session_top_bar');
-          const stateRaw = bar?.dataset?.state || '{}';
-          let state;
-          try { state = JSON.parse(stateRaw); } catch (_e) { state = {}; }
-          const controlUrl = window.__bridgeResolveControlUrl(state);
-          if (!controlUrl) return;
-          const payload = {
-            ...(event || {}),
-            session_id: state.session_id || '',
-            url: String((event && event.url) || location.href || ''),
-            controlled: !!state.controlled,
-            learning_active: !!state.learning_active,
-            observer_noise_mode: String(state.observer_noise_mode || 'minimal'),
-          };
-          fetch(`${controlUrl}/event`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-            keepalive: true,
-          }).catch(() => null);
-        };
-        window.__bridgeEnsureSessionObserver = () => {
-          if (window.__bridgeObserverInstalled) return;
-          window.__bridgeObserverInstalled = true;
-          let lastMoveTs = 0;
-          let lastMoveX = 0;
-          let lastMoveY = 0;
-          let lastScrollTs = 0;
-          let lastScrollY = 0;
-          const shouldCapture = (eventType, bridgeControl = false) => {
-            const bar = document.getElementById('__bridge_session_top_bar');
-            const stateRaw = bar?.dataset?.state || '{}';
-            let state = {};
-            try { state = JSON.parse(stateRaw); } catch (_e) { state = {}; }
-            const mode = String(state.observer_noise_mode || 'minimal').toLowerCase();
-            if (mode === 'debug') return true;
-            const controlled = !!state.controlled;
-            const learningActive = !!state.learning_active;
-            if (eventType === 'click') {
-              if (bridgeControl) return false;
-              return controlled || learningActive;
-            }
-            if (eventType === 'scroll') {
-              return learningActive;
-            }
-            if (eventType === 'mousemove') {
-              return false;
-            }
-            return true;
-          };
-          const cssPath = (node) => {
-            try {
-              if (!node || !(node instanceof Element)) return '';
-              if (node.id) return `#${node.id}`;
-              const testid = node.getAttribute && (node.getAttribute('data-testid') || node.getAttribute('data-test'));
-              if (testid) return `[data-testid="${testid}"]`;
-              const tag = String(node.tagName || '').toLowerCase();
-              const cls = String(node.className || '').trim().split(/\\s+/).filter(Boolean).slice(0, 2).join('.');
-              if (tag) return cls ? `${tag}.${cls}` : tag;
-              return '';
-            } catch (_e) { return ''; }
-          };
-          document.addEventListener('click', (ev) => {
-            const el = ev.target;
-            let target = '';
-            let selector = '';
-            let text = '';
-            let bridgeControl = false;
-            let controlled = false;
-            try {
-              const bar = document.getElementById('__bridge_session_top_bar');
-              const raw = bar?.dataset?.state || '{}';
-              const state = JSON.parse(raw);
-              controlled = !!state.controlled;
-            } catch (_e) { controlled = false; }
-            if (el && typeof el.closest === 'function') {
-              const btn = el.closest('button,[role="button"],a,input,select,textarea');
-              if (btn) {
-                target = (btn.textContent || btn.id || btn.className || '').trim();
-                selector = cssPath(btn);
-                text = String(btn.textContent || '').trim().slice(0, 180);
-                const bid = String(btn.id || '');
-                bridgeControl = bid.startsWith('__bridge_') || selector.includes('__bridge_');
-              }
-            }
-            if (!bridgeControl && !controlled && shouldCapture('click', bridgeControl)) {
-              window.__bridgeShowClick?.(
-                Number(ev.clientX || 0),
-                Number(ev.clientY || 0),
-                'manual click captured'
-              );
-            }
-            if (!shouldCapture('click', bridgeControl)) return;
-            window.__bridgeSendSessionEvent({
-              type: 'click',
-              target,
-              selector,
-              text,
-              message: `click ${target}`,
-              x: Number(ev.clientX || 0),
-              y: Number(ev.clientY || 0),
-            });
-          }, true);
-          window.addEventListener('mousemove', (ev) => {
-            if (!shouldCapture('mousemove', false)) return;
-            const now = Date.now();
-            if ((now - lastMoveTs) < 350) return;
-            const x = Number(ev.clientX || 0);
-            const y = Number(ev.clientY || 0);
-            const dist = Math.hypot(x - lastMoveX, y - lastMoveY);
-            if (dist < 18) return;
-            lastMoveTs = now;
-            lastMoveX = x;
-            lastMoveY = y;
-            window.__bridgeSendSessionEvent({
-              type: 'mousemove',
-              message: `mousemove ${x},${y}`,
-              x,
-              y,
-            });
-          }, true);
-          window.addEventListener('scroll', () => {
-            if (!shouldCapture('scroll', false)) return;
-            const now = Date.now();
-            if ((now - lastScrollTs) < 300) return;
-            const sy = Number(window.scrollY || window.pageYOffset || 0);
-            const delta = Math.abs(sy - lastScrollY);
-            if (delta < 80) return;
-            lastScrollTs = now;
-            lastScrollY = sy;
-            window.__bridgeSendSessionEvent({
-              type: 'scroll',
-              message: `scroll y=${sy}`,
-              scroll_y: sy,
-            });
-          }, { passive: true, capture: true });
-          window.addEventListener('error', (ev) => {
-            window.__bridgeSendSessionEvent({
-              type: 'page_error',
-              message: String(ev.message || 'window error'),
-            });
-          });
-          window.addEventListener('unhandledrejection', (ev) => {
-            window.__bridgeSendSessionEvent({
-              type: 'page_error',
-              message: String(ev.reason || 'unhandled rejection'),
-            });
-          });
-          if (!window.__bridgeFetchWrapped && typeof window.fetch === 'function') {
-            window.__bridgeFetchWrapped = true;
-            const origFetch = window.fetch.bind(window);
-            window.fetch = async (...args) => {
-              try {
-                const resp = await origFetch(...args);
-                if (resp && Number(resp.status || 0) >= 400) {
-                  window.__bridgeSendSessionEvent({
-                    type: Number(resp.status || 0) >= 500 ? 'network_error' : 'network_warn',
-                    status: Number(resp.status || 0),
-                    url: String(resp.url || args[0] || ''),
-                    message: `http ${resp.status}`,
-                  });
-                }
-                return resp;
-              } catch (err) {
-                window.__bridgeSendSessionEvent({
-                  type: 'network_error',
-                  status: 0,
-                  url: String(args[0] || ''),
-                  message: String(err || 'fetch failed'),
-                });
-                throw err;
-              }
-            };
-          }
-          if (!window.__bridgeXhrWrapped && window.XMLHttpRequest) {
-            window.__bridgeXhrWrapped = true;
-            const origOpen = XMLHttpRequest.prototype.open;
-            const origSend = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-              this.__bridgeMethod = String(method || 'GET');
-              this.__bridgeUrl = String(url || '');
-              return origOpen.call(this, method, url, ...rest);
-            };
-            XMLHttpRequest.prototype.send = function(...args) {
-              this.addEventListener('loadend', () => {
-                const st = Number(this.status || 0);
-                if (st >= 400 || st === 0) {
-                  window.__bridgeSendSessionEvent({
-                    type: (st === 0 || st >= 500) ? 'network_error' : 'network_warn',
-                    status: st,
-                    url: String(this.responseURL || this.__bridgeUrl || ''),
-                    message: `xhr ${st}`,
-                  });
-                }
-              });
-              return origSend.apply(this, args);
-            };
-          }
-        };
-        window.__bridgeStartTopBarPolling = (state) => {
-          const controlUrl = window.__bridgeResolveControlUrl(state || {});
-          if (window.__bridgeTopBarPollTimer) {
-            clearInterval(window.__bridgeTopBarPollTimer);
-            window.__bridgeTopBarPollTimer = null;
-          }
-          if (!controlUrl) return;
-          window.__bridgeTopBarPollTimer = setInterval(async () => {
-            try {
-              const resp = await fetch(`${controlUrl}/state`, { cache: 'no-store' });
-              const payload = await resp.json();
-              if (resp.ok && payload && typeof payload === 'object') {
-                window.__bridgeUpdateTopBarState(payload);
-              }
-            } catch (_err) {
-              // keep previous state; button actions will surface offline errors.
-            }
-          }, 2500);
-        };
-        window.__bridgeControlRequest = async (action) => {
-          const bar = document.getElementById('__bridge_session_top_bar');
-          const stateRaw = bar?.dataset?.state || '{}';
-          let state;
-          try { state = JSON.parse(stateRaw); } catch (_e) { state = {}; }
-          const controlUrl = window.__bridgeResolveControlUrl(state);
-          if (!controlUrl) {
-            return { ok: false, error: 'agent offline' };
-          }
-          try {
-            const resp = await fetch(`${controlUrl}/action`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ action }),
-            });
-            let payload = {};
-            try { payload = await resp.json(); } catch (_e) { payload = {}; }
-            if (!resp.ok) {
-              const msg = payload.error || `http ${resp.status}`;
-              return { ok: false, error: String(msg), payload };
-            }
-            return { ok: true, payload };
-          } catch (err) {
-            return { ok: false, error: String(err || 'agent offline') };
-          }
-        };
-        window.__bridgeEnsureTopBar = (state) => {
-          const id = '__bridge_session_top_bar';
-          let bar = document.getElementById(id);
-          if (!bar) {
-            bar = document.createElement('div');
-            bar.id = id;
-            bar.style.position = 'fixed';
-            bar.style.top = '0';
-            bar.style.left = '0';
-            bar.style.right = '0';
-            bar.style.height = '42px';
-            bar.style.display = 'flex';
-            bar.style.alignItems = 'center';
-            bar.style.gap = '10px';
-            bar.style.padding = '6px 10px';
-            bar.style.font = '12px/1.2 monospace';
-            bar.style.zIndex = '2147483644';
-            bar.style.pointerEvents = 'auto';
-            bar.style.backdropFilter = 'blur(4px)';
-            bar.style.borderBottom = '1px solid rgba(255,255,255,0.18)';
-            bar.style.transform = 'translateY(-110%)';
-            bar.style.opacity = '0';
-            bar.style.transition = 'transform 210ms ease-out, opacity 210ms ease-out';
-            bar.dataset.visible = '0';
-            const hot = document.createElement('div');
-            hot.id = '__bridge_top_hot';
-            hot.style.position = 'fixed';
-            hot.style.top = '0';
-            hot.style.left = '0';
-            hot.style.right = '0';
-            hot.style.height = '8px';
-            hot.style.pointerEvents = 'auto';
-            hot.style.zIndex = '2147483643';
-            hot.addEventListener('mouseenter', () => window.__bridgeSetTopBarVisible(true));
-            bar.addEventListener('mouseleave', () => window.__bridgeSetTopBarVisible(false));
-            const toggle = document.createElement('button');
-            toggle.id = '__bridge_top_toggle';
-            toggle.textContent = '◉';
-            toggle.style.position = 'fixed';
-            toggle.style.top = '6px';
-            toggle.style.left = '6px';
-            toggle.style.zIndex = '2147483644';
-            toggle.style.width = '18px';
-            toggle.style.height = '18px';
-            toggle.style.padding = '0';
-            toggle.style.font = '12px monospace';
-            toggle.style.borderRadius = '999px';
-            toggle.style.border = '1px solid rgba(255,255,255,0.35)';
-            toggle.style.background = 'rgba(17,17,17,0.65)';
-            toggle.style.color = '#fff';
-            toggle.style.pointerEvents = 'auto';
-            toggle.addEventListener('click', () => {
-              window.__bridgeSetTopBarVisible(bar.dataset.visible !== '1');
-            });
-            overlayHost.appendChild(hot);
-            overlayHost.appendChild(toggle);
-            overlayHost.appendChild(bar);
-          }
-          window.__bridgeUpdateTopBarState(state);
-        };
-        window.__bridgeUpdateTopBarState = (state) => {
-          const bar = document.getElementById('__bridge_session_top_bar');
-          if (!bar) return;
-          const s = state || {};
-          const controlled = !!s.controlled;
-          const open = String(s.state || 'open') === 'open';
-          const controlUrl = window.__bridgeResolveControlUrl(s);
-          const agentOnline = !!controlUrl && s.agent_online !== false;
-          const incidentOpen = !!s.incident_open;
-          const learningActive = !!s.learning_active;
-          const readyManual = open && !controlled && agentOnline && !incidentOpen && !learningActive;
-          const incidentText = String(s.last_error || '').slice(0, 96);
-          bar.style.background = controlled
-            ? 'rgba(59,167,255,0.22)'
-            : (
-              incidentOpen
-                ? 'rgba(255,82,82,0.26)'
-                : (
-                  learningActive
-                    ? 'rgba(245,158,11,0.24)'
-                    : (
-                      readyManual
-                    ? 'rgba(22,163,74,0.22)'
-                    : (open ? 'rgba(80,80,80,0.28)' : 'rgba(20,20,20,0.7)')
-                    )
-                )
-            );
-          bar.style.borderBottom = learningActive
-            ? '2px solid rgba(245,158,11,0.95)'
-            : (
-              readyManual
-                ? '2px solid rgba(34,197,94,0.95)'
-                : '1px solid rgba(255,255,255,0.18)'
-            );
-          bar.dataset.state = JSON.stringify(s);
-          window.__bridgeSetIncidentOverlay(incidentOpen && !controlled, incidentText || 'INCIDENT DETECTED');
-          window.__bridgeSetStateBorder?.(s);
-          window.__bridgeEnsureSessionObserver();
-          window.__bridgeStartTopBarPolling(s);
-          const ctrl = controlled
-            ? 'ASSISTANT CONTROL'
-            : (learningActive ? 'LEARNING/HANDOFF' : 'USER CONTROL');
-          const url = String(s.url || '').slice(0, 70);
-          const last = String(s.last_seen_at || '').replace('T', ' ').slice(0, 16);
-          const status = !agentOnline
-            ? 'agent offline'
-            : (
-              incidentOpen
-                ? `incident open (${Number(s.error_count || 0)})`
-                : ''
-            );
-          const readyBadge = readyManual
-            ? `<span
-                 id=\"__bridge_ready_badge\"
-                 aria-label=\"session-ready-manual-test\"
-                 style=\"
-                   display:inline-flex;
-                   align-items:center;
-                   gap:6px;
-                   background:#16a34a;
-                   color:#fff;
-                   border:1px solid #22c55e;
-                   font-size:13px;
-                   font-weight:700;
-                   padding:6px 10px;
-                   border-radius:999px;\"
-               >● READY FOR MANUAL TEST</span>`
-            : '';
-          bar.innerHTML = `
-            <strong>session ${s.session_id || '-'}</strong>
-            <span>state:${s.state || '-'}</span>
-            <span>control:${ctrl}</span>
-            <span>url:${url}</span>
-            <span>seen:${last}</span>
-            ${readyBadge}
-            <span id=\"__bridge_status_msg\" style=\"color:${agentOnline ? '#b7d8ff' : '#ffb3b3'}\">${status}</span>
-            <button
-              id=\"__bridge_ack_btn\" ${(open && agentOnline && incidentOpen) ? '' : 'disabled'}
-            >Clear incident</button>
-            <button id=\"__bridge_release_btn\" ${(open && agentOnline) ? '' : 'disabled'}>Release</button>
-            <button id=\"__bridge_close_btn\" ${(open && agentOnline) ? '' : 'disabled'}>Close</button>
-            <button id=\"__bridge_refresh_btn\" ${agentOnline ? '' : 'disabled'}>Refresh</button>
-          `;
-          const statusEl = bar.querySelector('#__bridge_status_msg');
-          const ackBtn = bar.querySelector('#__bridge_ack_btn');
-          const release = bar.querySelector('#__bridge_release_btn');
-          const closeBtn = bar.querySelector('#__bridge_close_btn');
-          const refresh = bar.querySelector('#__bridge_refresh_btn');
-          const wire = (btn, action) => {
-            if (!btn) return;
-            btn.onclick = async () => {
-              btn.disabled = true;
-              if (statusEl) statusEl.textContent = `${action}...`;
-              const result = await window.__bridgeControlRequest(action);
-              if (!result.ok) {
-                if (statusEl) statusEl.textContent = result.error || 'action failed';
-                window.__bridgeUpdateTopBarState({ ...s, agent_online: false });
-                return;
-              }
-              if (statusEl) statusEl.textContent = 'ok';
-              window.__bridgeUpdateTopBarState(result.payload || s);
-            };
-          };
-          wire(ackBtn, 'ack');
-          wire(release, 'release');
-          wire(closeBtn, 'close');
-          wire(refresh, 'refresh');
-        };
-        window.__bridgeDestroyTopBar = () => {
-          document.getElementById('__bridge_session_top_bar')?.remove();
-          document.getElementById('__bridge_top_hot')?.remove();
-          document.getElementById('__bridge_top_toggle')?.remove();
-          window.__bridgeSetIncidentOverlay(false);
-          if (window.__bridgeTopBarPollTimer) {
-            clearInterval(window.__bridgeTopBarPollTimer);
-            window.__bridgeTopBarPollTimer = null;
-          }
-        };
-        if (sessionState && sessionState.session_id) {
-          window.__bridgeEnsureTopBar(sessionState);
-        }
-        window.__bridgeOverlayInstalled = true;
-        return true;
-      };
-
-      window.__bridgeEnsureOverlay = () => installOverlay();
-      installOverlay();
-    })();
-    """
-    script = script_template.replace("__CFG_JSON__", json.dumps(config, ensure_ascii=False))
-    script = script.replace("__SESSION_JSON__", session_json)
-    page.add_init_script(script)
-    # Also execute on current page for attach/reuse flows where no navigation occurs.
-    try:
-        page.evaluate(script)
-    except Exception:
-        pass
-
-
-def _highlight_target(
-    page: Any,
-    locator: Any,
-    label: str,
-    *,
-    click_pulse_enabled: bool,
-    show_preview: bool = True,
-    auto_scroll: bool = True,
-) -> tuple[float, float] | None:
-    last_exc: Exception | None = None
-    for _ in range(4):
-        try:
-            if auto_scroll:
-                try:
-                    locator.scroll_into_view_if_needed()
-                except Exception:
-                    pass
-                try:
-                    locator.evaluate("el => el.scrollIntoView({block:'center', inline:'center'})")
-                except Exception:
-                    pass
-
-            info = locator.evaluate(
-                """
-                (el) => {
-                  const r = el.getBoundingClientRect();
-                  const x = r.left + (r.width / 2);
-                  const y = r.top + (r.height / 2);
-                  const inViewport = (
-                    x >= 0 && y >= 0 &&
-                    x <= window.innerWidth && y <= window.innerHeight &&
-                    r.width > 0 && r.height > 0
-                  );
-                  const top = inViewport ? document.elementFromPoint(x, y) : null;
-                  const ok = !!top && (top === el || (el.contains && el.contains(top)));
-                  return { x, y, ok };
-                }
-                """
-            )
-            if isinstance(info, dict) and bool(info.get("ok", False)):
-                x = float(info.get("x", 0.0))
-                y = float(info.get("y", 0.0))
-                if show_preview:
-                    page.evaluate(
-                        "([x, y, label]) => window.__bridgeShowClick?.(x, y, label)",
-                        [x, y, label],
-                    )
-                if show_preview and click_pulse_enabled:
-                    page.evaluate("([x, y]) => window.__bridgePulseAt?.(x, y)", [x, y])
-                page.wait_for_timeout(120)
-                return (x, y)
-
-            if auto_scroll:
-                # Likely occluded by fixed UI (e.g., dock). Scroll up a bit and retry.
-                try:
-                    page.evaluate("() => window.scrollBy(0, -120)")
-                except Exception:
-                    pass
-                try:
-                    page.wait_for_timeout(60)
-                except Exception:
-                    pass
-        except Exception as exc:
-            last_exc = exc
-            continue
-    if last_exc is not None:
-        return None
-    return None
-
-
-def _ensure_visual_overlay_installed(page: Any) -> None:
-    try:
-        page.evaluate("() => window.__bridgeEnsureOverlay?.()")
-    except Exception:
-        return
-
-
-def _verify_visual_overlay_visible(page: Any) -> None:
-    snapshot = _read_visual_overlay_snapshot(page)
-    try:
-        opacity = float(str(snapshot.get("opacity", "0") or "0"))
-    except Exception:
-        opacity = 0.0
-    z_index = int(snapshot.get("z_index", 0) or 0)
-    ok = bool(
-        snapshot.get("exists")
-        and snapshot.get("parent") == "body"
-        and snapshot.get("display") != "none"
-        and snapshot.get("visibility") != "hidden"
-        and opacity > 0
-        and z_index >= 2147483647
-        and snapshot.get("pointer_events") == "none"
-    )
-    if not ok:
-        raise RuntimeError(
-            "Visual overlay not visible: missing #__bridge_cursor_overlay or invalid style."
-        )
-
-
-def _read_visual_overlay_snapshot(page: Any) -> dict[str, Any]:
-    try:
-        raw = page.evaluate(
-            """
-            () => {
-              const el = document.getElementById('__bridge_cursor_overlay');
-              if (!el) return { exists: false };
-              const style = window.getComputedStyle(el);
-              const parent = el.parentElement && el.parentElement.tagName
-                ? el.parentElement.tagName.toLowerCase()
-                : '';
-              const z = Number.parseInt(style.zIndex || '0', 10);
-              return {
-                exists: true,
-                parent,
-                display: style.display || '',
-                visibility: style.visibility || '',
-                opacity: style.opacity || '0',
-                z_index: Number.isNaN(z) ? 0 : z,
-                pointer_events: style.pointerEvents || '',
-              };
-            }
-            """
-        )
-    except Exception as exc:
-        return {"exists": False, "error": str(exc)}
-    if isinstance(raw, dict):
-        return raw
-    return {"exists": False, "error": "overlay snapshot is not a dict"}
 
 
 def _force_visual_overlay_reinstall(page: Any) -> None:
@@ -3760,207 +2180,51 @@ def _ensure_visual_overlay_ready(page: Any, retries: int = 12, delay_ms: int = 1
     raise RuntimeError("Visual overlay not visible after retries.")
 
 
-def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
-    # Humanized path: elliptical sway + noisy lateral drift + clear deceleration near target.
-    global _LAST_HUMAN_ROUTE
+def _probe_step_target_state(page: Any, step: WebStep) -> dict[str, Any]:
+    present: bool | None = None
+    visible: bool | None = None
+    enabled: bool | None = None
     try:
-        viewport = page.evaluate("() => ({w: window.innerWidth || 0, h: window.innerHeight || 0})")
-        vw = float((viewport or {}).get("w") or 0)
-        vh = float((viewport or {}).get("h") or 0)
-    except Exception:
-        vw = 0.0
-        vh = 0.0
-
-    def _clamp(px: float, py: float) -> tuple[float, float]:
-        if vw > 0:
-            px = max(0.0, min(vw - 1.0, px))
-        if vh > 0:
-            py = max(0.0, min(vh - 1.0, py))
-        return px, py
-
-    target_x, target_y = _clamp(float(x), float(y))
-    start_x, start_y = target_x, target_y
-    has_cursor_pos = False
-    try:
-        pos = page.evaluate("() => window.__bridgeGetCursorPos?.() || null")
-        if isinstance(pos, dict):
-            sx = pos.get("x")
-            sy = pos.get("y")
-            if isinstance(sx, (int, float)) and isinstance(sy, (int, float)):
-                start_x, start_y = _clamp(float(sx), float(sy))
-                has_cursor_pos = True
-    except Exception:
-        pass
-    if not has_cursor_pos and vw > 0 and vh > 0:
-        start_x, start_y = _clamp(vw * 0.5, vh * 0.5)
-
-    rng = random.Random(int(time.time_ns()) ^ int(target_x * 131) ^ int(target_y * 197))
-    norm_speed = max(0.25, float(speed))
-    dx = target_x - start_x
-    dy = target_y - start_y
-    dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
-    if dist < 2.5:
-        _LAST_HUMAN_ROUTE = [(float(start_x), float(start_y)), (float(target_x), float(target_y))]
-        try:
-            page.evaluate("([x, y]) => window.__bridgeMoveCursor?.(x, y)", [target_x, target_y])
-        except Exception:
-            pass
-        return
-
-    nx = dx / dist
-    ny = dy / dist
-    perp_x = -ny
-    perp_y = nx
-    base_amp = max(10.0, min(44.0, dist * rng.uniform(0.1, 0.22)))
-    c1x, c1y = _clamp(
-        start_x + dx * rng.uniform(0.2, 0.34) + perp_x * base_amp * rng.uniform(-0.9, 0.9),
-        start_y + dy * rng.uniform(0.2, 0.34) + perp_y * base_amp * rng.uniform(-0.9, 0.9),
-    )
-    c2x, c2y = _clamp(
-        start_x + dx * rng.uniform(0.58, 0.8) + perp_x * base_amp * rng.uniform(-0.85, 0.85),
-        start_y + dy * rng.uniform(0.58, 0.8) + perp_y * base_amp * rng.uniform(-0.85, 0.85),
-    )
-    overshoot = max(1.5, min(8.0, dist * rng.uniform(0.02, 0.045)))
-    ox, oy = _clamp(
-        target_x + nx * overshoot + perp_x * rng.uniform(-3.2, 3.2),
-        target_y + ny * overshoot + perp_y * rng.uniform(-3.2, 3.2),
-    )
-
-    samples = int(max(18, min(52, round((dist / 24.0) + (24.0 / norm_speed)))))
-    phase = rng.uniform(0.0, math.pi * 2.0)
-    ellipse_cycles = rng.uniform(0.8, 1.8)
-    route: list[tuple[float, float]] = []
-    for i in range(1, samples + 1):
-        t = i / float(samples)
-        one_t = 1.0 - t
-        bx = (
-            one_t * one_t * one_t * start_x
-            + 3.0 * one_t * one_t * t * c1x
-            + 3.0 * one_t * t * t * c2x
-            + t * t * t * ox
-        )
-        by = (
-            one_t * one_t * one_t * start_y
-            + 3.0 * one_t * one_t * t * c1y
-            + 3.0 * one_t * t * t * c2y
-            + t * t * t * oy
-        )
-        # Elliptical lateral motion with tapering envelope near endpoints.
-        env = max(0.0, math.sin(math.pi * t))
-        wobble = math.sin((2.0 * math.pi * ellipse_cycles * t) + phase)
-        bx += perp_x * (base_amp * 0.84 * env * wobble)
-        by += perp_y * (base_amp * 0.84 * env * wobble)
-        # Fine-grained noise, stronger at mid-path and softer near target.
-        micro = max(0.0, 1.0 - abs(0.52 - t) * 1.85)
-        bx += perp_x * rng.uniform(-2.8, 2.8) * micro
-        by += perp_y * rng.uniform(-2.8, 2.8) * micro
-        route.append(_clamp(bx, by))
-    route.append(_clamp(target_x, target_y))
-    _LAST_HUMAN_ROUTE = [(float(px), float(py)) for px, py in route]
-    route_payload = [[float(px), float(py)] for px, py in route]
-    try:
-        page.evaluate(
-            "pts => { window.__bridgeLastHumanRoute = pts; window.__bridgeDrawPath?.(pts); }",
-            route_payload,
-        )
-    except Exception:
-        pass
-
-    last_pause_idx = len(route) - 2
-    for idx, (px, py) in enumerate(route):
-        if idx < len(route) - 1:
-            progress = min(1.0, idx / max(1, len(route) - 1))
-            # Decelerate near destination: fewer large jumps, finer final approach.
-            slow_factor = progress * progress
-            seg_steps = int(
-                max(
-                    2,
-                    min(
-                        11,
-                        round((3.2 / norm_speed) + (slow_factor * 6.0) + rng.uniform(-0.8, 1.3)),
-                    ),
-                )
-            )
+        if step.kind in {"click_text", "maybe_click_text"}:
+            node = page.locator("body").get_by_text(step.target, exact=False).first
         else:
-            seg_steps = 3
-        page.mouse.move(px, py, steps=seg_steps)
+            node = page.locator(step.target).first
         try:
-            # Feed intermediate points to the visual overlay so the trail reflects the real path.
-            page.evaluate("([x, y]) => window.__bridgeMoveCursor?.(x, y)", [px, py])
+            present = bool(node.count() > 0)
         except Exception:
-            pass
-        if idx < last_pause_idx:
-            progress = min(1.0, idx / max(1, len(route) - 1))
-            # Tiny cadence pauses; slightly longer near end to make slowdown perceptible.
-            pause_ms = int(
-                max(
-                    0,
-                    min(
-                        18,
-                        round((3.2 / norm_speed) + (progress * 5.0) + rng.uniform(-2.0, 2.4)),
-                    ),
-                )
-            )
-            if pause_ms > 0:
-                try:
-                    page.wait_for_timeout(pause_ms)
-                except Exception:
-                    pass
-    try:
-        page.evaluate("([x, y]) => window.__bridgeMoveCursor?.(x, y)", [target_x, target_y])
-    except Exception:
-        pass
-
-
-def _human_mouse_click(page: Any, x: float, y: float, *, speed: float, hold_ms: int) -> None:
-    _human_mouse_move(page, x, y, speed=speed)
-    # Tiny jitter right before click to avoid perfectly static pre-click posture.
-    try:
-        jitter_x = x + random.uniform(-1.5, 1.5)
-        jitter_y = y + random.uniform(-1.5, 1.5)
-        page.mouse.move(jitter_x, jitter_y, steps=2)
-        page.mouse.move(x, y, steps=2)
-    except Exception:
-        pass
-    try:
-        page.evaluate("([x, y]) => window.__bridgePulseAt?.(x, y)", [x, y])
-    except Exception:
-        pass
-    page.mouse.down()
-    effective_hold = int(max(0, min(260, round(float(hold_ms) * 0.34))))
-    if effective_hold > 0:
-        page.wait_for_timeout(effective_hold)
-    page.mouse.up()
-    # Post-click settle: small drift so cursor doesn't remain pinned on exact click coordinate.
-    try:
-        settle_x = x + random.uniform(-16.0, 16.0)
-        settle_y = y + random.uniform(-12.0, 12.0)
-        page.mouse.move(settle_x, settle_y, steps=4)
-        page.evaluate("([x, y]) => window.__bridgeMoveCursor?.(x, y)", [settle_x, settle_y])
-    except Exception:
-        pass
-
-
-def _collapse_ws(text: str) -> str:
-    return " ".join(str(text).replace("\n", " ").replace("\r", " ").split())
-
-
-def _demo_login_button_available(page: Any) -> bool:
-    try:
-        btn = page.get_by_role("button", name="Entrar demo")
-        if btn.count() <= 0:
-            return False
+            present = None
         try:
-            if not btn.first.is_visible(timeout=800):
-                return False
+            visible = bool(node.is_visible(timeout=180))
         except Exception:
-            return False
+            visible = None
         try:
-            return bool(btn.first.is_enabled())
+            enabled = bool(node.is_enabled())
         except Exception:
-            return True
+            enabled = None
     except Exception:
-        return False
+        pass
+    return {"present": present, "visible": visible, "enabled": enabled}
+
+
+def _interactive_step_not_applicable_reason(page: Any, step: WebStep) -> str:
+    if step.kind not in INTERACTIVE_STEP_KINDS:
+        return ""
+    state = _probe_step_target_state(page, step)
+    if state.get("enabled") is False:
+        return (
+            "target disabled in current context "
+            f"(present={state['present']}, visible={state['visible']}, enabled={state['enabled']})"
+        )
+    if (
+        step.kind in {"click_text", "maybe_click_text"}
+        and state.get("present") is False
+        and state.get("visible") is False
+    ):
+        return (
+            "target text not present/visible in current context "
+            f"(present={state['present']}, visible={state['visible']}, enabled={state['enabled']})"
+        )
+    return ""
 
 
 def _is_timeout_error(exc: Exception) -> bool:
@@ -4027,228 +2291,5 @@ def _ensure_visual_overlay_ready_best_effort(
     return False
 
 
-def _set_assistant_control_overlay(page: Any, enabled: bool) -> None:
-    if _page_is_closed(page):
-        return
-    try:
-        page.evaluate(
-            """
-        ([enabled]) => {
-          const id = '__bridge_assistant_control_overlay';
-          const existing = document.getElementById(id);
-          if (!enabled) {
-            if (existing) existing.remove();
-            return;
-          }
-          if (existing) return;
-          const wrap = document.createElement('div');
-          wrap.id = id;
-          wrap.style.position = 'fixed';
-          wrap.style.inset = '0';
-          wrap.style.border = '3px solid #3BA7FF';
-          wrap.style.boxSizing = 'border-box';
-          wrap.style.pointerEvents = 'none';
-          wrap.style.zIndex = '2147483645';
-          const badge = document.createElement('div');
-          badge.textContent = 'ASSISTANT CONTROL';
-          badge.style.position = 'fixed';
-          badge.style.top = '10px';
-          badge.style.right = '12px';
-          badge.style.padding = '4px 8px';
-          badge.style.borderRadius = '999px';
-          badge.style.font = '11px/1.2 monospace';
-          badge.style.color = '#fff';
-          badge.style.background = 'rgba(59,167,255,0.9)';
-          badge.style.pointerEvents = 'none';
-          wrap.appendChild(badge);
-          document.documentElement.appendChild(wrap);
-        }
-            """,
-            [enabled],
-        )
-    except Exception:
-        return
-
-
-def _set_user_control_overlay(page: Any, enabled: bool) -> None:
-    if _page_is_closed(page):
-        return
-    try:
-        page.evaluate(
-            """
-        ([enabled]) => {
-          const id = '__bridge_user_control_overlay';
-          const existing = document.getElementById(id);
-          if (!enabled) {
-            if (existing) existing.remove();
-            return;
-          }
-          if (existing) return;
-          const wrap = document.createElement('div');
-          wrap.id = id;
-          wrap.style.position = 'fixed';
-          wrap.style.inset = '0';
-          wrap.style.border = '3px solid #22c55e';
-          wrap.style.boxSizing = 'border-box';
-          wrap.style.pointerEvents = 'none';
-          wrap.style.zIndex = '2147483644';
-          const badge = document.createElement('div');
-          badge.textContent = 'USER CONTROL';
-          badge.style.position = 'fixed';
-          badge.style.top = '10px';
-          badge.style.right = '12px';
-          badge.style.padding = '4px 8px';
-          badge.style.borderRadius = '999px';
-          badge.style.font = '11px/1.2 monospace';
-          badge.style.color = '#fff';
-          badge.style.background = 'rgba(34,197,94,0.9)';
-          badge.style.pointerEvents = 'none';
-          wrap.appendChild(badge);
-          document.documentElement.appendChild(wrap);
-        }
-            """,
-            [enabled],
-        )
-    except Exception:
-        return
-
-
-def _set_learning_handoff_overlay(page: Any, enabled: bool) -> None:
-    if _page_is_closed(page):
-        return
-    try:
-        page.evaluate(
-            """
-        ([enabled]) => {
-          const id = '__bridge_learning_handoff_overlay';
-          const existing = document.getElementById(id);
-          if (!enabled) {
-            if (existing) existing.remove();
-            return;
-          }
-          if (existing) return;
-          const wrap = document.createElement('div');
-          wrap.id = id;
-          wrap.style.position = 'fixed';
-          wrap.style.inset = '0';
-          wrap.style.border = '3px solid #f59e0b';
-          wrap.style.boxSizing = 'border-box';
-          wrap.style.pointerEvents = 'none';
-          wrap.style.zIndex = '2147483645';
-          const badge = document.createElement('div');
-          badge.textContent = 'LEARNING/HANDOFF';
-          badge.style.position = 'fixed';
-          badge.style.top = '10px';
-          badge.style.right = '12px';
-          badge.style.padding = '4px 8px';
-          badge.style.borderRadius = '999px';
-          badge.style.font = '11px/1.2 monospace';
-          badge.style.color = '#111';
-          badge.style.background = 'rgba(245,158,11,0.95)';
-          badge.style.pointerEvents = 'none';
-          wrap.appendChild(badge);
-          document.documentElement.appendChild(wrap);
-        }
-            """,
-            [enabled],
-        )
-    except Exception:
-        return
-
-
-def _session_state_payload(
-    session: WebSession | None,
-    *,
-    override_controlled: bool | None = None,
-    override_state: str | None = None,
-    learning_active: bool = False,
-) -> dict[str, Any]:
-    if session is None:
-        return {}
-    control_port = int(session.control_port or 0)
-    return {
-        "session_id": session.session_id,
-        "url": session.url,
-        "title": session.title,
-        "controlled": session.controlled if override_controlled is None else override_controlled,
-        "state": session.state if override_state is None else override_state,
-        "learning_active": bool(learning_active),
-        "observer_noise_mode": _observer_noise_mode(),
-        "last_seen_at": session.last_seen_at,
-        "control_port": control_port,
-        "control_url": f"http://127.0.0.1:{control_port}" if control_port > 0 else "",
-        "agent_online": control_port > 0,
-    }
-
-
-def _update_top_bar_state(page: Any, payload: dict[str, Any]) -> None:
-    if _page_is_closed(page):
-        return
-    try:
-        page.evaluate("([payload]) => window.__bridgeUpdateTopBarState?.(payload)", [payload])
-    except Exception:
-        return
-
-
-def _destroy_top_bar(page: Any) -> None:
-    if _page_is_closed(page):
-        return
-    try:
-        page.evaluate("() => window.__bridgeDestroyTopBar?.()")
-    except Exception:
-        return
-
-
-def _notify_learning_state(session: WebSession | None, *, active: bool, window_seconds: int) -> None:
-    if session is None:
-        return
-    port = int(session.control_port or 0)
-    if port <= 0:
-        return
-    payload = {
-        "type": "learning_on" if active else "learning_off",
-        "window_seconds": int(max(1, min(600, window_seconds))),
-    }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/event",
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=2.0):
-            return
-    except Exception:
-        return
-
-
-def _same_origin_path(current_url: str, target_url: str) -> bool:
-    try:
-        current = urlparse(current_url)
-        target = urlparse(target_url)
-    except ValueError:
-        return False
-    if not current.scheme or not current.netloc:
-        return False
-    return (
-        current.scheme == target.scheme
-        and current.netloc == target.netloc
-        and (current.path or "/") == (target.path or "/")
-    )
-
-
 def _to_repo_rel(path: Path) -> str:
     return str(path.resolve().relative_to(Path.cwd()))
-
-
-def _normalize_url(raw: str) -> str:
-    return raw.rstrip(".,;:!?)]}\"'")
-
-
-def _is_valid_url(text: str) -> bool:
-    try:
-        parsed = urlparse(text)
-    except ValueError:
-        return False
-    return parsed.scheme in ("http", "https") and bool(parsed.netloc)

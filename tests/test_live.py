@@ -18,7 +18,7 @@ class LiveCommandTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5181",
-            title="Audio3",
+            title="Demo App",
             controlled=False,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",

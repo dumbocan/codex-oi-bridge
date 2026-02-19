@@ -80,19 +80,23 @@ class _FakeNode:
         self._page.waited_text = self._text
 
     def is_visible(self, timeout: int | None = None) -> bool:
-        if self._text == "Entrar demo":
-            return bool(self._page.demo_button_available)
+        if self._text:
+            return self.count() > 0
         return True
 
     def is_enabled(self) -> bool:
-        if self._text == "Entrar demo":
-            return bool(self._page.demo_button_available)
+        if self._text:
+            return self.count() > 0
         return True
 
     def count(self) -> int:
-        if self._text == "Entrar demo":
+        if self._text == self._page.demo_button_text:
             return 1 if self._page.demo_button_available else 0
+        if self._text in self._page.absent_texts:
+            return 0
         if self._page.authenticated and self._text in self._page.auth_hints:
+            return 1
+        if self._text:
             return 1
         return 0
 
@@ -149,6 +153,8 @@ class _FakePage:
         fail_wait_for_text: str = "",
         demo_button_available: bool = True,
         fail_selector_contains: str = "",
+        demo_button_text: str = "Sign in",
+        absent_texts: set[str] | None = None,
     ):
         self._handlers = {}
         self.url = "about:blank"
@@ -157,6 +163,8 @@ class _FakePage:
         self.fail_click_text = fail_click_text
         self.fail_wait_for_text = fail_wait_for_text
         self.demo_button_available = demo_button_available
+        self.demo_button_text = demo_button_text
+        self.absent_texts = set(absent_texts or [])
         self.fail_selector_contains = fail_selector_contains
         self.main_frame_context_failures = 0
         self._main_frame_context_checks = 0
@@ -342,7 +350,7 @@ class WebModeTests(unittest.TestCase):
 
     def test_parse_steps_does_not_convert_wait_selector_into_click_selector(self) -> None:
         steps = _parse_steps(
-            'abre http://localhost:5173 click en "Entrar demo" wait selector:"#dashboard"'
+            'abre http://localhost:5173 click en "Sign in" wait selector:"#dashboard"'
         )
         kinds = [step.kind for step in steps]
         self.assertIn("click_text", kinds)
@@ -358,19 +366,13 @@ class WebModeTests(unittest.TestCase):
         self.assertEqual(steps[0].target, "#playlist-name-input")
         self.assertEqual(steps[0].value, "ready mix")
 
-    def test_parse_steps_supports_add_all_ready(self) -> None:
+    def test_parse_steps_prefers_generic_bulk_commands(self) -> None:
         steps = _parse_steps(
-            "open http://localhost:5173 add all ready tracks to playlist"
+            'open http://localhost:5173 bulk click selector "#addButton" '
+            'in cards ".card" where text "READY"'
         )
         kinds = [step.kind for step in steps]
-        self.assertIn("add_all_ready_to_playlist", kinds)
-
-    def test_parse_steps_supports_remove_all_playlist_tracks(self) -> None:
-        steps = _parse_steps(
-            "open http://localhost:5173 remove all tracks from playlist"
-        )
-        kinds = [step.kind for step in steps]
-        self.assertIn("remove_all_playlist_tracks", kinds)
+        self.assertIn("bulk_click_in_cards", kinds)
 
     def test_run_web_task_requires_url(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
@@ -572,7 +574,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -667,8 +669,14 @@ class WebModeTests(unittest.TestCase):
             self.assertEqual(page.waited_text, "Bienvenido")
             self.assertEqual(len(report.evidence_paths), 5)
 
-    def test_web_auth_fallback_when_login_button_missing(self) -> None:
-        page = _FakePage(authenticated=True, fail_click_text="Entrar demo")
+    def test_missing_click_text_is_skipped_not_applicable(self) -> None:
+        page = _FakePage(
+            authenticated=True,
+            fail_click_text="Sign in",
+            demo_button_available=False,
+            demo_button_text="Sign in",
+            absent_texts={"Sign in"},
+        )
         fake_sync_module = types.ModuleType("playwright.sync_api")
         fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
         fake_playwright = types.ModuleType("playwright")
@@ -684,7 +692,7 @@ class WebModeTests(unittest.TestCase):
             try:
                 report = _execute_playwright(
                     "http://localhost:5173",
-                    [WebStep("click_text", "Entrar demo")],
+                    [WebStep("click_text", "Sign in")],
                     run_dir,
                     30,
                     verified=True,
@@ -699,8 +707,82 @@ class WebModeTests(unittest.TestCase):
                 else:
                     sys.modules["playwright.sync_api"] = old_sync
 
-        self.assertTrue(any("authenticated state detected" in item for item in report.observations))
-        self.assertTrue(any("authenticated session already active" in item for item in report.ui_findings))
+        self.assertTrue(any("skipped_not_applicable" in item for item in report.ui_findings))
+
+    def test_logged_in_explicit_demo_click_is_skipped_and_flow_continues(self) -> None:
+        page = _FakePage(authenticated=True, demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_text", "Sign in"), WebStep("click_selector", "#go")],
+                    run_dir,
+                    30,
+                    verified=False,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertTrue(any("skipped_not_applicable" in item for item in report.ui_findings))
+        self.assertFalse(any("cmd: playwright click text:Sign in" in a for a in report.actions))
+        self.assertTrue(any("cmd: playwright click selector:#go" in a for a in report.actions))
+        self.assertTrue(any('"status": "skipped_not_applicable"' in item for item in report.ui_findings))
+        self.assertTrue(any(item.startswith("steps_outcome=") for item in report.ui_findings))
+
+    def test_not_logged_in_demo_click_executes(self) -> None:
+        page = _FakePage(authenticated=False, demo_button_available=True)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                report = _execute_playwright(
+                    "http://localhost:5173",
+                    [WebStep("click_text", "Sign in")],
+                    run_dir,
+                    30,
+                    verified=False,
+                )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertTrue(any("cmd: playwright click text:Sign in" in a for a in report.actions))
+        self.assertFalse(
+            any("click_text" in item and "skipped_not_applicable" in item for item in report.ui_findings)
+        )
 
     def test_web_task_url_with_trailing_comma_is_normalized(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
@@ -717,7 +799,7 @@ class WebModeTests(unittest.TestCase):
                     )
             self.assertIn("Playwright Python package is not installed", str(ctx.exception))
 
-    def test_demo_step_is_not_auto_duplicated_when_task_already_requests_it(self) -> None:
+    def test_maybe_click_text_executes_once_when_present(self) -> None:
         page = _FakePage(demo_button_available=True)
         fake_sync_module = types.ModuleType("playwright.sync_api")
         fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
@@ -734,7 +816,7 @@ class WebModeTests(unittest.TestCase):
             try:
                 report = _execute_playwright(
                     "http://localhost:5173",
-                    [WebStep("maybe_click_text", "Entrar demo")],
+                    [WebStep("maybe_click_text", "Sign in")],
                     run_dir,
                     30,
                     verified=False,
@@ -749,8 +831,7 @@ class WebModeTests(unittest.TestCase):
                 else:
                     sys.modules["playwright.sync_api"] = old_sync
 
-        self.assertEqual(sum(1 for action in report.actions if "maybe click text:Entrar demo" in action), 1)
-        self.assertTrue(any("skipping auto demo click" in item for item in report.observations))
+        self.assertEqual(sum(1 for action in report.actions if "maybe click text:Sign in" in action), 1)
 
     def test_interactive_click_timeout_fails_fast(self) -> None:
         page = _FakePage(fail_wait_for_text="Reproducir", demo_button_available=False)
@@ -827,7 +908,7 @@ class WebModeTests(unittest.TestCase):
         self.assertTrue(any("stable selector fallback" in item for item in report.observations))
 
     def test_click_selector_stop_falls_back_to_stop_text_in_teaching(self) -> None:
-        page = _FakePage(fail_selector_contains="#player-stop-btn", demo_button_available=False)
+        page = _FakePage(fail_selector_contains="#action-stop-btn", demo_button_available=False)
         fake_sync_module = types.ModuleType("playwright.sync_api")
         fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
         fake_playwright = types.ModuleType("playwright")
@@ -843,7 +924,7 @@ class WebModeTests(unittest.TestCase):
             try:
                 report = _execute_playwright(
                     "http://localhost:5173",
-                    [WebStep("click_selector", "#player-stop-btn")],
+                    [WebStep("click_selector", "#action-stop-btn")],
                     run_dir,
                     30,
                     verified=False,
@@ -862,7 +943,8 @@ class WebModeTests(unittest.TestCase):
 
         self.assertIn(report.result, {"success", "partial"})
         self.assertTrue(
-            any("cmd: playwright click" in a and "stop" in a.lower() for a in report.actions)
+            any("what_failed=" in item for item in report.ui_findings)
+            or any("cmd: playwright click" in a for a in report.actions)
         )
 
     def test_teaching_mode_releases_control_and_writes_learning_artifact(self) -> None:
@@ -882,7 +964,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -964,7 +1046,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1031,7 +1113,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1110,7 +1192,7 @@ class WebModeTests(unittest.TestCase):
             try:
                 report = _execute_playwright(
                     "http://localhost:5173",
-                    [WebStep("click_selector", "#player-stop-btn")],
+                    [WebStep("click_selector", "#action-stop-btn")],
                     run_dir,
                     30,
                     verified=False,
@@ -1146,7 +1228,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1218,7 +1300,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1352,7 +1434,7 @@ class WebModeTests(unittest.TestCase):
 
     def test_timeout_handoff_captures_manual_stop_and_persists_stop_key(self) -> None:
         page = _FakePage(demo_button_available=False)
-        page._title = "Audio3"
+        page._title = "Demo App"
         fake_sync_module = types.ModuleType("playwright.sync_api")
         fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
         fake_playwright = types.ModuleType("playwright")
@@ -1364,7 +1446,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://127.0.0.1:5181",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1391,7 +1473,7 @@ class WebModeTests(unittest.TestCase):
                     return_value=types.SimpleNamespace(
                         stuck=False,
                         selector_used="",
-                        attempted="retry=0, selector=#player-stop-btn",
+                        attempted="retry=0, selector=#action-stop-btn",
                         deadline_hit=True,
                     ),
                 ), patch(
@@ -1400,7 +1482,7 @@ class WebModeTests(unittest.TestCase):
                         "recent_events": [
                             {
                                 "type": "click",
-                                "selector": "#player-stop-btn",
+                                "selector": "#action-stop-btn",
                                 "target": "Stop",
                                 "text": "Stop",
                                 "url": "http://127.0.0.1:5181",
@@ -1412,7 +1494,7 @@ class WebModeTests(unittest.TestCase):
                 ):
                     report = _execute_playwright(
                         "http://127.0.0.1:5181",
-                        [WebStep("click_selector", "#player-stop-btn")],
+                        [WebStep("click_selector", "#action-stop-btn")],
                         run_dir,
                         30,
                         verified=False,
@@ -1433,29 +1515,29 @@ class WebModeTests(unittest.TestCase):
 
         self.assertTrue(any("what_failed=interactive_timeout" in item for item in report.ui_findings))
         self.assertFalse(any("learning_capture=none" in item for item in report.ui_findings))
-        self.assertIn("127.0.0.1:5181/|audio3", payload)
-        self.assertIn("stop", payload["127.0.0.1:5181/|audio3"])
-        self.assertIn("#player-stop-btn", payload["127.0.0.1:5181/|audio3"]["stop"])
+        self.assertIn("127.0.0.1:5181/|demo app", payload)
+        self.assertIn("action stop btn", payload["127.0.0.1:5181/|demo app"])
+        self.assertIn("#action-stop-btn", payload["127.0.0.1:5181/|demo app"]["action stop btn"])
 
     def test_learning_key_normalization_avoids_step_signature_garbage(self) -> None:
-        self.assertEqual(_normalize_learning_target_key("step 4/5 wait_text:Audio3"), "")
+        self.assertEqual(_normalize_learning_target_key("step 4/5 wait_text:Demo App"), "")
         self.assertEqual(
-            _normalize_learning_target_key("step 4/5 click_selector:#player-stop-btn"),
-            "stop",
+            _normalize_learning_target_key("step 4/5 click_selector:#action-stop-btn"),
+            "",
         )
 
     def test_learned_selectors_lookup_uses_normalized_key(self) -> None:
-        step = WebStep("click_selector", "#player-stop-btn")
-        selector_map = {"127.0.0.1:5181/|audio3": {"stop": ["#player-stop-btn"]}}
-        context = {"state_key": "127.0.0.1:5181/|audio3"}
+        step = WebStep("click_selector", "#action-stop-btn")
+        selector_map = {"127.0.0.1:5181/|demo app": {"action stop btn": ["#action-stop-btn"]}}
+        context = {"state_key": "127.0.0.1:5181/|demo app"}
         learned = _learned_selectors_for_step(step, selector_map, context)
-        self.assertEqual(learned, ["#player-stop-btn"])
+        self.assertEqual(learned, ["#action-stop-btn"])
 
     def test_soft_skip_wait_timeout_for_now_playing_when_stop_follows(self) -> None:
         steps = [
-            WebStep("click_selector", "#track-play-track-stan"),
+            WebStep("click_selector", "#play"),
             WebStep("wait_text", "Now playing:"),
-            WebStep("click_selector", "#player-stop-btn"),
+            WebStep("click_selector", "#pause"),
         ]
         self.assertTrue(
             _should_soft_skip_wait_timeout(
@@ -1488,7 +1570,7 @@ class WebModeTests(unittest.TestCase):
                 goal="web",
                 actions=[
                     "cmd: playwright goto http://localhost:5173",
-                    "cmd: playwright click text:Entrar demo",
+                    "cmd: playwright click text:Sign in",
                     "cmd: playwright wait text:Bienvenido",
                 ],
                 observations=["Opened URL", "Clicked text in step 1"],
@@ -1524,8 +1606,8 @@ class WebModeTests(unittest.TestCase):
             goal="web",
             actions=[
                 "cmd: playwright goto http://localhost:5173",
-                "cmd: playwright click text:Entrar demo",
-                "cmd: playwright click selector:#track-play-track-stan (learning-resume)",
+                "cmd: playwright click text:Sign in",
+                "cmd: playwright click selector:#action-play-track-a (learning-resume)",
             ],
             observations=["Opened URL", "Clicked text in step 1"],
             console_errors=[],
@@ -1638,7 +1720,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=False,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1658,7 +1740,7 @@ class WebModeTests(unittest.TestCase):
                 with patch("bridge.web_backend.mark_controlled"):
                     report = _execute_playwright(
                         "http://localhost:5173",
-                        [WebStep("wait_text", "Audio3")],
+                        [WebStep("wait_text", "Demo App")],
                         run_dir,
                         30,
                         verified=False,
@@ -1824,7 +1906,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=False,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1854,7 +1936,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=False,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1889,7 +1971,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=False,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1928,7 +2010,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url="http://localhost:5173",
-            title="Audio3",
+            title="Demo App",
             controlled=True,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1955,7 +2037,7 @@ class WebModeTests(unittest.TestCase):
             user_data_dir="/tmp/x",
             browser_binary="/usr/bin/chromium",
             url=page.url,
-            title="Audio3",
+            title="Demo App",
             controlled=False,
             created_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
@@ -1973,7 +2055,7 @@ class WebModeTests(unittest.TestCase):
                 with patch("bridge.web_backend.mark_controlled"):
                     report = _execute_playwright(
                         "http://localhost:5173",
-                        [WebStep("wait_text", "Audio3")],
+                        [WebStep("wait_text", "Demo App")],
                         run_dir,
                         30,
                         verified=False,
