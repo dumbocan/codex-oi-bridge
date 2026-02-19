@@ -35,9 +35,29 @@ def same_origin_path(current_url: str, target_url: str) -> bool:
         return False
     if not current.scheme or not current.netloc:
         return False
+    if current.scheme != target.scheme:
+        return False
+
+    def _normalized_host(host: str | None) -> str:
+        low = str(host or "").strip().lower()
+        if low in {"localhost", "127.0.0.1", "::1"}:
+            return "loopback"
+        return low
+
+    def _effective_port(parsed: object) -> int | None:
+        port = getattr(parsed, "port", None)
+        if isinstance(port, int):
+            return port
+        scheme = str(getattr(parsed, "scheme", "")).lower()
+        if scheme == "http":
+            return 80
+        if scheme == "https":
+            return 443
+        return None
+
     return (
-        current.scheme == target.scheme
-        and current.netloc == target.netloc
+        _normalized_host(current.hostname) == _normalized_host(target.hostname)
+        and _effective_port(current) == _effective_port(target)
         and (current.path or "/") == (target.path or "/")
     )
 

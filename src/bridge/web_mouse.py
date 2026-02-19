@@ -65,7 +65,7 @@ def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
     ny = dy / dist
     perp_x = -ny
     perp_y = nx
-    base_amp = max(10.0, min(44.0, dist * rng.uniform(0.1, 0.22)))
+    base_amp = max(12.0, min(52.0, dist * rng.uniform(0.12, 0.28)))
     c1x, c1y = _clamp(
         start_x + dx * rng.uniform(0.2, 0.34) + perp_x * base_amp * rng.uniform(-0.9, 0.9),
         start_y + dy * rng.uniform(0.2, 0.34) + perp_y * base_amp * rng.uniform(-0.9, 0.9),
@@ -74,15 +74,17 @@ def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
         start_x + dx * rng.uniform(0.58, 0.8) + perp_x * base_amp * rng.uniform(-0.85, 0.85),
         start_y + dy * rng.uniform(0.58, 0.8) + perp_y * base_amp * rng.uniform(-0.85, 0.85),
     )
-    overshoot = max(1.5, min(8.0, dist * rng.uniform(0.02, 0.045)))
+    overshoot = max(2.0, min(11.0, dist * rng.uniform(0.03, 0.06)))
     ox, oy = _clamp(
         target_x + nx * overshoot + perp_x * rng.uniform(-3.2, 3.2),
         target_y + ny * overshoot + perp_y * rng.uniform(-3.2, 3.2),
     )
 
-    samples = int(max(18, min(52, round((dist / 24.0) + (24.0 / norm_speed)))))
+    samples = int(max(10, min(28, round((dist / 36.0) + (14.0 / norm_speed)))))
     phase = rng.uniform(0.0, math.pi * 2.0)
-    ellipse_cycles = rng.uniform(0.8, 1.8)
+    ellipse_cycles = rng.uniform(1.0, 2.4)
+    phase2 = rng.uniform(0.0, math.pi * 2.0)
+    ellipse_cycles2 = rng.uniform(0.6, 1.7)
     route: list[tuple[float, float]] = []
     for i in range(1, samples + 1):
         t = i / float(samples)
@@ -102,12 +104,14 @@ def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
         # Elliptical lateral motion with tapering envelope near endpoints.
         env = max(0.0, math.sin(math.pi * t))
         wobble = math.sin((2.0 * math.pi * ellipse_cycles * t) + phase)
-        bx += perp_x * (base_amp * 0.84 * env * wobble)
-        by += perp_y * (base_amp * 0.84 * env * wobble)
+        wobble2 = math.cos((2.0 * math.pi * ellipse_cycles2 * t) + phase2)
+        combo = (wobble * 0.72) + (wobble2 * 0.38)
+        bx += perp_x * (base_amp * 0.9 * env * combo)
+        by += perp_y * (base_amp * 0.9 * env * combo)
         # Fine-grained noise, stronger at mid-path and softer near target.
         micro = max(0.0, 1.0 - abs(0.52 - t) * 1.85)
-        bx += perp_x * rng.uniform(-2.8, 2.8) * micro
-        by += perp_y * rng.uniform(-2.8, 2.8) * micro
+        bx += perp_x * rng.uniform(-4.2, 4.2) * micro
+        by += perp_y * rng.uniform(-4.2, 4.2) * micro
         route.append(_clamp(bx, by))
     route.append(_clamp(target_x, target_y))
     _LAST_HUMAN_ROUTE = [(float(px), float(py)) for px, py in route]
@@ -130,8 +134,8 @@ def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
                 max(
                     2,
                     min(
-                        11,
-                        round((3.2 / norm_speed) + (slow_factor * 6.0) + rng.uniform(-0.8, 1.3)),
+                        8,
+                        round((2.0 / norm_speed) + (slow_factor * 4.0) + rng.uniform(-1.1, 1.6)),
                     ),
                 )
             )
@@ -150,8 +154,8 @@ def _human_mouse_move(page: Any, x: float, y: float, *, speed: float) -> None:
                 max(
                     0,
                     min(
-                        18,
-                        round((3.2 / norm_speed) + (progress * 5.0) + rng.uniform(-2.0, 2.4)),
+                        10,
+                        round((1.1 / norm_speed) + (progress * 2.0) + rng.uniform(-1.8, 2.4)),
                     ),
                 )
             )
@@ -181,7 +185,7 @@ def _human_mouse_click(page: Any, x: float, y: float, *, speed: float, hold_ms: 
     except Exception:
         pass
     page.mouse.down()
-    effective_hold = int(max(0, min(260, round(float(hold_ms) * 0.34))))
+    effective_hold = int(max(0, min(120, round(float(hold_ms) * 0.16) + random.randint(-10, 12))))
     if effective_hold > 0:
         page.wait_for_timeout(effective_hold)
     page.mouse.up()

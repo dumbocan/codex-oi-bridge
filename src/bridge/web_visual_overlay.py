@@ -76,6 +76,7 @@ def _install_visual_overlay(
         trailLayer.style.inset = '0';
         trailLayer.style.pointerEvents = 'none';
         trailLayer.style.zIndex = '2147483646';
+        trailLayer.style.display = cfg.traceEnabled ? 'block' : 'none';
         overlayHost.appendChild(trailLayer);
 
         const stateBorder = document.createElement('div');
@@ -139,7 +140,7 @@ def _install_visual_overlay(
 
         let lastTrailPoint = null;
         const emitTrail = (x, y) => {
-        if (!cfg.cursorEnabled) return;
+        if (!cfg.cursorEnabled || !cfg.traceEnabled) return;
         const px = Number(x);
         const py = Number(y);
         if (!Number.isFinite(px) || !Number.isFinite(py)) return;

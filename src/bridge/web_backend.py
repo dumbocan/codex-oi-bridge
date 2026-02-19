@@ -464,7 +464,7 @@ def _execute_playwright(
                     click_pulse_enabled=visual_click_pulse,
                     scale=visual_scale,
                     color=visual_color,
-                    trace_enabled=True,
+                    trace_enabled=False,
                     session_state=_session_state_payload(session),
                 )
                 page.bring_to_front()
@@ -507,6 +507,8 @@ def _execute_playwright(
         wait_timeout_ms = max(1000, min(60000, wait_timeout_ms))
         interactive_timeout_ms = int(float(os.getenv("BRIDGE_WEB_INTERACTIVE_TIMEOUT_SECONDS", "8")) * 1000)
         interactive_timeout_ms = max(1000, min(60000, interactive_timeout_ms))
+        post_action_pause_ms = int(float(os.getenv("BRIDGE_WEB_POST_ACTION_PAUSE_MS", "250")))
+        post_action_pause_ms = max(0, min(2000, post_action_pause_ms))
         watchdog_cfg = WebWatchdogConfig(
             stuck_interactive_seconds=float(os.getenv("BRIDGE_WEB_STUCK_INTERACTIVE_SECONDS", "12")),
             stuck_step_seconds=float(os.getenv("BRIDGE_WEB_STUCK_STEP_SECONDS", "20")),
@@ -993,7 +995,8 @@ def _execute_playwright(
                     if len(actions) > prev_action_len:
                         watchdog_state.last_progress_event_ts = time.monotonic()
                     _record_step_outcome(idx=idx, step=step, status="executed")
-                    page.wait_for_timeout(1000)
+                    if post_action_pause_ms > 0:
+                        page.wait_for_timeout(post_action_pause_ms)
                     page.screenshot(path=str(after), full_page=False)
                     evidence_paths.append(_to_repo_rel(after))
                     if visual:
@@ -2130,7 +2133,7 @@ def _launch_browser(
 ) -> Any:
     kwargs: dict[str, Any] = {"headless": not visual}
     if visual:
-        slow_mo = int(max(180, min(500, 260 / max(0.2, visual_mouse_speed))))
+        slow_mo = int(max(90, min(500, 260 / max(0.2, visual_mouse_speed))))
         kwargs["slow_mo"] = slow_mo
         kwargs["args"] = [
             "--window-size=1280,860",
