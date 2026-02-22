@@ -256,3 +256,145 @@ def resume_after_learning(
         return True
     except Exception:
         return False
+
+
+def process_learning_window(
+    *,
+    page: Any,
+    session: Any | None,
+    failed_target_for_teaching: str,
+    learning_context: dict[str, str],
+    learning_window_seconds: int,
+    actions: list[str],
+    observations: list[str],
+    ui_findings: list[str],
+    evidence_paths: list[str],
+    capture_manual_learning: Callable[..., dict[str, Any] | None],
+    stable_selectors_for_target: Callable[[str], list[str]],
+    store_learned_selector: Callable[..., None],
+    write_teaching_artifacts: Callable[[dict[str, Any]], list[str]],
+    show_learning_thanks_notice: Callable[[Any, str], None],
+    resume_after_learning: Callable[..., bool],
+    notify_learning_state: Callable[[Any, bool, int], None],
+    update_top_bar_state: Callable[[Any, dict[str, Any]], None],
+    session_state_payload: Callable[..., dict[str, Any]],
+    disable_active_youtube_iframe_pointer_events: Callable[[Any], dict[str, Any] | None],
+    restore_iframe_pointer_events: Callable[[Any, dict[str, Any] | None], None],
+) -> None:
+    learn: dict[str, Any] | None = None
+    if session is not None:
+        notify_learning_state(session, active=True, window_seconds=learning_window_seconds)
+        try:
+            update_top_bar_state(
+                page,
+                session_state_payload(session, override_controlled=False, learning_active=True),
+            )
+        except Exception:
+            pass
+
+    learning_iframe_guard = disable_active_youtube_iframe_pointer_events(page)
+    try:
+        if session is not None:
+            learn = capture_manual_learning(
+                page=page,
+                session=session,
+                failed_target=failed_target_for_teaching,
+                context=learning_context,
+                wait_seconds=learning_window_seconds,
+            )
+        if learn:
+            selector_used = str(learn.get("selector", "")).strip()
+            if not selector_used:
+                target_hint = str(learn.get("target", "")).strip()
+                stable = stable_selectors_for_target(target_hint)
+                selector_used = stable[0] if stable else ""
+            if selector_used:
+                store_learned_selector(
+                    target=str(learn.get("failed_target", "")).strip(),
+                    selector=selector_used,
+                    context=learning_context,
+                    source="manual",
+                )
+            artifact_paths = write_teaching_artifacts(learn)
+            evidence_paths.extend(artifact_paths)
+            show_learning_thanks_notice(page, str(learn.get("failed_target", "")).strip())
+            observations.append(
+                "Teaching mode learned selector from manual action: "
+                f"{selector_used or learn.get('target', '')}"
+            )
+            ui_findings.append(
+                "Gracias, ya he aprendido dónde está el botón "
+                f"{str(learn.get('failed_target', '')).strip()}. Ya continúo yo."
+            )
+            resumed = resume_after_learning(
+                page=page,
+                selector=selector_used,
+                target=str(learn.get("failed_target", "")).strip(),
+                actions=actions,
+                observations=observations,
+                ui_findings=ui_findings,
+            )
+            if resumed:
+                observations.append("teaching resume: action replayed after learning")
+            else:
+                ui_findings.append("learning_resume=failed")
+        else:
+            ui_findings.append("learning_capture=none")
+    finally:
+        restore_iframe_pointer_events(page, learning_iframe_guard)
+        if session is not None:
+            notify_learning_state(session, active=False, window_seconds=1)
+            try:
+                update_top_bar_state(
+                    page,
+                    session_state_payload(session, override_controlled=False, learning_active=False),
+                )
+            except Exception:
+                pass
+
+
+def release_control_for_handoff(
+    *,
+    page: Any,
+    session: Any,
+    visual: bool,
+    control_enabled: bool,
+    wait_for_human_learning: bool,
+    actions: list[str],
+    ui_findings: list[str],
+    mark_controlled: Callable[..., None],
+    safe_page_title: Callable[[Any], str],
+    notify_learning_state: Callable[[Any, bool, int], None],
+    learning_window_seconds: int,
+    set_assistant_control_overlay: Callable[[Any, bool], None],
+    set_learning_handoff_overlay: Callable[[Any, bool], None],
+    set_user_control_overlay: Callable[[Any, bool], None],
+    update_top_bar_state: Callable[[Any, dict[str, Any]], None],
+    session_state_payload: Callable[..., dict[str, Any]],
+) -> bool:
+    mark_controlled(session, False, url=page.url, title=safe_page_title(page))
+    if wait_for_human_learning:
+        notify_learning_state(
+            session,
+            active=True,
+            window_seconds=learning_window_seconds,
+        )
+    if visual and control_enabled:
+        set_assistant_control_overlay(page, False)
+        if wait_for_human_learning:
+            set_learning_handoff_overlay(page, True)
+        else:
+            set_user_control_overlay(page, True)
+        update_top_bar_state(
+            page,
+            session_state_payload(
+                session,
+                override_controlled=False,
+                learning_active=bool(wait_for_human_learning),
+            ),
+        )
+        control_enabled = False
+    actions.append("cmd: playwright release control (teaching handoff)")
+    if "control released" not in ui_findings:
+        ui_findings.append("control released")
+    return control_enabled

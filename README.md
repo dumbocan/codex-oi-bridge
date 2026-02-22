@@ -481,7 +481,11 @@ Si falla:
   - `report.json` y `status.json` consistentes al finalizar,
   - run no queda en `running` indefinido.
 - Refactor incremental en progreso (sin romper tests):
-  - extracción a módulos: parser, bulk scan, teaching, watchdog, handoff, frame-guard, executor step helpers, finalización.
+  - extracción a módulos: parser, bulk scan, teaching, watchdog, handoff, frame-guard, preflight, step-runner, retries, learning-store, handoff-actions, interaction-executor, step-applicability, visual-runtime, runtime-safety, run-bootstrap, run-state, session-overlay-ops, run-postloop, target-preflight, run-reporting, run-loop, finalización.
+  - `web_backend.py` reducido progresivamente con wrappers de compatibilidad para no romper tests existentes (`1172` líneas en esta ronda).
+  - validación repetida durante el refactor:
+    - `flake8 -j1 src/bridge/web_backend.py src/bridge/web_run_loop.py src/bridge/web_run_reporting.py src/bridge/web_target_preflight.py src/bridge/web_run_postloop.py src/bridge/web_session_overlay_ops.py src/bridge/web_run_state.py src/bridge/web_run_bootstrap.py src/bridge/web_runtime_safety.py src/bridge/web_visual_runtime.py src/bridge/web_step_applicability.py src/bridge/web_interaction_executor.py src/bridge/web_learning_store.py src/bridge/web_preflight.py src/bridge/web_step_runner.py src/bridge/web_teaching.py src/bridge/web_run_handoff.py src/bridge/web_interactive_retries.py src/bridge/web_handoff_actions.py`
+    - `PYTHONPATH=src python3 -m unittest -q tests.test_web_mode tests.test_web_session tests.test_live tests.test_cli tests.test_web_backend` (74 tests)
 
 ## Estructura de carpetas (refactor en progreso)
 
@@ -492,12 +496,29 @@ Módulos principales en `src/bridge/`:
 - `web_backend.py`: orquestación principal de ejecución web (todavía en reducción progresiva).
 - `web_steps.py`: parseo de comandos web y rewrite de pasos genéricos (ej. play ambiguo).
 - `web_bulk_scan.py`: escaneo DOM para operaciones bulk (cards, selectors visibles, playlist seleccionada).
+- `web_preflight.py`: navegación/contexto inicial, overlay inicial y evidencia `step_0_context`.
+- `web_step_runner.py`: prechecks comunes por step y ejecución de ramas `interactive`/`wait` con resultados estructurados.
+- `web_interactive_retries.py`: reintentos interactivos con scroll, selector fallback y detección de stuck local.
+- `web_interaction_executor.py`: primitivas Playwright de interacción (`click/fill/select/bulk`) y wrapper de waits.
+- `web_step_applicability.py`: precheck genérico de aplicabilidad (`present/visible/enabled`) y helper de timeout errors.
+- `web_learning_store.py`: persistencia/carga de selectores aprendidos y priorización por contexto.
 - `web_teaching.py`: captura de aprendizaje manual, validación de click útil, artefactos y resume.
 - `web_watchdog.py`: estado/config de watchdog y evaluación de atascos.
 - `web_executor_steps.py`: clasificación de tipos de step y findings repetidos de error/timeout.
 - `web_run_finalize.py`: normalización de resultado final y estructura de `ui_findings`.
 - `web_handoff.py`: avisos y transición de control en handoff teaching.
+- `web_handoff_actions.py`: helpers para producir actualizaciones de estado al ceder control (stuck/target_not_found).
+- `web_run_handoff.py`: decisiones de handoff por watchdog/timeout/iframe con payload estructurado.
 - `web_frame_guard.py`: política main-frame-first y guardias de foco/iframe.
+- `web_visual_runtime.py`: robustez de overlay visual (reinstalación, readiness y fallback best-effort).
+- `web_runtime_safety.py`: guardias de página/sesión cerrada, evidencia timeout y helpers de path relativos.
+- `web_run_bootstrap.py`: setup inicial de browser/page, overlay inicial, observers y timeouts/config de run.
+- `web_run_state.py`: estado mutable del run (handoff/control/result) y helpers para aplicar decisiones/updates.
+- `web_session_overlay_ops.py`: operaciones sobre top bar/overlay en sesiones attach (release/ensure/destroy) desacopladas del backend.
+- `web_run_postloop.py`: procesamiento post-loop (handoff/learning) y cleanup `finally` de sesión/browser.
+- `web_target_preflight.py`: comprobaciones de reachability/stack previas a `web-run` con wrappers compatibles en backend.
+- `web_run_reporting.py`: persistencia final de `report.json`/`status.json` y ensamblado del `OIReport` final.
+- `web_run_loop.py`: orquestación del loop de steps (`interactive`/`wait`) extraída del backend con callbacks para mantener semántica.
 
 ## Modelo mental: OI + Bridge + App
 
