@@ -1,7 +1,16 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from bridge.web_backend import _highlight_target, _preflight_target_reachable
+from bridge.web_learning_store import (
+    learned_scroll_hints_for_step,
+    load_learned_scroll_hints,
+    store_learned_scroll_hints,
+)
+from bridge.web_steps import WebStep
+from bridge.web_teaching import capture_manual_learning
 
 
 class _FakePage:
@@ -58,6 +67,58 @@ class WebBackendOcclusionTests(unittest.TestCase):
         locator = _FakeLocator(ok_after=3)
         pt = _highlight_target(page, locator, "step 1", click_pulse_enabled=False)
         self.assertIsNotNone(pt)
+
+
+class WebTeachingScrollLearningTests(unittest.TestCase):
+    def test_capture_manual_learning_includes_recent_scrolls(self) -> None:
+        events = [
+            {"type": "scroll", "created_at": "t1", "scroll_y": 120, "url": "http://x"},
+            {"type": "scroll", "created_at": "t2", "scroll_y": 360, "url": "http://x"},
+            {
+                "type": "click",
+                "created_at": "t3",
+                "selector": "#player-stop-btn",
+                "target": "Stop",
+                "text": "Stop",
+                "url": "http://x",
+                "message": "click Stop",
+            },
+        ]
+
+        payload = capture_manual_learning(
+            page=None,
+            session=object(),
+            failed_target="#player-stop-btn",
+            context={"state_key": "localhost/|audio3"},
+            wait_seconds=5,
+            request_session_state=lambda _s: {"recent_events": events},
+            show_wrong_click_notice=lambda _page, _t: None,
+        )
+        self.assertIsNotNone(payload)
+        scrolls = list(payload.get("scroll_events", []))
+        self.assertEqual([s.get("scroll_y") for s in scrolls], [120, 360])
+
+    def test_store_and_load_scroll_hints_by_context(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            learning_json = root / "web_teaching_scroll_hints.json"
+            ctx = {"state_key": "127.0.0.1:5181/|audio3"}
+            store_learned_scroll_hints(
+                learning_dir=root,
+                learning_json=learning_json,
+                target="#track-play-track-stan",
+                scroll_positions=[220, 480, 480],
+                context=ctx,
+                normalize_failed_target_label=lambda raw: str(raw).split(":")[-1].strip(),
+            )
+            loaded = load_learned_scroll_hints(learning_json)
+            hints = learned_scroll_hints_for_step(
+                step=WebStep("click_selector", "#track-play-track-stan"),
+                scroll_map=loaded,
+                context=ctx,
+                normalize_failed_target_label=lambda raw: str(raw).split(":")[-1].strip(),
+            )
+            self.assertEqual(hints, [220, 480])
 
 
 if __name__ == "__main__":

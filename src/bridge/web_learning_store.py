@@ -1,4 +1,4 @@
-"""Persistence and selector-prioritization helpers for web teaching mode."""
+"""Persistence and selector/scroll-hint prioritization helpers for web teaching mode."""
 
 from __future__ import annotations
 
@@ -26,6 +26,38 @@ def load_learned_selectors(learning_json: Path) -> dict[str, dict[str, list[str]
         for tgt, selectors in value.items():
             if isinstance(tgt, str) and isinstance(selectors, list):
                 entry[tgt] = [str(s).strip() for s in selectors if str(s).strip()]
+        if entry:
+            out[str(key)] = entry
+    return out
+
+
+def load_learned_scroll_hints(learning_json: Path) -> dict[str, dict[str, list[int]]]:
+    try:
+        if not learning_json.exists():
+            return {}
+        payload = json.loads(learning_json.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, dict[str, list[int]]] = {}
+    for key, value in payload.items():
+        if not isinstance(value, dict):
+            continue
+        entry: dict[str, list[int]] = {}
+        for tgt, positions in value.items():
+            if not isinstance(tgt, str) or not isinstance(positions, list):
+                continue
+            norm_positions: list[int] = []
+            for pos in positions:
+                try:
+                    ival = int(pos)
+                except Exception:
+                    continue
+                if ival not in norm_positions:
+                    norm_positions.append(ival)
+            if norm_positions:
+                entry[tgt] = norm_positions[:8]
         if entry:
             out[str(key)] = entry
     return out
@@ -129,6 +161,48 @@ def store_learned_selector(
     )
 
 
+def store_learned_scroll_hints(
+    *,
+    learning_dir: Path,
+    learning_json: Path,
+    target: str,
+    scroll_positions: list[int],
+    context: dict[str, str],
+    normalize_failed_target_label: Callable[[str], str],
+) -> None:
+    target_norm = normalize_learning_target_key(
+        target,
+        normalize_failed_target_label=normalize_failed_target_label,
+    )
+    if not target_norm:
+        return
+    clean_positions: list[int] = []
+    for pos in scroll_positions:
+        try:
+            ival = int(pos)
+        except Exception:
+            continue
+        if ival < 0:
+            ival = 0
+        if ival not in clean_positions:
+            clean_positions.append(ival)
+    if not clean_positions:
+        return
+    state_key = str(context.get("state_key", "")).strip()
+    if not state_key:
+        return
+    all_map = load_learned_scroll_hints(learning_json)
+    bucket = all_map.setdefault(state_key, {})
+    prev = list(bucket.get(target_norm, []))
+    merged: list[int] = []
+    for val in (clean_positions + prev):
+        if val not in merged:
+            merged.append(val)
+    bucket[target_norm] = merged[:8]
+    learning_dir.mkdir(parents=True, exist_ok=True)
+    learning_json.write_text(json.dumps(all_map, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def learned_selectors_for_step(
     *,
     step: Any,
@@ -163,6 +237,38 @@ def learned_selectors_for_step(
             if selector not in out:
                 out.append(selector)
     return out
+
+
+def learned_scroll_hints_for_step(
+    *,
+    step: Any,
+    scroll_map: dict[str, dict[str, list[int]]],
+    context: dict[str, str],
+    normalize_failed_target_label: Callable[[str], str],
+) -> list[int]:
+    if getattr(step, "kind", "") not in {"click_text", "click_selector"}:
+        return []
+    state_key = str(context.get("state_key", "")).strip()
+    if not state_key:
+        return []
+    bucket = scroll_map.get(state_key, {})
+    raw_key = str(getattr(step, "target", "")).strip().lower()
+    norm_key = normalize_learning_target_key(
+        str(getattr(step, "target", "")),
+        normalize_failed_target_label=normalize_failed_target_label,
+    )
+    out: list[int] = []
+    for key in (norm_key, raw_key):
+        if not key:
+            continue
+        for pos in bucket.get(key, []):
+            try:
+                ival = int(pos)
+            except Exception:
+                continue
+            if ival not in out:
+                out.append(ival)
+    return out[:8]
 
 
 def prioritize_steps_with_learned_selectors(

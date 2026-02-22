@@ -164,13 +164,15 @@ def capture_manual_learning(
     max_wait = max(4, min(180, int(wait_seconds)))
     deadline = datetime.now(timezone.utc).timestamp() + max_wait
     seen: set[str] = set()
+    recent_scrolls: list[dict[str, Any]] = []
     while datetime.now(timezone.utc).timestamp() < deadline:
         try:
             state = request_session_state(session)
         except BaseException:
             return None
         events = list(state.get("recent_events", []) or [])
-        for evt in reversed(events):
+        learned_click: dict[str, Any] | None = None
+        for evt in events:
             if not isinstance(evt, dict):
                 continue
             key = "|".join(
@@ -183,7 +185,23 @@ def capture_manual_learning(
             if key in seen:
                 continue
             seen.add(key)
-            if str(evt.get("type", "")).strip().lower() != "click":
+            etype = str(evt.get("type", "")).strip().lower()
+            if etype == "scroll":
+                try:
+                    scroll_y = int(evt.get("scroll_y", 0) or 0)
+                except Exception:
+                    scroll_y = 0
+                recent_scrolls.append(
+                    {
+                        "timestamp": str(evt.get("created_at", "")),
+                        "scroll_y": scroll_y,
+                        "url": str(evt.get("url", "")),
+                    }
+                )
+                if len(recent_scrolls) > 8:
+                    recent_scrolls = recent_scrolls[-8:]
+                continue
+            if etype != "click":
                 continue
             if not is_relevant_manual_learning_event(evt, failed_target):
                 if page is not None:
@@ -191,14 +209,17 @@ def capture_manual_learning(
                 continue
             selector = str(evt.get("selector", "")).strip()
             target = str(evt.get("target", "")).strip()
-            return {
+            learned_click = {
                 "failed_target": failed_target or target,
                 "selector": selector,
                 "target": target,
                 "timestamp": str(evt.get("created_at", "")),
                 "url": str(evt.get("url", "")),
                 "state_key": context.get("state_key", ""),
+                "scroll_events": list(recent_scrolls[-6:]),
             }
+        if learned_click:
+            return learned_click
         try:
             from time import sleep
 
@@ -229,7 +250,17 @@ def write_teaching_artifacts(
         f"- timestamp: `{payload.get('timestamp', '')}`",
         f"- url: `{payload.get('url', '')}`",
         f"- state_key: `{payload.get('state_key', '')}`",
+        f"- scroll_events_count: `{len(list(payload.get('scroll_events', []) or []))}`",
     ]
+    scroll_events = list(payload.get("scroll_events", []) or [])
+    if scroll_events:
+        md_lines.append("- scroll_events:")
+        for evt in scroll_events[-6:]:
+            if not isinstance(evt, dict):
+                continue
+            md_lines.append(
+                f"  - y={int(evt.get('scroll_y', 0) or 0)} at {str(evt.get('timestamp', ''))}"
+            )
     md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
     return [to_repo_rel(json_path), to_repo_rel(md_path)]
 
@@ -280,6 +311,7 @@ def process_learning_window(
     session_state_payload: Callable[..., dict[str, Any]],
     disable_active_youtube_iframe_pointer_events: Callable[[Any], dict[str, Any] | None],
     restore_iframe_pointer_events: Callable[[Any, dict[str, Any] | None], None],
+    store_learned_scroll_hints: Callable[..., None] | None = None,
 ) -> None:
     learn: dict[str, Any] | None = None
     if session is not None:
@@ -315,6 +347,26 @@ def process_learning_window(
                     context=learning_context,
                     source="manual",
                 )
+            scroll_positions: list[int] = []
+            for evt in list(learn.get("scroll_events", []) or []):
+                if not isinstance(evt, dict):
+                    continue
+                try:
+                    pos = int(evt.get("scroll_y", 0) or 0)
+                except Exception:
+                    continue
+                if pos not in scroll_positions:
+                    scroll_positions.append(pos)
+            if store_learned_scroll_hints is not None and scroll_positions:
+                store_learned_scroll_hints(
+                    target=str(learn.get("failed_target", "")).strip(),
+                    scroll_positions=scroll_positions,
+                    context=learning_context,
+                )
+                observations.append(
+                    f"Teaching mode learned scroll hints: {scroll_positions[:6]}"
+                )
+                ui_findings.append(f"learning_scrolls_captured={len(scroll_positions)}")
             artifact_paths = write_teaching_artifacts(learn)
             evidence_paths.extend(artifact_paths)
             show_learning_thanks_notice(page, str(learn.get("failed_target", "")).strip())

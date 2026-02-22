@@ -469,8 +469,10 @@ Si falla:
   - no depende de excepción para ceder control.
 - Aprendizaje real:
   - captura click manual útil (selector/text/url/timestamp),
+  - captura scroll manual relevante durante handoff (para contexto de búsqueda),
   - persistencia en `runs/<run_id>/learning/` y `runs/learning/web_teaching_selectors.json`,
   - reutilización en runs siguientes por contexto.
+  - pre-scroll aprendido antes de reintentos del mismo objetivo (cuando hay hints guardados).
 - Main-frame-first/iframe:
   - salida activa de foco iframe,
   - guard temporal `pointer-events: none` en iframe YouTube durante handoff/learning.
@@ -485,7 +487,7 @@ Si falla:
   - `web_backend.py` reducido progresivamente con wrappers de compatibilidad para no romper tests existentes (`1172` líneas en esta ronda).
   - validación repetida durante el refactor:
     - `flake8 -j1 src/bridge/web_backend.py src/bridge/web_run_loop.py src/bridge/web_run_reporting.py src/bridge/web_target_preflight.py src/bridge/web_run_postloop.py src/bridge/web_session_overlay_ops.py src/bridge/web_run_state.py src/bridge/web_run_bootstrap.py src/bridge/web_runtime_safety.py src/bridge/web_visual_runtime.py src/bridge/web_step_applicability.py src/bridge/web_interaction_executor.py src/bridge/web_learning_store.py src/bridge/web_preflight.py src/bridge/web_step_runner.py src/bridge/web_teaching.py src/bridge/web_run_handoff.py src/bridge/web_interactive_retries.py src/bridge/web_handoff_actions.py`
-    - `PYTHONPATH=src python3 -m unittest -q tests.test_web_mode tests.test_web_session tests.test_live tests.test_cli tests.test_web_backend` (74 tests)
+    - `PYTHONPATH=src python3 -m unittest -q tests.test_web_mode tests.test_web_session tests.test_live tests.test_cli tests.test_web_backend` (76 tests)
 
 ## Estructura de carpetas (refactor en progreso)
 
@@ -501,7 +503,7 @@ Módulos principales en `src/bridge/`:
 - `web_interactive_retries.py`: reintentos interactivos con scroll, selector fallback y detección de stuck local.
 - `web_interaction_executor.py`: primitivas Playwright de interacción (`click/fill/select/bulk`) y wrapper de waits.
 - `web_step_applicability.py`: precheck genérico de aplicabilidad (`present/visible/enabled`) y helper de timeout errors.
-- `web_learning_store.py`: persistencia/carga de selectores aprendidos y priorización por contexto.
+- `web_learning_store.py`: persistencia/carga de selectores y scroll-hints aprendidos, y priorización por contexto.
 - `web_teaching.py`: captura de aprendizaje manual, validación de click útil, artefactos y resume.
 - `web_watchdog.py`: estado/config de watchdog y evaluación de atascos.
 - `web_executor_steps.py`: clasificación de tipos de step y findings repetidos de error/timeout.

@@ -37,6 +37,7 @@ def execute_steps_loop(
     overlay_debug_path: Path,
     evidence_dir: Path,
     learned_selector_map: dict[str, Any],
+    learned_scroll_map: dict[str, Any],
     learning_context: dict[str, str],
     actions: list[str],
     observations: list[str],
@@ -62,6 +63,7 @@ def execute_steps_loop(
     apply_interactive_step_with_retries: Callable[..., Any],
     apply_interactive_step: Callable[..., None],
     learned_selectors_for_step: Callable[..., list[str]],
+    learned_scroll_hints_for_step: Callable[..., list[int]],
     retry_stuck_handoff: Callable[..., dict[str, Any]],
     target_not_found_handoff: Callable[..., dict[str, Any]],
     should_soft_skip_wait_timeout: Callable[..., bool],
@@ -82,6 +84,7 @@ def execute_steps_loop(
     trigger_stuck_handoff: Callable[..., bool],
     show_teaching_notice: Callable[[Any, str], None],
     store_learned_selector: Callable[..., None],
+    apply_learned_scroll_hints: Callable[..., None],
 ) -> StepLoopResult:
     interactive_step = 0
     total = len(steps)
@@ -145,6 +148,19 @@ def execute_steps_loop(
                 )
                 watchdog_state.last_progress_event_ts = time.monotonic()
                 continue
+
+            learned_scrolls = learned_scroll_hints_for_step(
+                step=step,
+                scroll_map=learned_scroll_map,
+                context=learning_context,
+            )
+            if learned_scrolls:
+                apply_learned_scroll_hints(
+                    page=page,
+                    target=str(getattr(step, "target", "")),
+                    scroll_positions=learned_scrolls,
+                    ui_findings=ui_findings,
+                )
 
             interactive_result = execute_interactive_step(
                 page=page,

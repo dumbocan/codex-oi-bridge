@@ -68,12 +68,15 @@ from bridge.web_interactive_retries import (
     apply_interactive_step_with_retries as _retries_apply_interactive_step_with_retries,
 )
 from bridge.web_learning_store import (
+    learned_scroll_hints_for_step as _learning_learned_scroll_hints_for_step,
     is_learning_target_candidate as _learning_is_target_candidate,
     is_specific_selector as _learning_is_specific_selector,
     learned_selectors_for_step as _learning_learned_selectors_for_step,
+    load_learned_scroll_hints as _learning_load_learned_scroll_hints,
     load_learned_selectors as _learning_load_learned_selectors,
     normalize_learning_target_key as _learning_normalize_target_key,
     prioritize_steps_with_learned_selectors as _learning_prioritize_steps,
+    store_learned_scroll_hints as _learning_store_learned_scroll_hints,
     store_learned_selector as _learning_store_learned_selector,
 )
 from bridge.web_run_finalize import (
@@ -185,6 +188,7 @@ _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 
 _LEARNING_DIR = Path("runs") / "learning"
 _LEARNING_JSON = _LEARNING_DIR / "web_teaching_selectors.json"
+_LEARNING_SCROLL_JSON = _LEARNING_DIR / "web_teaching_scroll_hints.json"
 
 
 def _observer_noise_mode() -> str:
@@ -372,6 +376,7 @@ def _execute_playwright(
     page = None
     interactive_timeout_ms = 8000
     learned_selector_map = _load_learned_selectors()
+    learned_scroll_map = _load_learned_scroll_hints()
     watchdog_state = WebWatchdogState()
     timing_cfg = _bootstrap_load_run_timing_config()
     step_hard_timeout_seconds = timing_cfg.step_hard_timeout_seconds
@@ -539,6 +544,7 @@ def _execute_playwright(
                 overlay_debug_path=overlay_debug_path,
                 evidence_dir=evidence_dir,
                 learned_selector_map=learned_selector_map,
+                learned_scroll_map=learned_scroll_map,
                 learning_context=learning_context,
                 actions=actions,
                 observations=observations,
@@ -564,6 +570,7 @@ def _execute_playwright(
                 apply_interactive_step_with_retries=_apply_interactive_step_with_retries,
                 apply_interactive_step=_apply_interactive_step,
                 learned_selectors_for_step=_learned_selectors_for_step,
+                learned_scroll_hints_for_step=_learned_scroll_hints_for_step,
                 retry_stuck_handoff=_retry_stuck_handoff,
                 target_not_found_handoff=_target_not_found_handoff,
                 should_soft_skip_wait_timeout=_should_soft_skip_wait_timeout,
@@ -584,6 +591,7 @@ def _execute_playwright(
                 trigger_stuck_handoff=_trigger_stuck_handoff,
                 show_teaching_notice=_show_teaching_handoff_notice,
                 store_learned_selector=_store_learned_selector,
+                apply_learned_scroll_hints=_apply_learned_scroll_hints,
             )
             ui_findings.append(f"steps_outcome={json.dumps(loop_result.step_outcomes, ensure_ascii=False)}")
             _postloop_process_handoff_and_learning(
@@ -603,6 +611,7 @@ def _execute_playwright(
                 capture_manual_learning=_capture_manual_learning,
                 stable_selectors_for_target=_stable_selectors_for_target,
                 store_learned_selector=_store_learned_selector,
+                store_learned_scroll_hints=_store_learned_scroll_hints,
                 write_teaching_artifacts=_write_teaching_artifacts,
                 show_learning_thanks_notice=_show_learning_thanks_notice,
                 resume_after_learning=_resume_after_learning,
@@ -773,6 +782,10 @@ def _load_learned_selectors() -> dict[str, dict[str, list[str]]]:
     return _learning_load_learned_selectors(_LEARNING_JSON)
 
 
+def _load_learned_scroll_hints() -> dict[str, dict[str, list[int]]]:
+    return _learning_load_learned_scroll_hints(_LEARNING_SCROLL_JSON)
+
+
 def _store_learned_selector(
     *,
     target: str,
@@ -787,6 +800,22 @@ def _store_learned_selector(
         selector=selector,
         context=context,
         source=source,
+        normalize_failed_target_label=_normalize_failed_target_label,
+    )
+
+
+def _store_learned_scroll_hints(
+    *,
+    target: str,
+    scroll_positions: list[int],
+    context: dict[str, str],
+) -> None:
+    _learning_store_learned_scroll_hints(
+        learning_dir=_LEARNING_DIR,
+        learning_json=_LEARNING_SCROLL_JSON,
+        target=target,
+        scroll_positions=scroll_positions,
+        context=context,
         normalize_failed_target_label=_normalize_failed_target_label,
     )
 
@@ -827,6 +856,19 @@ def _learned_selectors_for_step(
     return _learning_learned_selectors_for_step(
         step=step,
         selector_map=selector_map,
+        context=context,
+        normalize_failed_target_label=_normalize_failed_target_label,
+    )
+
+
+def _learned_scroll_hints_for_step(
+    step: WebStep,
+    scroll_map: dict[str, dict[str, list[int]]],
+    context: dict[str, str],
+) -> list[int]:
+    return _learning_learned_scroll_hints_for_step(
+        step=step,
+        scroll_map=scroll_map,
         context=context,
         normalize_failed_target_label=_normalize_failed_target_label,
     )
@@ -944,6 +986,33 @@ def _normalize_failed_target_label(raw: str) -> str:
 
 def _show_wrong_manual_click_notice(page: Any, failed_target: str) -> None:
     _teaching_show_wrong_click_notice(page, failed_target, _stable_selectors_for_target)
+
+
+def _apply_learned_scroll_hints(
+    *,
+    page: Any,
+    target: str,
+    scroll_positions: list[int],
+    ui_findings: list[str],
+) -> None:
+    if not scroll_positions:
+        return
+    applied: list[int] = []
+    for pos in scroll_positions[:3]:
+        try:
+            y = max(0, int(pos))
+        except Exception:
+            continue
+        try:
+            page.evaluate("([y]) => window.scrollTo(0, y)", [y])
+            page.wait_for_timeout(140)
+            applied.append(y)
+        except Exception:
+            break
+    if applied:
+        ui_findings.append(
+            f"applied learned scroll hints for {target}: {','.join(str(v) for v in applied)}"
+        )
 
 
 def _capture_manual_learning(
