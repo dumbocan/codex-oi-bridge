@@ -39,8 +39,18 @@ No usar `bridge` directo salvo que la sesión tenga `.venv` y `.env` cargados ma
 
 - `codex-oi-bridge` mantiene motor **genérico** (acciones, prechecks, skip, retries, teaching/handoff, reporting).
 - La semántica específica de cada app (flujos, estado login, selectores de negocio) vive en el repositorio de esa app.
+- Patrón recomendado de integración (app-aware, fuera del core):
+  1. `README` de la app (contrato operativo).
+  2. `PLAYBOOK` de la app (mapa de pantallas/estados, reglas de decisión, selectores preferidos/fallbacks, validaciones visibles).
+  3. Wrapper semántico de la app (traduce intents cortos como `play song` a un prompt `web-run` robusto).
+  4. `state probe` previo (detección de pantalla actual) antes de expandir el prompt semántico.
+- Regla de diseño: el core ejecuta pasos y aprende selectores/scrolls; la app decide *qué* pasos aplicar según el estado detectado.
 - Para Audio3, el playbook oficial está en:
   - `/home/micasa/audio3/docs/11-OI-PLAYBOOK.md`
+- Ejemplo Audio3 (app-side):
+  - Wrapper semántico: `/home/micasa/audio3/scripts/oi_semantic_web_run.sh`
+  - Traductor de intents: `/home/micasa/audio3/scripts/oi_semantic_prompt.py`
+  - El wrapper hace `bridge-safe web-run --verified` como `state probe` para distinguir `landing_demo_or_auth` vs `catalog_ready` antes de generar el plan.
 - Contrato de lectura para ejecutar Audio3 con OI:
   1. `/home/micasa/audio3/README.md`
   2. `/home/micasa/audio3/docs/11-OI-PLAYBOOK.md`
