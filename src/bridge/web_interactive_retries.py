@@ -67,7 +67,7 @@ def apply_interactive_step_with_retries(
                 for selector in stable_selectors_for_target(hint):
                     candidates.append(WebStep("click_selector", selector))
 
-    last_exc: Exception | None = None
+    last_exc: BaseException | None = None
     total_attempts = max(1, int(max_retries) + 1)
     started_at = time.monotonic()
     baseline_events = observer_useful_event_count(session)
@@ -124,7 +124,7 @@ def apply_interactive_step_with_retries(
                     )
                     return RetryResult(selector_used=candidate.target)
                 return RetryResult(selector_used="")
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 last_exc = exc
                 if _should_mark_stuck(
                     started_at=started_at,

@@ -237,6 +237,11 @@ def apply_interactive_step(
             ui_findings.append(
                 f"step {step_num} verify bulk click in cards: clicked={clicked}, selector={step.target}"
             )
+            if clicked == 0:
+                target_desc = f"selector={step.target} cards={card_selector}"
+                if required_text:
+                    target_desc += f" text={required_text}"
+                raise SystemExit(f"Bulk click in cards found no matching clickable targets: {target_desc}")
             return
 
         if step.kind == "bulk_click_until_empty":

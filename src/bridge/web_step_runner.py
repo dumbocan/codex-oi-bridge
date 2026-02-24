@@ -243,7 +243,7 @@ def execute_interactive_step(
                 step_num=interactive_step,
                 timeout_ms=effective_timeout_ms,
             )
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         if is_page_closed_error(exc) or runtime_closed(page, session):
             return InteractiveStepResult(
                 should_break=True,
@@ -255,6 +255,7 @@ def execute_interactive_step(
             step_kind=step.kind,
             step_target=step.target,
             interactive_step=interactive_step,
+            failure_message=str(exc),
         ):
             return InteractiveStepResult(
                 should_break=True,
