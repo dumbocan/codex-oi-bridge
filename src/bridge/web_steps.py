@@ -60,6 +60,12 @@ _FILL_SELECTOR_TEXT_RE_ALT = re.compile(
     r"(?:text|texto)?\s*[=:]?\s*[\"'“”]([^\"'“”]{1,240})[\"'“”]",
     flags=re.IGNORECASE,
 )
+_FILL_SELECTOR_TEXT_RE_DIRECT = re.compile(
+    r"(?:type|fill|escribe|rellena|teclea)\b[^\n\r]{0,80}?"
+    r"selector\s*[=:]?\s*[\"'“”]([^\"'“”]{1,160})[\"'“”][^\n\r]{0,120}?"
+    r"(?:text|texto)\s*[=:]?\s*[\"'“”]([^\"'“”]{1,240})[\"'“”]",
+    flags=re.IGNORECASE,
+)
 _WAIT_SELECTOR_RE = re.compile(
     r"(?:wait|espera)(?:\s+for)?\s+selector\s*[=:]?\s*[\"'“”]([^\"'“”]{1,160})[\"'“”]",
     flags=re.IGNORECASE,
@@ -94,6 +100,14 @@ def parse_steps(task: str) -> list[WebStep]:
             )
         )
     for match in _FILL_SELECTOR_TEXT_RE_ALT.finditer(task):
+        captures.append(
+            (
+                match.start(),
+                match.end(),
+                WebStep("fill_selector", match.group(1).strip(), match.group(2).strip()),
+            )
+        )
+    for match in _FILL_SELECTOR_TEXT_RE_DIRECT.finditer(task):
         captures.append(
             (
                 match.start(),
@@ -153,6 +167,8 @@ def parse_steps(task: str) -> list[WebStep]:
     for match in _FILL_SELECTOR_TEXT_RE.finditer(task):
         steps.append(WebStep("fill_selector", match.group(2).strip(), match.group(1).strip()))
     for match in _FILL_SELECTOR_TEXT_RE_ALT.finditer(task):
+        steps.append(WebStep("fill_selector", match.group(1).strip(), match.group(2).strip()))
+    for match in _FILL_SELECTOR_TEXT_RE_DIRECT.finditer(task):
         steps.append(WebStep("fill_selector", match.group(1).strip(), match.group(2).strip()))
     for match in _SELECT_LABEL_RE.finditer(task):
         steps.append(WebStep("select_label", match.group(2).strip(), match.group(1).strip()))

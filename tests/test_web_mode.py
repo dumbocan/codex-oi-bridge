@@ -366,6 +366,16 @@ class WebModeTests(unittest.TestCase):
         self.assertEqual(steps[0].target, "#playlist-name-input")
         self.assertEqual(steps[0].value, "ready mix")
 
+    def test_parse_steps_supports_fill_selector_then_text_syntax(self) -> None:
+        steps = _parse_steps(
+            'open http://localhost:5173 fill selector "#playlist-search-input" text "__zz_no_match__" '
+            'wait text:"Show all playlist tracks"'
+        )
+        self.assertEqual(steps[0].kind, "fill_selector")
+        self.assertEqual(steps[0].target, "#playlist-search-input")
+        self.assertEqual(steps[0].value, "__zz_no_match__")
+        self.assertEqual(steps[1].kind, "wait_text")
+
     def test_parse_steps_prefers_generic_bulk_commands(self) -> None:
         steps = _parse_steps(
             'open http://localhost:5173 bulk click selector "#addButton" '
@@ -442,6 +452,49 @@ class WebModeTests(unittest.TestCase):
         self.assertEqual(saved["result"], report.result)
         self.assertTrue(any(call.get("state") == "completed" for call in status_calls))
         self.assertTrue(all(call.get("state") != "running" for call in status_calls[-1:]))
+
+    def test_run_web_task_executes_fill_selector_then_text_syntax(self) -> None:
+        page = _FakePage(demo_button_available=False)
+        fake_sync_module = types.ModuleType("playwright.sync_api")
+        fake_sync_module.sync_playwright = lambda: _FakePlaywrightCtx(page)
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.sync_api = fake_sync_module
+
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            run_dir = Path(tmp) / "runs" / "r-fill-direct"
+            run_dir.mkdir(parents=True)
+            old_playwright = sys.modules.get("playwright")
+            old_sync = sys.modules.get("playwright.sync_api")
+            sys.modules["playwright"] = fake_playwright
+            sys.modules["playwright.sync_api"] = fake_sync_module
+            try:
+                with patch("bridge.web_backend._preflight_target_reachable"), patch(
+                    "bridge.web_backend._preflight_stack_prereqs"
+                ), patch(
+                    "bridge.web_backend._playwright_available",
+                    return_value=True,
+                ):
+                    report = run_web_task(
+                        'open http://localhost:5173, fill selector "#playlist-search-input" text "__zz_no_match__", '
+                        'wait text:"Show all playlist tracks"',
+                        run_dir,
+                        30,
+                        verified=False,
+                        visual=False,
+                        teaching_mode=False,
+                    )
+            finally:
+                if old_playwright is None:
+                    sys.modules.pop("playwright", None)
+                else:
+                    sys.modules["playwright"] = old_playwright
+                if old_sync is None:
+                    sys.modules.pop("playwright.sync_api", None)
+                else:
+                    sys.modules["playwright.sync_api"] = old_sync
+
+        self.assertIn("cmd: playwright fill selector:#playlist-search-input text:__zz_no_match__", report.actions)
+        self.assertEqual(page.filled.get("#playlist-search-input"), "__zz_no_match__")
 
     def test_run_web_task_run_timeout_finishes_and_releases_control(self) -> None:
         page = _FakePage(demo_button_available=False)
